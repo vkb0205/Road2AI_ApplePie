@@ -1,0 +1,40 @@
+{
+  "builder_name": "parquet",
+  "citation": "",
+  "config_name": "relationships",
+  "dataset_name": "vietnamese-legal-documents",
+  "dataset_size": 40727320,
+  "description": "",
+  "download_size": 4066078,
+  "features": {
+    "doc_id": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "other_doc_id": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "relationship": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 44793398,
+  "splits": {
+    "data": {
+      "name": "data",
+      "num_bytes": 40727320,
+      "num_examples": 897890,
+      "dataset_name": "vietnamese-legal-documents"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

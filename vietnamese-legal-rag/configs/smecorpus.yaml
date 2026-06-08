@@ -1,0 +1,89 @@
+sme_filtering:
+  labels:
+    include:
+      - doanh nghiệp
+      - đầu tư
+      - thuế
+      - lao động
+      - bảo hiểm
+      - thương mại
+      - kế toán
+      - kiểm toán
+      - ngân hàng
+      - chứng khoán
+      - sở hữu trí tuệ
+      - hải quan
+      - đấu thầu
+      - cạnh tranh
+      - bảo vệ quyền lợi người tiêu dùng
+    conditional:
+      - hành chính
+      - dân sự
+      - hình sự
+      - tố tụng
+      - xây dựng
+      - đất đai
+      - môi trường
+      - giao thông vận tải
+      - công nghệ thông tin
+      - y tế
+      - giáo dục
+      - nông nghiệp
+    exclude:
+      - quốc phòng
+      - an ninh quốc gia
+      - ngoại giao
+      - tổ chức bộ máy nhà nước
+      - cán bộ công chức
+      - thi đua khen thưởng
+  title_keywords:
+    - doanh nghiệp
+    - hộ kinh doanh
+    - hợp tác xã
+    - kinh doanh
+    - đầu tư
+    - thuế
+    - hóa đơn
+    - hợp đồng
+    - lao động
+    - bảo hiểm xã hội
+    - giấy phép
+    - điều kiện
+    - xử phạt
+    - vi phạm hành chính
+    - thương mại
+    - xuất khẩu
+    - nhập khẩu
+    - hải quan
+    - kế toán
+    - kiểm toán
+    - sở hữu trí tuệ
+    - nhãn hiệu
+    - đấu thầu
+    - cạnh tranh
+    - phá sản
+  document_types:
+    accepted:
+      - luật
+      - bộ luật
+      - nghị định
+      - thông tư
+      - quyết định
+      - nghị quyết
+      - thông tư liên tịch
+  validity_status:
+    accepted:
+      - còn hiệu lực
+      - đang có hiệu lực
+      - hiệu lực
+      - chưa có hiệu lực
+    prefer_active: true
+    allow_unknown: true
+  relationships:
+    allow_external_references: false
+  output_paths:
+    filtered_metadata: data/interim/sme_filtered_metadata.jsonl
+    joined_content: data/interim/sme_joined_content.jsonl
+    filtered_relationships: data/interim/sme_filtered_relationships.jsonl
+    removal_log: artifacts/reports/sme_filter_removals.jsonl
+    validation_report: artifacts/reports/sme_filter_validation.json
