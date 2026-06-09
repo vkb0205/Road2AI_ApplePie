@@ -1,0 +1,76 @@
+SME_TITLE_KEYWORDS:
+  - "doanh nghiệp"
+  - "hỗ trợ doanh nghiệp nhỏ và vừa"
+  - "đầu tư"
+  - "kinh doanh"
+  - "thuế"
+  - "hóa đơn"
+  - "kế toán"
+  - "kiểm toán"
+  - "phá sản"
+  - "thương mại"
+  - "lao động"
+  - "bảo hiểm xã hội"
+  - "bảo hiểm y tế"
+  - "bhxh"
+  - "bhyt"
+  - "việc làm"
+  - "công đoàn"
+  - "hợp đồng"
+  - "sở hữu trí tuệ"
+  - "góp vốn"
+  - "cổ phần"
+  - "chi nhánh"
+
+SME_LINH_VUC:
+  - "Doanh nghiệp"
+  - "Đầu tư"
+  - "Thương mại"
+  - "Thuế - Phí - Lệ Phí"
+  - "Kế toán - Kiểm toán"
+  - "Lao động - Tiền lương"
+  - "Bảo hiểm"
+  - "Tài chính nhà nước"
+  - "Tiền tệ - Ngân hàng"
+  - "Xuất nhập khẩu"
+  - "Sở hữu trí tuệ"
+  - "Chứng khoán"
+  - "Quyền dân sự"
+  - "Vi phạm hành chính"
+
+SME_NGANH:
+  - "Doanh nghiệp"
+  - "Tài chính"
+  - "Lao động"
+  - "Thương mại"
+  - "Đầu tư"
+
+VALID_DOCUMENT_TYPES:
+  - Sắc lệnh
+  - Quyết định
+  - Chỉ thị
+  - Nghị quyết
+  - Thông tư liên tịch
+  - Thông tư
+  - Nghị định
+  - Pháp lệnh
+  - Lệnh
+  - Luật
+  - Sắc luật
+  - Chương trình
+  - Công ước
+  - Nghị định thư
+  - Hiến pháp
+  - Bộ luật
+  - Nghị quyết liên tịch
+  - Thông báo
+  - Hiệp định
+  - Văn bản hợp nhất
+  - Công văn
+  - Bản ghi nhớ
+  - None
+  - Thỏa thuận
+  - Nghị Quyết
+  - Thông tư liên bộ
+  - Văn bản khác
+  - Văn bản liên quan

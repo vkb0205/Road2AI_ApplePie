@@ -77,15 +77,15 @@ Output conforms to the competition JSON schema (Section 13).
 
 ### 2.1 Functional requirements
 
-| ID | Requirement |
-|---|---|
-| FR-01 | The system MUST accept a JSON list of `{id, question}` and return a JSON list of `{id, question, answer, relevant_docs, relevant_articles}`. |
-| FR-02 | The `answer` field MUST cite at least one article using the pattern `Điều X`, where the cited article exists in the retrieved context. |
-| FR-03 | Each entry in `relevant_docs` MUST follow the format `<law_id>\|<Loại + Mã + Trích yếu>`. |
-| FR-04 | Each entry in `relevant_articles` MUST follow the format `<law_id>\|<Loại + Mã + Trích yếu>\|Điều X`. |
-| FR-05 | The `answer` MUST include a disclaimer that the information is for reference and does not replace formal legal consultation. |
-| FR-06 | The system MUST refuse to fabricate `law_id` values that are not present in the retrieved context. |
-| FR-07 | The system MUST exclude articles from documents whose `tinh_trang_hieu_luc` indicates expired status. |
+| ID    | Requirement                                                                                                                                  |                           |          |
+| -------| ----------------------------------------------------------------------------------------------------------------------------------------------| ---------------------------| ----------|
+| FR-01 | The system MUST accept a JSON list of `{id, question}` and return a JSON list of `{id, question, answer, relevant_docs, relevant_articles}`. |                           |          |
+| FR-02 | The `answer` field MUST cite at least one article using the pattern `Điều X`, where the cited article exists in the retrieved context.       |                           |          |
+| FR-03 | Each entry in `relevant_docs` MUST follow the format `<law_id>\                                                                              | <Loại + Mã + Trích yếu>`. |          |
+| FR-04 | Each entry in `relevant_articles` MUST follow the format `<law_id>\                                                                          | <Loại + Mã + Trích yếu>\  | Điều X`. |
+| FR-05 | The `answer` MUST include a disclaimer that the information is for reference and does not replace formal legal consultation.                 |                           |          |
+| FR-06 | The system MUST refuse to fabricate `law_id` values that are not present in the retrieved context.                                           |                           |          |
+| FR-07 | The system MUST exclude articles from documents whose `tinh_trang_hieu_luc` indicates expired status.                                        |                           |          |
 
 ### 2.2 Non-functional requirements
 
@@ -466,15 +466,34 @@ SME_NGANH:
   - "Đầu tư"
 
 VALID_DOCUMENT_TYPES:
-  - "Luật"
-  - "Bộ luật"
-  - "Nghị định"
-  - "Thông tư"
-  - "Thông tư liên tịch"
-  - "Quyết định"
-  - "Nghị quyết"
-  - "Pháp lệnh"
-  - "Văn bản hợp nhất"
+  - Sắc lệnh
+  - Quyết định
+  - Chỉ thị
+  - Nghị quyết
+  - Thông tư liên tịch
+  - Thông tư
+  - Nghị định
+  - Pháp lệnh
+  - Lệnh
+  - Luật
+  - Sắc luật
+  - Chương trình
+  - Công ước
+  - Nghị định thư
+  - Hiến pháp
+  - Bộ luật
+  - Nghị quyết liên tịch
+  - Thông báo
+  - Hiệp định
+  - Văn bản hợp nhất
+  - Công văn
+  - Bản ghi nhớ
+  - None
+  - Thỏa thuận
+  - Nghị Quyết
+  - Thông tư liên bộ
+  - Văn bản khác
+  - Văn bản liên quan
 ```
 
 **Derived fields**:
@@ -946,18 +965,18 @@ final hits
 
 ### 10.2 Parameters
 
-| Parameter | Value |
-|---|---|
-| `TOP_BM25` | 50 |
-| `TOP_DENSE_SUMMARY` | 50 |
-| `TOP_DENSE_FULL` | 50 |
-| `RRF_K` | 60 |
-| `FUSED_TOP` | 30 |
-| `GRAPH_DISCOUNT_DOC` | 0.6 |
-| `GRAPH_DISCOUNT_CONCEPT` | 0.3 |
-| `EXPANDED_TOP` | 50 |
-| `RERANK_MAX_INPUT_CHARS` | 2000 |
-| `FINAL_TOP_K` | 5 |
+| Parameter                | Value |
+| --------------------------| -------|
+| `TOP_BM25`               | 50    |
+| `TOP_DENSE_SUMMARY`      | 50    |
+| `TOP_DENSE_FULL`         | 50    |
+| `RRF_K`                  | 60    |
+| `FUSED_TOP`              | 30    |
+| `GRAPH_DISCOUNT_DOC`     | 0.6   |
+| `GRAPH_DISCOUNT_CONCEPT` | 0.3   |
+| `EXPANDED_TOP`           | 50    |
+| `RERANK_MAX_INPUT_CHARS` | 2000  |
+| `FINAL_TOP_K`            | 5     |
 
 ### 10.3 RRF fusion formula
 
