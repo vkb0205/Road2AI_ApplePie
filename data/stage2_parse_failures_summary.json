@@ -1,0 +1,9 @@
+{
+  "total_failures": 2406,
+  "by_reason": {
+    "zero_dieu_law_like_doc": 275,
+    "zero_parsable_dieu_law_like_doc": 34,
+    "single_dieu_law_like_doc": 70,
+    "text_too_short_after_cleaning": 2027
+  }
+}

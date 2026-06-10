@@ -1,2 +1,6 @@
 data/raw
 data/stage1_sme_docs.parquet
+content.jsonl
+thesis.pdf
+tmp_duplicate_sample.txt
+__pycache__/

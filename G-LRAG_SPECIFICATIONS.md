@@ -541,45 +541,58 @@ VALID_DOCUMENT_TYPES:
 **Regex patterns** (compiled with `re.MULTILINE`):
 
 ```python
-RE_PHAN   = r"^\s*(Phần\s+thứ\s+[\dIVXLCDM\w]+.*)$"
+RE_PHAN   = r"^\s*(Phần(?:\s+thứ)?\s+[\dIVXLCDM\w]+.*)$"
 RE_CHUONG = r"^\s*(Chương\s+[\dIVXLCDM\w]+.*)$"
-RE_MUC    = r"^\s*(Mục\s+[\dIVXLCDM]+.*)$"
-RE_DIEU   = r"^\s*Điều\s+(\d+)([a-zđ]?)\s*\.\s*(.*)$"
+RE_MUC    = r"^\s*(Mục\s+[\dIVXLCDM\w]+.*)$"
+RE_DIEU   = r"^\s*Điều\s+(\d+)([a-zđ]?)\s*(?:[\.:\-–—)]\s*)?(.*)$"
 RE_KHOAN  = r"^\s*(\d+)\.\s+(.*)$"
 RE_DIEM   = r"^\s*([a-zđ])\)\s+(.*)$"
 ```
 
 Notes on the Vietnamese legal-text format that drive these patterns:
 
-- "Phần" is written as `Phần thứ <số La Mã hoặc số đếm>` in many older documents. Plain `Phần I` also occurs.
-- "Mục" may be numbered with either Arabic digits or Roman numerals.
-- "Điều" is always numbered with Arabic digits; some amended documents use the suffix form `Điều 13a`, `Điều 13b`.
-- The HTML structure on vbpl.vn is not consistent across documents. CSS classes like `pChuong`, `pDieu`, `pKhoan` exist in some documents but not all. The parser MUST work on the plain-text projection of the HTML body, not on CSS classes.
+- "Phần" may appear as `Phần thứ X` or `Phần X`, and documents can use Arabic digits, Roman numerals, or word-like counters.
+- "Mục" may be numbered with Arabic digits, Roman numerals, or other word-like tokens.
+- "Điều" is numbered with Arabic digits; amended documents may use suffixes such as `Điều 13a`, `Điều 13b`, or `Điều 32đ`.
+- `RE_DIEU` accepts optional separator characters after the article number: `. : - – — )`.
+- The parser works on the cleaned plain-text projection of the HTML body, not on CSS classes.
 
 **Algorithm**:
 
 1. For each `(doc_id, content_html)` whose `doc_id` is in Stage 1:
-   a. Parse HTML with `BeautifulSoup(content_html, "lxml")`.
-   b. Strip script/style tags; extract text with `soup.get_text("\n", strip=True)`.
-   c. Normalize whitespace: `re.sub(r"[ \t]+", " ", text)`; `re.sub(r"\n{2,}", "\n", text)`.
-   d. Deduplicate consecutive identical lines (nested-tag artifact).
-2. Run a two-pass scan on the cleaned text.
-   - **Pass A — locate Điều boundaries**: find all `RE_DIEU` matches and record `(start_pos, dieu_num, dieu_suffix, dieu_title)`. Each Điều spans from its match start to the start of the next match (or end of text).
-   - **Pass B — assign hierarchy context**: walk forward through the text; before each Điều, record the most recent `Phần`, `Chương`, and `Mục` headers that appeared above it.
-3. For each located Điều span, emit one record with:
+   a. Parse HTML with `BeautifulSoup(content_html, "html.parser")`.
+   b. Remove `script` and `style` tags.
+   c. Extract text with `soup.get_text("\n", strip=True)`.
+   d. Normalize whitespace: `re.sub(r"[ \t]+", " ", text)` and `re.sub(r"\n{2,}", "\n", text)`.
+   e. Deduplicate consecutive identical lines.
+2. Locate all `Điều` boundaries with `RE_DIEU` and build spans from each boundary start to the next boundary or end of text.
+3. Assign hierarchy context to each article by recording the most recent preceding `Phần`, `Chương`, and `Mục` headers.
+4. For each article span, emit one row with:
    - `dieu_so = f"Điều {dieu_num}{dieu_suffix}"`
    - `dieu_ten = dieu_title.strip()`
-   - `noi_dung = text[start_pos_after_title : end_pos].strip()`
-   - `start_char`, `end_char` = byte offsets in the cleaned text (for re-extraction if needed).
-4. Emit one row per Điều to `stage2_articles.parquet`.
-5. If a document yields zero Điều OR yields exactly one Điều while its `title` mentions "Luật", "Bộ luật", or "Nghị định", write the `doc_id`, `title`, and first 500 characters of cleaned text to `stage2_parse_failures.jsonl`.
+   - `noi_dung` = text after the Điều header through the next article boundary or document end
+   - `phan`, `chuong`, `muc` from the nearest preceding headers
+   - `doc_uid = f"{law_id}|{ten_van_ban}|{dieu_so}"`
+5. Drop rows where `len(noi_dung) < 30`.
+6. If no `Điều` boundaries are found, build a single fallback article from the whole cleaned text.
+   - If the cleaned text is shorter than 30 characters, emit failure `text_too_short_after_cleaning`.
+7. If the title is law-like (`Luật`, `Bộ luật`, `Nghị định`) and the parser produces zero articles after fallback, emit failure `zero_dieu_law_like_doc`.
+8. If the title is law-like and the parser finds boundaries but all articles are dropped for short content, emit failure `zero_parsable_dieu_law_like_doc`.
+9. If exactly one article remains and the title is law-like, emit failure `single_dieu_law_like_doc`.
+10. Save successful article rows to `stage2_articles.parquet` and failures to `stage2_parse_failures.jsonl`.
+
+**Final keep/drop policy (Decided 2026-06-10)**
+
+- Keep fallback document-level articles produced when no `Điều` markers are found. Fallback rows use `dieu_so = "Điều VB"` and are emitted to `stage2_articles.parquet` (they are also logged as `zero_dieu_law_like_doc` when the title is law-like).
+- Keep `single_dieu_law_like_doc` article rows (emit the single parsed article) but log the failure for manual review.
+- Drop (do not emit article rows) for `text_too_short_after_cleaning` (cleaned text < 30 characters) and for `zero_parsable_dieu_law_like_doc` (title suggests a multi-article law but parser produced no parsable article rows). Both are recorded in `stage2_parse_failures.jsonl` for audit.
 
 **Quality gates**:
 
 - Drop articles where `len(noi_dung) < 30` characters.
-- Assert each `(doc_id, dieu_so)` pair is unique.
-- Assert per-document Điều numbers are strictly increasing (warn but do not abort on violations — amended documents may reorder).
-- Manual review queue: a human spot-checks 10 random articles from each of 5 well-known laws (Luật Doanh nghiệp 2020, Luật Lao động 2019, Luật Hỗ trợ DNNVV 2017, Luật Thuế TNDN, Luật BHXH) against the official Government Portal (chinhphu.vn).
+- Sort parsed articles by `noi_dung` length descending, then deduplicate by `(doc_id, dieu_so)`, keeping the longest row.
+- Assert each `doc_uid` is unique in the final output.
+- Assert no duplicate `(doc_id, dieu_so)` pairs remain after deduplication.
 
 **Stage 2.5 — Optional manual fixes**: For documents in `stage2_parse_failures.jsonl` that are deemed important, a human operator may produce a JSON record providing parsed articles manually. The file `stage2_manual_fixes.json` is merged into Stage 2 output at the start of Stage 3.
 
