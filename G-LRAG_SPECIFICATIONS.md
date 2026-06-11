@@ -159,11 +159,11 @@ The system consists of two phases:
 | Module | Responsibility | Inputs | Outputs |
 |---|---|---|---|
 | `data.stage1_filter` | Filter SME-scope documents | `metadata` config + `content` IDs | `stage1_sme_docs.parquet` |
-| `data.stage2_parse_html` | Parse HTML into article-level records | `content` config + stage 1 | `stage2_articles.parquet`, `stage2_parse_failures.jsonl` |
-| `data.stage3_chunking` | Split long articles with overlap | stage 2 | `stage3_chunks.parquet` |
-| `data.stage4_summarize` | Generate summaries per chunk | stage 3 | `stage4_enriched.parquet`, `summary_cache.jsonl` |
-| `data.stage5_build_graph` | Build NetworkX knowledge graph | stage 1, stage 4, `relationships` config | `kg.gpickle` |
-| `data.stage6_index` | Build BM25 and FAISS indexes | stage 4 | `bm25.pkl`, `faiss_summary.index`, `faiss_full.index`, `chunk_meta.npy` |
+| `data.stage2_parse_html` | Parse HTML into article-level records | `content` config + Stage 1 | `stage2_articles.parquet`, `stage2_parse_failures.jsonl` |
+| `data.stage3_chunking` | Split long articles with overlap | Stage 2 | `stage3_chunks.parquet` |
+| `data.stage4_summarize` | Generate summaries per chunk | Stage 3 | `stage4_enriched.parquet`, `summary_cache.jsonl` |
+| `data.stage5_build_graph` | Build NetworkX knowledge graph | Stage 1, Stage 4, `relationships` config | `kg.gpickle` |
+| `data.stage6_index` | Build BM25 and FAISS indexes | Stage 4 | `bm25.pkl`, `faiss_summary.index`, `faiss_full.index`, `chunk_meta.npy` |
 | `retrieval.retriever` | Hybrid retrieval + graph expansion + rerank | query, all indexes, KG | top-K hits |
 | `generation.generator` | LLM answer generation with grounded context | query, hits | answer string |
 | `generation.guardrails` | Post-generation validation and retry | answer, hits | validated answer or fallback |
