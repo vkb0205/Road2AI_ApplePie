@@ -41,3 +41,20 @@
     - `zero_parsable_dieu_law_like_doc`: **34** (law-like, had Điều but all dropped for short content → dropped)
   - **Interpretation**: Majority failures are empty/short documents. Fallback `Điều VB` preserved ~275 regulatory documents despite lacking formal article structure. For triage, inspect failure samples via `src/data/debug_stage2_failures.py`.
 
+### Checkpoint 10/06/2026 - KL
+- Implement Stage 3 chunking in `src/data/stage3_chunking.py`:
+  - Input: `data/stage2_articles.parquet`, optionally merged with `data/stage2_manual_fixes.json`/`.jsonl`.
+  - Output: `data/stage3_chunks.parquet`.
+  - Parameters: `MAX_TOKENS = 1024`, tokenizer `google/gemma-3-12b-it`.
+  - Support gated repo access via `HUGGINGFACE_HUB_TOKEN`, `HF_TOKEN`, or `--hf-token`.
+  - Load the tokenizer with explicit auth: `AutoTokenizer.from_pretrained(..., token=hf_token, trust_remote_code=True)`.
+  - Preserve Stage 2 metadata and build `breadcrumb` from `loai_van_ban`, `ten_van_ban`, `phan`, `chuong`, `muc`, `dieu_so`, `dieu_ten`.
+  - Split `noi_dung` into Khoản-level pieces using `re.split(r"(?=^\s*\d+\.\s)", flags=re.M)`.
+  - Greedily pack Khoản pieces into chunks while keeping cumulative token count ≤ `MAX_TOKENS`.
+  - At chunk boundary, prepend the last Khoản of the previous chunk into the next chunk when it fits.
+  - If a single Khoản exceeds `MAX_TOKENS`, split it by sentence boundaries and then by token blocks.
+  - Emit chunk records with `chunk_id`, `part_idx`, `breadcrumb`, and `chunk_text`.
+  - `chunk_text` begins with breadcrumb followed by the joined chunk body.
+  - Runtime validation: produced `74,107` chunks from `56,269` Stage 2 rows, covering `12,633` unique documents.
+  - Warnings observed during this run are non-blocking: PyTorch disabled due to version `2.2.1`, Windows symlink cache warning, and BPE tokenizer cleanup warning.
+

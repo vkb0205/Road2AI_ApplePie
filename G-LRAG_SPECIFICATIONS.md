@@ -594,8 +594,6 @@ Notes on the Vietnamese legal-text format that drive these patterns:
 - Assert each `doc_uid` is unique in the final output.
 - Assert no duplicate `(doc_id, dieu_so)` pairs remain after deduplication.
 
-**Stage 2.5 — Optional manual fixes**: For documents in `stage2_parse_failures.jsonl` that are deemed important, a human operator may produce a JSON record providing parsed articles manually. The file `stage2_manual_fixes.json` is merged into Stage 2 output at the start of Stage 3.
-
 ### 7.3 Stage 3 — Chunking
 
 **Input**: `stage2_articles.parquet` (merged with `stage2_manual_fixes.json` if present).
@@ -606,7 +604,12 @@ Notes on the Vietnamese legal-text format that drive these patterns:
 
 - `MAX_TOKENS = 1024`
 - `OVERLAP_TOKENS = 128`
-- Tokenizer: `AutoTokenizer.from_pretrained("google/gemma-3-12b-it")`.
+- Tokenizer: `AutoTokenizer.from_pretrained("google/gemma-3-12b-it", token=hf_token, trust_remote_code=True)`, where `hf_token` is loaded from `--hf-token`, `HF_TOKEN`, or `HUGGINGFACE_HUB_TOKEN`.
+
+**Implementation note**:
+
+- Stage 3 explicitly passes the Hugging Face auth token into tokenizer loading so that gated repos like `google/gemma-3-12b-it` are accessed with authentication instead of using unauthenticated default requests.
+- If the token is missing or invalid, tokenizer loading may still fail even when the environment variable is present.
 
 **Algorithm**:
 
@@ -627,6 +630,11 @@ Notes on the Vietnamese legal-text format that drive these patterns:
    - At chunk boundary, prepend the last Khoản of the previous chunk to the new chunk (overlap). If a single Khoản exceeds `MAX_TOKENS`, split it further at sentence boundaries.
    - Each emitted chunk receives `chunk_id = f"{doc_uid}#{part_idx}"` with `part_idx` increasing from 0.
 5. Every chunk carries the breadcrumb as a prefix in `chunk_text`.
+
+**Validation note**:
+
+- Verified run output: `stage2_articles.parquet` with `56,269` rows produced `stage3_chunks.parquet` with `74,107` chunks and `12,633` unique documents.
+- Observed warnings are expected for this pipeline stage: PyTorch is disabled on the local environment (`torch==2.2.1`), Windows symlink caching is degraded, and Gemma BPE tokenizer emits a cleanup warning.
 
 **Output schema**: Stage 2 schema + `breadcrumb`, `chunk_id`, `chunk_text`, `part_idx`.
 

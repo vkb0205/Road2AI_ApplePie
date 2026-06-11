@@ -4,3 +4,5 @@ content.jsonl
 thesis.pdf
 tmp_duplicate_sample.txt
 __pycache__/
+.env
+data/stage3_chunks.parquet
