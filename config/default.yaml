@@ -74,3 +74,16 @@ VALID_DOCUMENT_TYPES:
   - Thông tư liên bộ
   - Văn bản khác
   - Văn bản liên quan
+
+summarization:
+  model: "google/gemma-3-12b-it"
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "float16"
+  attn_implementation: "eager"
+  batch_size: 2
+  max_input_chars: 3000
+  max_new_tokens: 256
+  temperature: 0.1
+  repetition_penalty: 1.05
+  seed: 42

@@ -58,3 +58,39 @@
   - Runtime validation: produced `74,107` chunks from `56,269` Stage 2 rows, covering `12,633` unique documents.
   - Warnings observed during this run are non-blocking: PyTorch disabled due to version `2.2.1`, Windows symlink cache warning, and BPE tokenizer cleanup warning.
 
+### Checkpoint 11/06/2026 - DB
+- Implement Stage 4 summarization in `src/data/stage4_summarize.py`:
+  - Use `google/gemma-3-12b-it` with 4-bit NF4 quantization for summarization
+  - Load tokenizer and model with explicit HF token auth for gated repo access
+  - Configure `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)`
+  - Use `attn_implementation="eager"` for compatibility with quantized models
+  - Generate two-field JSON summaries: `short` (≤30 words) and `key` (3-5 bullet points)
+  - Apply chat template with system and user prompts in Vietnamese
+  - Extract JSON from model response using regex patterns with fallback logic
+  - Build `enriched_text` format: `[TÓM TẮT]` + `[Ý CHÍNH]` + `[NỘI DUNG ĐẦY ĐỦ]`
+  - Implement resumable JSONL cache (`summary_cache.jsonl`) - append after each chunk
+  - Cache loading skips already-processed chunks on restart
+  - Store `key` column as JSON string for Parquet compatibility
+  - Generate statistics on non-empty summaries and key points
+  - Parameters: `max_input_chars=3000`, `max_new_tokens=256`, `temperature=0.1`, `repetition_penalty=1.05`, `batch_size=2`
+
+- Add Stage 4 configuration to `config/default.yaml`:
+  - Model: `google/gemma-3-12b-it`
+  - Quantization: 4-bit NF4 with float16 compute
+  - Generation parameters: temperature 0.1, repetition penalty 1.05
+  - Batch size: 2 (conservative for 16GB VRAM)
+
+- Implement `notebooks/kaggle_02_summarization.ipynb` for Kaggle GPU T4 [kaggle.com/code/boinhbo/kaggle-02-summarization]:
+  - Complete notebook with 10 sections: setup, config, prompts, helpers, data loading, model loading, generation, enriched parquet building, output saving, upload instructions
+  - Install dependencies: `transformers==4.46.0`, `torch==2.4.1`, `accelerate==1.0.1`, `bitsandbytes==0.44.1`
+  - Load HF token from Kaggle Secrets or environment variables
+  - Mount `stage3_chunks.parquet` from Kaggle Dataset
+  - Display GPU memory usage and estimated runtime (~17 hours for full corpus)
+  - Progress bar with tqdm for chunk processing
+  - Error handling with fallback to empty summaries
+  - Resume capability from existing cache
+  - Output validation and sample enriched chunk display
+  - Upload instructions for creating `glrag-stage4` Kaggle Dataset
+
+**Status**: Stage 4 implementation complete. Ready for execution on Kaggle GPU T4.
+**Next steps**: Upload `stage3_chunks.parquet` to Kaggle Dataset, run Notebook 02 to generate summaries, then upload outputs for Stage 5.
