@@ -162,8 +162,8 @@ The system consists of two phases:
 | `data.stage2_parse_html` | Parse HTML into article-level records | `content` config + Stage 1 | `stage2_articles.parquet`, `stage2_parse_failures.jsonl` |
 | `data.stage3_chunking` | Split long articles with overlap | Stage 2 | `stage3_chunks.parquet` |
 | `data.stage4_summarize` | Generate summaries per chunk | Stage 3 | `stage4_enriched.parquet`, `summary_cache.jsonl` |
-| `data.stage5_build_graph` | Build NetworkX knowledge graph | Stage 1, Stage 4, `relationships` config | `kg.gpickle` |
-| `data.stage6_index` | Build BM25 and FAISS indexes | Stage 4 | `bm25.pkl`, `faiss_summary.index`, `faiss_full.index`, `chunk_meta.npy` |
+| `data.stage5_build_graph` | Build NetworkX knowledge graph | Stage 1, Stage 2/3, `relationships` config | `kg.gpickle` |
+| `data.stage6_index` | Build BM25 and FAISS indexes | Stage 3 | `bm25.pkl`, `faiss_summary.index`, `faiss_full.index`, `chunk_meta.npy` |
 | `retrieval.retriever` | Hybrid retrieval + graph expansion + rerank | query, all indexes, KG | top-K hits |
 | `generation.generator` | LLM answer generation with grounded context | query, hits | answer string |
 | `generation.guardrails` | Post-generation validation and retry | answer, hits | validated answer or fallback |
@@ -188,6 +188,8 @@ content ──┘                              │     stage2_parse_failures.jso
                                          │           └──► chunk_meta.npy
                                          │
 relationships ──────────────────────────┴──► kg.gpickle
+
+Note: BM25/FAISS indexes can be built directly from `stage3_chunks.parquet`, with `stage4_enriched.parquet` as optional metadata only.
 ```
 
 ---
@@ -365,8 +367,8 @@ The data pipeline executes six stages sequentially plus one optional manual revi
 | 2.5 | Manual review (optional) | `stage2_parse_failures.jsonl` | `stage2_manual_fixes.json` |
 | 3 | Chunking | Stage 2 (+ manual fixes if present) | `stage3_chunks.parquet` |
 | 4 | Summary injection | Stage 3 | `stage4_enriched.parquet` + `summary_cache.jsonl` |
-| 5 | Graph construction | Stage 1 + Stage 4 + `relationships` config | `kg.gpickle` |
-| 6 | Indexing | Stage 4 | `bm25.pkl`, `faiss_summary.index`, `faiss_full.index`, `chunk_meta.npy` |
+| 5 | Graph construction | Stage 1 + Stage 2/3 + `relationships` config | `kg.gpickle` |
+| 6 | Indexing | Stage 3 | `bm25.pkl`, `faiss_summary.index`, `faiss_full.index`, `chunk_meta.npy` |
 
 ### 6.2 Expected volumes
 
@@ -638,54 +640,24 @@ Notes on the Vietnamese legal-text format that drive these patterns:
 
 **Output schema**: Stage 2 schema + `breadcrumb`, `chunk_id`, `chunk_text`, `part_idx`.
 
-### 7.4 Stage 4 — Summary injection
+### 7.4 Stage 4 — Summary injection (optional)
 
 **Input**: `stage3_chunks.parquet`.
 
 **Output**: `stage4_enriched.parquet`, `summary_cache.jsonl`.
 
-**Model**: `Qwen/Qwen2.5-3B-Instruct`, loaded with `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)`.
+**Note**: This stage is optional. The main KG and index pipeline can run without it using Stage 2 and Stage 3 artifacts.
 
-**Generation parameters**: `batch_size=4, max_new_tokens=256, do_sample=False, temperature=0.1, repetition_penalty=1.05`.
+**If used**:
+- Model: `Qwen/Qwen2.5-3B-Instruct`, loaded with `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)`.
+- Generation parameters: `batch_size=4, max_new_tokens=256, do_sample=False, temperature=0.1, repetition_penalty=1.05`.
+- Prompt template: generate `short` (summary) and `key` (key bullet points).
+- Cache format: `summary_cache.jsonl`
+- Enriched text format: optional `enriched_text` field.
 
-**Prompt template**:
-
-```
-Bạn là chuyên gia tóm tắt văn bản pháp luật Việt Nam.
-Hãy tạo HAI tóm tắt cho điều luật dưới đây:
-
-[ĐIỀU LUẬT]
-{chunk_text_truncated_to_3000_chars}
-
-[YÊU CẦU]
-1) SUM_SHORT: 1 câu duy nhất (≤30 từ) nêu CHỦ ĐỀ chính của điều.
-2) SUM_KEY: 3-5 gạch đầu dòng nêu các Ý PHÁP LÝ then chốt
-   (đối tượng áp dụng, nghĩa vụ, quyền, điều kiện, chế tài).
-
-Trả về JSON: {"short": "...", "key": ["...", "..."]}
-```
-
-**Cache format** (`summary_cache.jsonl`, one JSON per line):
-
-```json
-{"chunk_id": "<chunk_id>", "short": "<sentence>", "key": ["<bullet1>", "<bullet2>", ...]}
-```
-
-**Resumability**: On restart, read existing `chunk_id` values from the cache and skip them.
-
-**Enriched text format** (added as new column `enriched_text`):
-
-```
-[TÓM TẮT] {short}
-[Ý CHÍNH]
-• {key_1}
-• {key_2}
-• ...
-[NỘI DUNG ĐẦY ĐỦ]
-{chunk_text}
-```
-
-If the summarizer returns invalid JSON for a chunk, `short` and `key` default to empty values; `enriched_text` still contains the full chunk text.
+**Fallback**: If this stage is not run, the pipeline should still build:
+- KG from `stage2_articles.parquet` + `relationships`
+- BM25/FAISS from `stage3_chunks.parquet`
 
 ---
 
@@ -707,7 +679,7 @@ If the summarizer returns invalid JSON for a chunk, `short` and `key` default to
 
 | Edge label | From | To | Source |
 |---|---|---|---|
-| `HAS_ARTICLE` | Document | Article | Derived from Stage 4 |
+| `HAS_ARTICLE` | Document | Article | Derived from Stage 2 / optional Stage 4 |
 | `AMENDS` | Document | Document | `relationships` config |
 | `AMENDED_BY` | Document | Document | `relationships` config |
 | `REPLACES` | Document | Document | `relationships` config |
@@ -724,7 +696,7 @@ If the summarizer returns invalid JSON for a chunk, `short` and `key` default to
 | `CORRECTED_BY` | Document | Document | `relationships` config |
 | `RELATED_LANGUAGE` | Document | Document | `relationships` config |
 | `RELATED_CONTENT` | Document | Document | `relationships` config |
-| `MENTIONS` | Article | Concept | String match on enriched text |
+| `MENTIONS` | Article | Concept | Rule-based string match on article/chunk text; optional enriched text if available |
 
 ### 8.4 Relationship label mapping
 
@@ -842,7 +814,7 @@ for row in sme_docs.itertuples():
                ngay_ban_hanh=row.ngay_ban_hanh)
 ```
 
-**Step 2** — Article nodes and `HAS_ARTICLE` edges from `stage4_enriched.parquet`:
+**Step 2** — Article nodes and `HAS_ARTICLE` edges from `stage2_articles.parquet` (or optional `stage4_enriched.parquet` if available):
 
 ```python
 for art in articles.drop_duplicates("doc_uid").itertuples():
@@ -851,8 +823,11 @@ for art in articles.drop_duplicates("doc_uid").itertuples():
                doc_uid=art.doc_uid,
                law_id=art.law_id,
                ten_van_ban=art.ten_van_ban,
-               dieu=art.dieu_so,
-               summary=art.short)
+               dieu=art.dieu_so)
+    if hasattr(art, "short"):
+        G.nodes[art_id]["summary"] = art.short
+    if hasattr(art, "enriched_text"):
+        G.nodes[art_id]["enriched_text"] = art.enriched_text
     G.add_edge(f"DOC:{art.doc_id}", art_id, rel="HAS_ARTICLE")
 ```
 
@@ -877,7 +852,16 @@ for c in LEGAL_CONCEPTS:
     G.add_node(f"CONCEPT:{c.lower()}", type="Concept", name=c)
 
 for art in articles.itertuples():
-    text_lower = art.enriched_text.lower()
+    text_lower = None
+    if hasattr(art, "enriched_text"):
+        text_lower = art.enriched_text.lower()
+    elif hasattr(art, "chunk_text"):
+        text_lower = art.chunk_text.lower()
+    elif hasattr(art, "article_text"):
+        text_lower = art.article_text.lower()
+    if text_lower is None:
+        continue
+
     for c in LEGAL_CONCEPTS:
         if c.lower() in text_lower:
             G.add_edge(f"ART:{art.doc_uid}",
@@ -909,7 +893,7 @@ with open("kg.gpickle", "wb") as f:
 ### 9.1 BM25 index
 
 - Library: `rank_bm25.BM25Okapi`.
-- Input text: `enriched_text` column from `stage4_enriched.parquet`.
+- Input text: `chunk_text` from `stage3_chunks.parquet` or optional `enriched_text` from `stage4_enriched.parquet` if available.
 - Tokenization: `pyvi.ViTokenizer.tokenize(text).lower().split()`.
 - Parameters: `k1=1.5, b=0.75`.
 
@@ -926,7 +910,7 @@ with open("kg.gpickle", "wb") as f:
 ### 9.2 FAISS summary index
 
 - Embedder: `BAAI/bge-m3`, `use_fp16=True`.
-- Input text: `(short + " " + " ".join(key)).strip()`.
+- Input text: `(short + " " + " ".join(key)).strip()` if Stage 4 metadata is available; otherwise use article/chunk title/text.
 - Encoding parameters: `batch_size=32, max_length=256, return_dense=True`.
 - Normalization: L2-normalize before insertion.
 - Index type: `faiss.IndexFlatIP`.
@@ -937,7 +921,7 @@ with open("kg.gpickle", "wb") as f:
 ### 9.3 FAISS full index
 
 - Embedder: `BAAI/bge-m3`, `use_fp16=True`.
-- Input text: `enriched_text` (full column).
+- Input text: `chunk_text` from `stage3_chunks.parquet` or optional `enriched_text` if Stage 4 is available.
 - Encoding parameters: `batch_size=8, max_length=1024, return_dense=True`.
 - Normalization: L2-normalize before insertion.
 - Index type: `faiss.IndexFlatIP`.
@@ -954,7 +938,7 @@ chunk_id (str), doc_uid (str), law_id (str), ten_van_ban (str),
 dieu_so (str), doc_id (int), row_idx (int)
 ```
 
-The `row_idx` of each chunk equals its row index in `stage4_enriched.parquet`, in `bm25.pkl`, in `faiss_summary.index`, and in `faiss_full.index`. This 1-to-1 alignment is required.
+The `row_idx` of each chunk equals its row index in `bm25.pkl`, in `faiss_summary.index`, and in `faiss_full.index`. If `stage4_enriched.parquet` is available, its row ordering should match the indexed chunks, but the core pipeline does not require it.
 
 ---
 

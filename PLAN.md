@@ -72,14 +72,11 @@ The plan is organised into five phases that mirror the pipeline:
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
-| 4.1 | 🔲 Implement `src/data/stage4_summarize.py` using `Qwen/Qwen2.5-3B-Instruct` (4-bit NF4) | All | 🔲 Open | Runs on Kaggle GPU T4; outputs valid `summary_cache.jsonl` |
-| 4.2 | 🔲 Prompt engineering: two-field JSON response (`short` ≤ 30 words, `key` 3–5 bullets); fallback on invalid JSON keeps full `chunktext` | All | 🔲 Open | Fewer than 5 % of chunks fall back to empty summary on a 1 000-row smoke test |
-| 4.3 | 🔲 JSONL cache resumability: restart reads existing `chunkid` entries and skips them | All | 🔲 Open | Kill and restart mid-corpus; output is identical to a single uninterrupted run |
-| 4.4 | 🔲 Produce `stage4_enriched.parquet` with `enriched_text` column (summary prefix + full chunk body) | All | 🔲 Open | `enriched_text` is non-null for every row; spot-check 20 random rows against source articles |
-| 4.5 | 🔲 Upload `stage4_enriched.parquet` + `summary_cache.jsonl` as Kaggle Dataset | All | ⏳ Blocked on 4.4 | Dataset visible; Notebook 03 mounts without error |
+| 4.1 | 🔲 Evaluate `src/data/stage4_summarize.py` and `notebooks/kaggle_02_summarization.ipynb` as experimental artifacts | All | ✅ Deferred | Kept for analysis, not required for core KG/index build |
+| 4.2 | 🔲 Do not depend on `stage4_enriched.parquet` for production retrieval artifacts | All | ✅ Done | KG/index build uses Stage 2/3 artifacts instead |
+| 4.3 | 🔲 Preserve optional support for Stage 4 metadata if available, but make it non-blocking | All | ✅ Done | `short`, `key`, `enriched_text` are optional metadata only |
 
-> **Runtime note:** Stage 4 is estimated at ~17 GPU-hours across multiple sessions.  
-> Start Notebook 02 as early as possible to leave buffer for re-runs.
+> **Runtime note:** Summary injection is not a hard dependency for the pipeline. Prioritize Stage 2 and Stage 3 artifacts for graph/index construction.
 
 ---
 
@@ -91,9 +88,9 @@ The plan is organised into five phases that mirror the pipeline:
 |---|------|-------|--------|------------|
 | 5.1 | 🔲 Implement `src/data/stage5buildgraph.py`; build `networkx.MultiDiGraph` with Document, Article, Concept nodes | All | ⏳ Blocked on 4.4 | Script completes without error |
 | 5.2 | 🔲 Add Document nodes from `stage1_sme_docs.parquet` (attributes: `law_id`, `ten`, `loai`, `nganh`, `ngay_ban_hanh`) | All | ⏳ | Node count in [3 000, 8 000] |
-| 5.3 | 🔲 Add Article nodes + `HAS_ARTICLE` edges from `stage4_enriched.parquet` (deduplicated by `doc_uid`) | All | ⏳ | Article node count ≈ 50 000 |
+| 5.3 | 🔲 Add Article nodes + `HAS_ARTICLE` edges from `stage2_articles.parquet` (deduplicated by `doc_uid`) | All | ⏳ | Article node count ≈ 50 000 |
 | 5.4 | 🔲 Add cross-document edges from `relationships` config; filter to SME doc IDs; map 14 Vietnamese labels via `RELATIONSHIP_MAP` | All | ⏳ | Edge count in [150 000, 350 000] |
-| 5.5 | 🔲 Add Concept nodes and `MENTIONS` edges via string-match on `enriched_text` against `config/legal_concepts.yaml` | All | ⏳ | 50–100 concept nodes; `MENTIONS` edges ≈ 30 000–50 000 |
+| 5.5 | 🔲 Add Concept nodes and `MENTIONS` edges via rule-based extraction on article/chunk text; optional use of `enriched_text` if Stage 4 exists | All | ⏳ | 50–100 concept nodes; `MENTIONS` edges ≈ 30 000–50 000 |
 | 5.6 | 🔲 Persist graph to `kg.gpickle` using `pickle.HIGHEST_PROTOCOL` | All | ⏳ | File readable; `nx.info(G)` shows expected node/edge counts |
 | 5.7 | 🔲 Validate: log warnings for unmapped relationship labels (stored verbatim under key `rel`) | All | ⏳ | Zero crash; warnings visible in log |
 
@@ -101,9 +98,9 @@ The plan is organised into five phases that mirror the pipeline:
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
-| 6.1 | 🔲 Implement BM25 index in `src/data/stage6index.py`; tokenise with `pyvi.ViTokenizer`; parameters k₁=1.5, b=0.75 | All | ⏳ Blocked on 4.4 | `bm25.pkl` written; query smoke test returns non-empty ranking |
-| 6.2 | 🔲 Build FAISS summary index: embed `short + " ".join(key)` via `BAAI/bge-m3` (fp16, batch 32, max 256 tokens); `IndexFlatIP` | All | ⏳ | `faiss_summary.index` written; dimension 1 024 |
-| 6.3 | 🔲 Build FAISS full index: embed `enriched_text` (batch 8, max 1 024 tokens) | All | ⏳ | `faiss_full.index` written; row count equals `stage4_enriched.parquet` |
+| 6.1 | 🔲 Implement BM25 index in `src/data/stage6index.py`; tokenise with `pyvi.ViTokenizer`; parameters k₁=1.5, b=0.75 | All | ⏳ | `bm25.pkl` written; query smoke test returns non-empty ranking |
+| 6.2 | 🔲 Build FAISS summary index: embed article text / optional `short + " ".join(key)` if available | All | ⏳ | `faiss_summary.index` written; dimension 1 024 |
+| 6.3 | 🔲 Build FAISS full index: embed chunk text (`stage3_chunks.parquet`) or optional `enriched_text` if Stage 4 exists | All | ⏳ | `faiss_full.index` written; row count equals indexed chunks |
 | 6.4 | 🔲 Build `chunk_meta.npy` structured array with columns `chunk_id`, `doc_uid`, `law_id`, `ten_van_ban`, `dieu_so`, `doc_id`, `row_idx`; verify 1-to-1 alignment with all three indexes | All | ⏳ | Assert `len(bm25.doc_ids) == len(faiss_summary) == len(faiss_full) == len(chunk_meta)` |
 | 6.5 | 🔲 Upload all four index artifacts as Kaggle Dataset for Notebook 04 | All | ⏳ Blocked on 6.1–6.4 | Notebook 04 mounts and loads without error |
 
@@ -185,7 +182,7 @@ The plan is organised into five phases that mirror the pipeline:
 ## Dependency Graph (summary)
 
 ```
-Stage1 ✅ → Stage2 ✅ → Stage3 ✅ → Stage4 → Stage5 → Stage6
+Stage1 ✅ → Stage2 ✅ → Stage3 ✅ → Stage5 → Stage6
                                           ↓               ↓
                                      Retrieval ←──────────┘
                                           ↓
@@ -215,7 +212,7 @@ Stage1 ✅ → Stage2 ✅ → Stage3 ✅ → Stage4 → Stage5 → Stage6
 |------|-----------|
 | 11 Jun 2026 | Phase 0 complete; Stage 3 artifacts on Kaggle |
 | 12 Jun 2026 | Stage 2.5 manual review complete |
-| 14 Jun 2026 | Stage 4 summarisation complete (`stage4_enriched.parquet` ready) |
+| 14 Jun 2026 | Stage 4 summarisation considered optional; pipeline validated on Stage 2/3 artifacts |
 | 16 Jun 2026 | Stage 5–6 complete; all indexes on Kaggle |
 | 18 Jun 2026 | Retrieval module validated on devset (F2 ≥ 0.55) |
 | 22 Jun 2026 | Generation + guardrails complete; first full pipeline run |
