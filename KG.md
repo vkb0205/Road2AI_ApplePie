@@ -21,8 +21,8 @@ Mục tiêu của KG không phải là mô hình hóa toàn bộ pháp luật Vi
 2. **Ưu tiên relation có tác dụng trực tiếp cho competition.**  
    Các relation nên phục vụ đúng kiểu câu hỏi trong public test: điều kiện, thủ tục, trách nhiệm, xử phạt, hồ sơ, hiệu lực, ưu đãi, và cross-doc multi-hop.
 
-3. **Doc-level là tầng quan trọng nhất cho graph reasoning.**  
-   Article-level dùng để trỏ xuống điều luật; chunk-level chỉ dùng để index và rerank, không cần đưa vào KG.
+3. **Doc-level và article-level vẫn là backbone pháp lý.**  
+   `DOC -> ART` vẫn là trục chuẩn để đi từ văn bản sang điều luật; chunk được đưa vào KG như tầng trung gian để neo evidence, nhưng không trở thành node pháp lý trung tâm.
 
 4. **Concept là tầng ngữ nghĩa phụ trợ.**  
    Concept giúp gom các chủ đề pháp lý lặp lại giữa nhiều văn bản, nhưng không thay thế relation pháp lý gốc.
@@ -95,7 +95,34 @@ Trong đó `doc_uid = {law_id}|{ten_van_ban}|{dieu_so}`.
 
 ***
 
-### 3.3 `CONCEPT` node
+### 3.3 `CHUNK` node
+
+Node này đại diện cho một **chunk triển khai** được sinh từ Stage 3 để bám sát ngữ cảnh cục bộ phục vụ concept extraction và retrieval tracing.
+
+**Key format**
+```text
+CHUNK:{chunk_id}
+```
+
+**Attributes**
+- `type = "Chunk"`.
+- `chunk_id`.
+- `doc_uid`.
+- `doc_id`.
+- `rowidx`.
+- `part_idx`.
+- `breadcrumb`.
+- `law_id` (khuyến nghị giữ thêm để tiện join / debug).
+- `dieu_so` (khuyến nghị giữ thêm để tiện audit từ chunk về article).
+
+**Vai trò**
+- Là node trung gian nối `ART -> CHUNK -> CONCEPT`.
+- Giữ trace rõ ràng từ retrieval unit về article gốc.
+- Cho phép concept extraction bám vào evidence nhỏ, sạch hơn article full text.
+
+***
+
+### 3.4 `CONCEPT` node
 
 Node này đại diện cho **khái niệm pháp lý hoặc chủ đề pháp lý** được trích từ nội dung văn bản.
 
@@ -120,7 +147,7 @@ CONCEPT:{name_lower}
 **Vai trò**
 - Gom các điều luật thuộc cùng chủ đề.
 - Hỗ trợ câu hỏi có wording khác nhau nhưng cùng bản chất pháp lý.
-- Làm graph expansion từ article sang các article cùng concept.
+- Làm graph expansion từ chunk sang các chunk/article cùng concept.
 
 ***
 
@@ -132,14 +159,14 @@ CONCEPT:{name_lower}
    - `display_name`: tiếng Việt có dấu, ví dụ `hóa đơn điện tử`.
    - `norm_name`: lowercase, bỏ dấu, bỏ ký tự thừa để chuẩn hoá matching.
    - `node_id`: key kỹ thuật, ví dụ `CONCEPT:hoa_don_dien_tu`.
-4. Giới hạn tối đa **3 concept/article**.
-5. Concept chỉ được gán khi có bằng chứng rõ ràng trong article hoặc chunk text, ưu tiên concept xuất hiện ở tiêu đề điều, phần mở đầu, hoặc nội dung chính.
+4. Giới hạn tối đa **3 concept/chunk** trong luồng chính; khi aggregate ngược lên article thì có thể giữ union của các concept từ các chunk con.
+5. Concept chỉ được gán khi có bằng chứng rõ ràng trong chunk text; article text chỉ dùng để tổng hợp ngược, sanity-check, hoặc fallback kiểm tra.
 6. Không dùng LLM để tạo concept tự do; chỉ dùng rule/dictionary hoặc mapping vào danh sách concept có sẵn.
 7. Dedup cần hai tầng:
    - dedup theo `norm_name` trước khi tạo node.
-   - dedup theo `(article_id, concept_id)` trước khi tạo edge.
-8. Article là nguồn chính để gán concept; chunk chỉ dùng như bằng chứng phụ hoặc fallback khi cần.
-9. Bản v1 không cần ART–ART; concept layer sẽ đóng vai trò semantic bridge giữa articles.
+   - dedup theo `(chunk_id, concept_id)` trước khi tạo edge.
+8. Chunk là nguồn chính để gán concept; article chỉ là lớp tổng hợp ngược hoặc kiểm tra lại.
+9. Bản v1 không cần `ART–ART`; concept layer sẽ đóng vai trò semantic bridge giữa các article thông qua các chunk con.
 10. Ghi lại reason/mapping cho mỗi concept edge để audit và review thủ công.
 
 ***
@@ -150,7 +177,8 @@ CONCEPT:{name_lower}
 Chỉ giữ các edge thật sự có ích cho retrieval:
 - `DOC -> DOC`.
 - `DOC -> ART`.
-- `ART -> CONCEPT`.
+- `ART -> CHUNK`.
+- `CHUNK -> CONCEPT`.
 
 Không tạo `CHUNK -> CHUNK`.  
 Không tạo reverse edge riêng.  
@@ -162,7 +190,8 @@ Không tạo edge mơ hồ chỉ để “cho đẹp graph”.
 
 | Relation | Nối node gì với node gì | Có sẵn trong dataset relationship gốc chưa? | Cách tạo | Vì sao giữ / dùng | Ghi chú triển khai |
 |---|---|---:|---|---|---|
-| `HAS_ARTICLE` | `DOC -> ART` | Không | Tạo từ Stage 2 / Stage 4 | Bắt buộc để đi từ văn bản sang điều luật; đây là lớp nền cho citation và graph expansion | Deterministic, không dùng LLM. |
+| `HAS_ARTICLE` | `DOC -> ART` | Không | Tạo từ Stage 2 | Bắt buộc để đi từ văn bản sang điều luật; đây là lớp nền cho citation và graph expansion | Deterministic, không dùng LLM. |
+| `HAS_CHUNK` | `ART -> CHUNK` | Không | Tạo từ Stage 3 | Neo chunk về article gốc; bắt buộc nếu chunk là retrieval unit và là nguồn concept extraction chính | Deterministic, không dùng LLM. |
 | `AMENDS` | `DOC -> DOC` | Có | Lấy từ dataset `relationships` gốc | Cực quan trọng vì văn bản pháp luật Việt Nam sửa đổi liên tục; multi-hop qua văn bản sửa đổi là case rất thường gặp | Chỉ giữ canonical 1 chiều. |
 | `REPLACES` | `DOC -> DOC` | Có | Lấy từ dataset `relationships` gốc | Dùng để ưu tiên bản thay thế / bản mới hơn khi có chồng chéo hiệu lực | Chỉ giữ canonical 1 chiều. |
 | `DETAILS` | `DOC -> DOC` | Có | Lấy từ dataset `relationships` gốc | Rất hữu ích cho câu hỏi thủ tục, điều kiện, hồ sơ, cách thực hiện; đây là relation đáng giá nhất cho hỏi đáp | Chỉ giữ canonical 1 chiều. |
@@ -171,7 +200,7 @@ Không tạo edge mơ hồ chỉ để “cho đẹp graph”.
 | `CONSOLIDATES` | `DOC -> DOC` | Có | Lấy từ dataset `relationships` gốc | Quan trọng để ưu tiên bản hợp nhất, tránh trích sai bản cũ | Canonical 1 chiều. |
 | `CORRECTS` | `DOC -> DOC` | Có | Lấy từ dataset `relationships` gốc | Giữ để xử lý trường hợp văn bản đính chính / sửa lỗi nội dung | Canonical 1 chiều, mức ưu tiên thấp hơn. |
 | `RELATED_CONTENT` | `DOC -> DOC` | Có | Lấy từ dataset `relationships` gốc nếu label sạch | Có thể giúp tăng recall khi câu hỏi liên quan gần chủ đề nhưng không khớp hoàn toàn | Chỉ giữ nếu thực nghiệm cho thấy sạch; nếu nhiễu thì bỏ. |
-| `MENTIONS` | `ART -> CONCEPT` | Không | Tạo từ article/chunk text bằng rule-based extraction; optional `enriched_text` nếu Stage 4 exists | Hỗ trợ gom chủ đề pháp lý, làm cầu nối semantic giữa nhiều điều luật | Không dùng LLM nếu rule/dictionary đủ tốt.
+| `MENTIONS` | `CHUNK -> CONCEPT` | Không | Tạo từ chunk text bằng rule-based extraction; optional `enriched_text` nếu Stage 4 exists nhưng chunk text vẫn là nguồn chính | Hỗ trợ gom chủ đề pháp lý, làm cầu nối semantic giữa nhiều điều luật thông qua các chunk con | Không dùng LLM nếu rule/dictionary đủ tốt. |
 
 ***
 
@@ -200,20 +229,26 @@ Các relation `DOC -> DOC` nên lấy trực tiếp từ `relationships` dataset
 - `CORRECTS`
 - `RELATED_CONTENT`.
 
-### 7.2 Từ Stage 2 / Stage 3
-- `HAS_ARTICLE` từ `stage2_articles.parquet` hoặc optional `stage4_enriched.parquet`.
-- `ART` nodes từ stage 2 articles.
-- `short`, `key`, `enriched_text` chỉ có khi Stage 4 được chạy; không bắt buộc cho KG.
+### 7.2 Từ Stage 2
+- `HAS_ARTICLE` từ `stage2_articles.parquet`.
+- `ART` nodes từ Stage 2 articles.
 
-### 7.3 Từ rule-based concept extraction
-- `MENTIONS` từ article text (`stage2_articles.parquet`) hoặc chunk text (`stage3_chunks.parquet`), với `stage4_enriched.parquet` là tùy chọn bổ sung.
+### 7.3 Từ Stage 3
+- `HAS_CHUNK` từ `stage3_chunks.parquet`, nối `ART -> CHUNK`.
+- `CHUNK` nodes từ Stage 3 chunks với metadata tối thiểu: `chunk_id`, `doc_uid`, `doc_id`, `rowidx`, `part_idx`, `breadcrumb`.
+- **Luồng concept extraction chính: chunk text → concept** (Section 7.4 bên dưới).
+
+### 7.4 Từ rule-based concept extraction trên chunk
+- **`MENTIONS` từ chunk text (`stage3_chunks.parquet`) là nguồn chính ở luồng mới.**
+- Optional `enriched_text` nếu Stage 4 có sẵn, nhưng **chunk text vẫn là primary source**.
+- `stage2_articles.parquet` chỉ dùng để aggregate ngược / kiểm tra lại.
 - Cách làm:
-  - tạo vocabulary khái niệm pháp lý,
-  - normalize về lowercase,
-  - match string hoặc synonym list,
-  - gán edge `ART -> CONCEPT` nếu khái niệm xuất hiện đủ rõ.
+  - Tạo vocabulary khái niệm pháp lý từ controlled list.
+  - Normalize về lowercase, bỏ dấu, loại bỏ ký tự thừa.
+  - Match string (substring) hoặc synonym list trên chunk text.
+  - Gán edge `CHUNK -> CONCEPT` nếu khái niệm xuất hiện rõ trong chunk.
 
-### 7.4 Khi nào mới dùng LLM
+### 7.5 Khi nào mới dùng LLM
 Chỉ dùng LLM nếu:
 - muốn mở rộng concept vocabulary,
 - muốn chuẩn hóa synonym phức tạp,
@@ -266,17 +301,29 @@ Procedure:
 
 ***
 
-### 8.4 Build concept nodes
+### 8.4 Build chunk nodes
 Input:
-- `stage2_articles.parquet` hoặc `stage3_chunks.parquet`.
+- `stage3_chunks.parquet`.
+
+Procedure:
+1. Duyệt từng chunk.
+2. Tạo `CHUNK:{chunk_id}`.
+3. Gán metadata tối thiểu: `doc_uid`, `doc_id`, `rowidx`, `part_idx`, `breadcrumb`.
+4. Tạo cạnh `ART -> CHUNK` với relation `HAS_CHUNK`.
+
+***
+
+### 8.5 Build concept nodes
+Input:
+- `stage3_chunks.parquet`.
 - Optional: `stage4_enriched.parquet` if available.
 
 Procedure:
 1. Tạo dictionary concept chuẩn.
-2. Duyệt text từng article hoặc chunk.
+2. Duyệt text từng chunk.
 3. Match concept bằng string / synonym / regex.
 4. Tạo `CONCEPT` node nếu chưa có.
-5. Tạo edge `ART -> CONCEPT` bằng `MENTIONS`.
+5. Tạo edge `CHUNK -> CONCEPT` bằng `MENTIONS`.
 
 ***
 
@@ -286,7 +333,7 @@ Graph này cần phục vụ 4 loại truy vấn chính:
 
 1. **Single-doc, single-article**
 - Ví dụ: “Công ty muốn sử dụng hóa đơn điện tử không mã thì cần điều kiện gì?”
-- Cần `DOC -> ART` và `MENTIONS`.
+- Cần `DOC -> ART -> CHUNK` và `MENTIONS`.
 
 2. **Cross-doc, same topic**
 - Ví dụ: luật + nghị định + thông tư về cùng vấn đề.
@@ -298,30 +345,39 @@ Graph này cần phục vụ 4 loại truy vấn chính:
 
 4. **Topic bridging**
 - Ví dụ: một query nhắc “bảo hiểm xã hội” nhưng văn bản có thể gọi theo cách khác.
-- Cần `CONCEPT` và `MENTIONS` để tăng recall.
+- Cần `CHUNK -> CONCEPT` để tăng recall, sau đó aggregate ngược về article/doc phục vụ cite.
 
 ***
 
 ## 10. Ghi chú về chunk
 
 Chunk là tầng phục vụ:
-- BM25,
-- FAISS,
-- rerank,
-- context construction cho LLM.
+- BM25 indexing,
+- FAISS dense search,
+- rerank via cross-encoder,
+- context construction cho LLM,
+- **concept extraction (luồng chính của KG)**.
 
-Chunk **không cần** trở thành node của KG, vì:
-- chunk là cấu trúc triển khai, không phải thực thể pháp lý,
-- chunk đã mang breadcrumb và summary,
-- article node đã đủ để bridge từ doc sang nội dung. 
+Chunk **được đưa vào KG như một tầng trung gian** giữa article và concept:
+- **Là retrieval unit chính** (thay vì article hoặc doc).
+- **Là source chính cho concept extraction** thay vì article text.
+- Nhưng **vẫn không trở thành node pháp lý trung tâm**, vì:
+  - Chunk là cấu trúc triển khai / evidence layer, không phải đơn vị cite cuối cùng.
+  - Citation và legal grounding vẫn quay về article/doc.
+  - Chunk giúp neo tín hiệu semantic ở độ hạt nhỏ, nhưng article là unit để trích dẫn trong answer.
 
-Nếu muốn trace từ chunk về graph, chỉ cần metadata:
+Metadata tối thiểu cần giữ trên node chunk:
 - `chunk_id`.
 - `doc_uid`.
 - `doc_id`.
 - `rowidx`.
+- `part_idx`.
+- `breadcrumb`.
+
+Có thể giữ thêm để tiện trace / audit:
 - `law_id`.
-- `dieu_so`. 
+- `dieu_so`.
+
 ***
 
 ## 11. Quality gates
@@ -329,9 +385,13 @@ Nếu muốn trace từ chunk về graph, chỉ cần metadata:
 Trước khi chốt KG, cần kiểm tra:
 - Không có duplicate node key.
 - `HAS_ARTICLE` luôn nối từ `DOC` sang `ART`.
+- `HAS_CHUNK` luôn nối từ `ART` sang `CHUNK`.
 - Tất cả `ART` đều có parent `DOC`.
+- Mọi `CHUNK` đều có parent `ART`.
 - Tất cả doc-doc edges đều thuộc whitelist canonical relations.
-- `MENTIONS` chỉ nối `ART -> CONCEPT`.
+- `MENTIONS` chỉ nối `CHUNK -> CONCEPT`.
+- `CHUNK -> CONCEPT` là edge duy nhất cho concept extraction ở luồng chính.
+- Không có `ART -> CONCEPT` nếu pipeline mới đã chuyển hẳn sang chunk-first.
 - Không có `RELATED_LANGUAGE` trong final KG nếu không có bằng chứng thực nghiệm tốt.
 
 ***
@@ -340,6 +400,7 @@ Trước khi chốt KG, cần kiểm tra:
 
 ### Giữ
 - `HAS_ARTICLE`
+- `HAS_CHUNK`
 - `AMENDS`
 - `REPLACES`
 - `DETAILS`
@@ -359,10 +420,11 @@ Trước khi chốt KG, cần kiểm tra:
 ### Ưu tiên cao nhất
 Nếu phải chọn ít relation nhất mà vẫn hiệu quả, mình đề xuất theo thứ tự:
 1. `HAS_ARTICLE`
-2. `DETAILS`
-3. `AMENDS`
-4. `REPLACES`
-5. `CITES_REF`
-6. `BASED_ON`
-7. `CONSOLIDATES`
-8. `MENTIONS` 
+2. `HAS_CHUNK`
+3. `DETAILS`
+4. `AMENDS`
+5. `REPLACES`
+6. `CITES_REF`
+7. `BASED_ON`
+8. `CONSOLIDATES`
+9. `MENTIONS`

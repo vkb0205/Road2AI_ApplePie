@@ -86,13 +86,14 @@ The plan is organised into five phases that mirror the pipeline:
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
-| 5.1 | 🔲 Implement `src/data/stage5buildgraph.py`; build `networkx.MultiDiGraph` with Document, Article, Concept nodes | All | ⏳ Blocked on 4.4 | Script completes without error |
+| 5.1 | 🔲 Implement `src/data/stage5buildgraph.py`; build `networkx.MultiDiGraph` with Document, Article, Chunk, Concept nodes | All | ⏳ Blocked on Stage 2/3 artifacts | Script completes without error |
 | 5.2 | 🔲 Add Document nodes from `stage1_sme_docs.parquet` (attributes: `law_id`, `ten`, `loai`, `nganh`, `ngay_ban_hanh`) | All | ⏳ | Node count in [3 000, 8 000] |
 | 5.3 | 🔲 Add Article nodes + `HAS_ARTICLE` edges from `stage2_articles.parquet` (deduplicated by `doc_uid`) | All | ⏳ | Article node count ≈ 50 000 |
-| 5.4 | 🔲 Add cross-document edges from `relationships` config; filter to SME doc IDs; map 14 Vietnamese labels via `RELATIONSHIP_MAP` | All | ⏳ | Edge count in [150 000, 350 000] |
-| 5.5 | 🔲 Add Concept nodes and `MENTIONS` edges via rule-based extraction on article/chunk text; optional use of `enriched_text` if Stage 4 exists | All | ⏳ | 50–100 concept nodes; `MENTIONS` edges ≈ 30 000–50 000 |
-| 5.6 | 🔲 Persist graph to `kg.gpickle` using `pickle.HIGHEST_PROTOCOL` | All | ⏳ | File readable; `nx.info(G)` shows expected node/edge counts |
-| 5.7 | 🔲 Validate: log warnings for unmapped relationship labels (stored verbatim under key `rel`) | All | ⏳ | Zero crash; warnings visible in log |
+| 5.4 | 🔲 Add Chunk nodes + `HAS_CHUNK` edges from `stage3_chunks.parquet`; keep `chunk_id`, `doc_uid`, `doc_id`, `rowidx`, `part_idx`, `breadcrumb` metadata | All | ⏳ | Chunk node count = 74 107; every chunk has parent `ART` |
+| 5.5 | 🔲 Add cross-document edges from `relationships` config; filter to SME doc IDs; map 14 Vietnamese labels via `RELATIONSHIP_MAP` | All | ⏳ | Edge count in [150 000, 350 000] |
+| 5.6 | 🔲 Add Concept nodes and `MENTIONS` edges via **chunk text extraction** (chunk-first pipeline); chunk text is primary source, article text only for aggregation | All | ⏳ | 50–100 concept nodes; `MENTIONS` edges are `CHUNK -> CONCEPT` only; no `ART -> CONCEPT` |
+| 5.7 | 🔲 Persist graph to `kg.gpickle` using `pickle.HIGHEST_PROTOCOL` | All | ⏳ | File readable; `nx.info(G)` shows expected node/edge counts |
+| 5.8 | 🔲 Validate: enforce `DOC -> ART -> CHUNK -> CONCEPT`; check every chunk has parent article; no orphan chunks; no `ART -> CONCEPT` edges | All | ⏳ | Zero crash; quality gates pass; chunk-first pipeline confirmed |
 
 ### Stage 6 — Indexing ⏳
 
@@ -116,7 +117,7 @@ The plan is organised into five phases that mirror the pipeline:
 |---|------|-------|--------|------------|
 | 7.1 | 🔲 Implement `src/retrieval/retriever.py`: parallel BM25 + FAISS-summary + FAISS-full (top-50 each) | All | ⏳ Blocked on Phase 2 | Returns ≥ 1 hit for all 50 devset questions |
 | 7.2 | 🔲 Implement `src/retrieval/rrf.py`: RRF fusion with k=60; keep top-30 | All | ⏳ | Output is deterministic across re-runs with seed 42 |
-| 7.3 | 🔲 Implement `src/retrieval/graphexpand.py`: 1-hop DOC → ART expansion via `DETAILS/AMENDS/REPLACES/CITESREF/BASISOF`; concept co-mention siblings with discount 0.3; output top-50 | All | ⏳ | Graph expansion increases recall on devset by ≥ 5 pp vs. no expansion |
+| 7.3 | 🔲 Implement `src/retrieval/graphexpand.py`: 1-hop DOC → ART expansion via `DETAILS/AMENDS/REPLACES/CITESREF/BASISOF`; concept co-mention through `ART -> CHUNK -> CONCEPT <- CHUNK <- ART` with discount 0.3; output top-50 articles | All | ⏳ | Graph expansion increases recall on devset by ≥ 5 pp vs. no expansion |
 | 7.4 | 🔲 Implement cross-encoder rerank via `BAAI/bge-reranker-v2-m3` (fp16); keep final top-K = 5 | All | ⏳ | F2 macro on devset ≥ 0.55 |
 | 7.5 | 🔲 Run end-to-end retrieval on devset; record F2 macro as baseline for ablation | All | ⏳ | Baseline number committed to `devset/results_baseline.json` |
 
@@ -182,7 +183,7 @@ The plan is organised into five phases that mirror the pipeline:
 ## Dependency Graph (summary)
 
 ```
-Stage1 ✅ → Stage2 ✅ → Stage3 ✅ → Stage5 → Stage6
+Stage1 ✅ → Stage2 ✅ → Stage3 ✅ → Stage5 (DOC→ART→CHUNK→CONCEPT) → Stage6
                                           ↓               ↓
                                      Retrieval ←──────────┘
                                           ↓

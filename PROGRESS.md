@@ -66,3 +66,49 @@
 
 **Status**: Stage 4 summary injection removed from the main pipeline.
 
+---
+
+## Knowledge Graph & Concept Extraction — Chunk-First Approach
+
+### Checkpoint 14/06/2026 - System Design Update
+
+**Scope**: Updated all markdown specifications (KG.md, PLAN.md, G-LRAG_SPECIFICATIONS.md, PROGRESS.md) to implement **chunk-centric concept extraction** while preserving DOC and ART as standard layers.
+
+**Key Changes**:
+
+1. **Concept extraction source**: Moved from article-level to **chunk-level extraction**.
+   - **Primary source**: `chunk_text` from `stage3_chunks.parquet` (mandatory).
+   - **Secondary source**: Optional `enriched_text` from Stage 4 if available, but chunk text remains primary.
+   - **Article aggregation**: Article text used only for reverse aggregation / sanity checking, not as primary extraction source.
+
+2. **New edge in KG core**: Added `ART -> CHUNK` edge type.
+   - **Previous core edges**: `DOC -> DOC`, `DOC -> ART`, `ART -> CONCEPT`.
+   - **New core edges**: `DOC -> DOC`, `DOC -> ART`, `ART -> CHUNK`, `CHUNK -> CONCEPT`.
+
+3. **CHUNK as intermediate node**:
+   - Chunk nodes (`CHUNK:{chunk_id}`) now included in KG as intermediate layer.
+   - Chunks are retrieval units (indexed by BM25/FAISS).
+   - Chunks carry tightly-scoped evidence for concept matching.
+   - Metadata on chunk nodes: `chunk_id`, `doc_uid`, `doc_id`, `rowidx`, `part_idx`, `breadcrumb`.
+
+4. **Concept node quality gates**:
+   - **No orphan chunks**: Every `CHUNK` must have parent `ART` via `HAS_CHUNK` edge.
+   - **No `ART -> CONCEPT` in chunk-first pipeline**: All concept mentions now flow through chunks.
+   - **`CHUNK -> CONCEPT` as primary**: Rule-based matching on chunk text (controlled vocabulary, no LLM).
+
+5. **Motivation for chunk-first**:
+   - With 74,107 chunks vs. 56,269 articles, chunk-level extraction provides:
+     - More granular evidence scoping (chunk is smaller, tighter unit).
+     - Better alignment with retrieval (chunks are what BM25/FAISS indexes).
+     - Reduced false-positive concept assignments (smaller text span = lower ambiguity).
+
+6. **Files updated**:
+   - `KG.md`: Sections 2 (design principles), 3.3 (CHUNK node spec), 4 (concept design), 5.2 (edge types), 7.3–7.5 (relation sources), 10 (chunk role), 11 (quality gates).
+   - `PLAN.md`: Stage 5 tasks 5.6 and 5.8 to reflect chunk-first extraction.
+   - `G-LRAG_SPECIFICATIONS.md`: Section 8.2 (node types with CHUNK), Section 8.5 and 8.8 (concept extraction procedure and stats).
+   - `PROGRESS.md`: This checkpoint documenting the system-wide update.
+
+**Next steps**: 
+- Stage 5 (graph build) implementation must enforce chunk-first concept extraction.
+- Update Stage 6 (indexing) if needed to reflect chunk as retrieval unit.
+- Verify quality gates during graph build to ensure no orphan chunks and no `ART -> CONCEPT` edges.

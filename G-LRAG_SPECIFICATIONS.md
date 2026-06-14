@@ -696,7 +696,8 @@ Notes on the Vietnamese legal-text format that drive these patterns:
 | `CORRECTED_BY` | Document | Document | `relationships` config |
 | `RELATED_LANGUAGE` | Document | Document | `relationships` config |
 | `RELATED_CONTENT` | Document | Document | `relationships` config |
-| `MENTIONS` | Article | Concept | Rule-based string match on article/chunk text; optional enriched text if available |
+| `HAS_CHUNK` | Article | Chunk | Derived from Stage 3 (`stage3_chunks.parquet`) |
+| `MENTIONS` | Chunk | Concept | Rule-based string match on chunk text; optional enriched text if available, but chunk text is the primary source |
 
 ### 8.4 Relationship label mapping
 
@@ -747,7 +748,7 @@ Unmapped labels are stored verbatim under the key `rel` and logged as warnings d
 
 ### 8.5 Concept seed list
 
-Curated list of approximately 50-100 SME-relevant legal concepts, stored in `config/legal_concepts.yaml`. Matching is case-insensitive substring search against `enriched_text`.
+Curated list of approximately 50-100 SME-relevant legal concepts, stored in `config/legal_concepts.yaml`. Matching is case-insensitive substring search against chunk text (or optional `enriched_text` when available), with Stage 3 chunks as the primary evidence source.
 
 ```yaml
 LEGAL_CONCEPTS:
@@ -814,7 +815,7 @@ for row in sme_docs.itertuples():
                ngay_ban_hanh=row.ngay_ban_hanh)
 ```
 
-**Step 2** — Article nodes and `HAS_ARTICLE` edges from `stage2_articles.parquet` (or optional `stage4_enriched.parquet` if available):
+**Step 2** — Article nodes and `HAS_ARTICLE` edges from `stage2_articles.parquet` (or optional Stage 4 metadata if available):
 
 ```python
 for art in articles.drop_duplicates("doc_uid").itertuples():
@@ -845,26 +846,43 @@ for r in rels.itertuples():
     G.add_edge(f"DOC:{r.doc_id}", f"DOC:{r.other_doc_id}", rel=rel_enum)
 ```
 
-**Step 4** — Concept nodes and `MENTIONS` edges:
+**Step 4** — Chunk nodes and `HAS_CHUNK` edges from `stage3_chunks.parquet`:
+
+```python
+for ch in chunks.itertuples():
+    chunk_id = f"CHUNK:{ch.chunk_id}"
+    G.add_node(chunk_id,
+               type="Chunk",
+               chunk_id=ch.chunk_id,
+               doc_uid=ch.doc_uid,
+               doc_id=ch.doc_id,
+               rowidx=ch.rowidx,
+               part_idx=ch.part_idx,
+               breadcrumb=ch.breadcrumb)
+    G.add_edge(f"ART:{ch.doc_uid}", chunk_id, rel="HAS_CHUNK")
+```
+
+**Step 5** — Concept nodes and `MENTIONS` edges (chunk-first extraction):
 
 ```python
 for c in LEGAL_CONCEPTS:
     G.add_node(f"CONCEPT:{c.lower()}", type="Concept", name=c)
 
-for art in articles.itertuples():
-    text_lower = None
-    if hasattr(art, "enriched_text"):
-        text_lower = art.enriched_text.lower()
-    elif hasattr(art, "chunk_text"):
-        text_lower = art.chunk_text.lower()
-    elif hasattr(art, "article_text"):
-        text_lower = art.article_text.lower()
+# Chunk-first concept extraction: primary source is chunk text
+for ch in chunks.itertuples():
+    # Primary: chunk_text (mandatory)
+    text_lower = ch.chunk_text.lower() if hasattr(ch, "chunk_text") else None
+    
+    # Secondary: optional enriched_text from Stage 4, but only if chunk_text check fails
+    if text_lower is None and hasattr(ch, "enriched_text"):
+        text_lower = ch.enriched_text.lower()
+    
     if text_lower is None:
         continue
 
     for c in LEGAL_CONCEPTS:
         if c.lower() in text_lower:
-            G.add_edge(f"ART:{art.doc_uid}",
+            G.add_edge(f"CHUNK:{ch.chunk_id}",
                        f"CONCEPT:{c.lower()}", rel="MENTIONS")
 ```
 
@@ -881,8 +899,10 @@ with open("kg.gpickle", "wb") as f:
 |---|---|
 | Document nodes | ~4,000 |
 | Article nodes | ~50,000 |
+| Chunk nodes | ~74,107 |
 | Concept nodes | ~50-100 |
 | `HAS_ARTICLE` edges | ~50,000 |
+| `HAS_CHUNK` edges | ~74,107 |
 | Cross-document edges | ~150,000-250,000 |
 | `MENTIONS` edges | ~30,000-50,000 |
 
@@ -1035,18 +1055,30 @@ def graph_expand(candidates, discount_doc=0.6, discount_concept=0.3, top_n=50):
                     score * discount_doc
                 )
 
-        # 1.5-hop: concept co-mention
-        for _, concept in G.out_edges(art_node):
-            if not concept.startswith("CONCEPT:"):
+        # 1.5-hop: concept co-mention via chunk layer
+        for _, chunk_node, edge in G.out_edges(art_node, data=True):
+            if edge.get("rel") != "HAS_CHUNK":
                 continue
-            for sibling, _ in G.in_edges(concept):
-                if sibling == art_node or not sibling.startswith("ART:"):
+            for _, concept, edge2 in G.out_edges(chunk_node, data=True):
+                if edge2.get("rel") != "MENTIONS":
                     continue
-                sib_uid = G.nodes[sibling]["doc_uid"]
-                sib_idx = uid_to_idx.get(sib_uid)
-                if sib_idx is None or sib_idx in expanded:
-                    continue
-                expanded[sib_idx] = score * discount_concept
+                for sibling_chunk, _, edge3 in G.in_edges(concept, data=True):
+                    if edge3.get("rel") != "MENTIONS":
+                        continue
+                    if sibling_chunk == chunk_node or not sibling_chunk.startswith("CHUNK:"):
+                        continue
+                    sib_art = next(
+                        (p for p, _, d in G.in_edges(sibling_chunk, data=True)
+                         if d.get("rel") == "HAS_CHUNK"),
+                        None
+                    )
+                    if sib_art is None or sib_art == art_node:
+                        continue
+                    sib_uid = G.nodes[sib_art]["doc_uid"]
+                    sib_idx = uid_to_idx.get(sib_uid)
+                    if sib_idx is None or sib_idx in expanded:
+                        continue
+                    expanded[sib_idx] = score * discount_concept
 
     return sorted(expanded.items(), key=lambda x: -x[1])[:top_n]
 ```
