@@ -86,7 +86,7 @@ The plan is organised into five phases that mirror the pipeline:
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
-| 5.1 | 🔲 Implement `src/data/stage5buildgraph.py`; build `networkx.MultiDiGraph` with Document, Article, Chunk, Concept nodes | All | ⏳ Blocked on Stage 2/3 artifacts | Script completes without error |
+| 5.1 | 🔲 Implement `src/data/stage5_build_graph.py`; build `networkx.MultiDiGraph` with Document, Article, Chunk, Concept nodes | All | ⏳ Blocked on Stage 2/3 artifacts | Script completes without error |
 | 5.2 | 🔲 Add Document nodes from `stage1_sme_docs.parquet` (attributes: `law_id`, `ten`, `loai`, `nganh`, `ngay_ban_hanh`) | All | ⏳ | Node count in [3 000, 8 000] |
 | 5.3 | 🔲 Add Article nodes + `HAS_ARTICLE` edges from `stage2_articles.parquet` (deduplicated by `doc_uid`) | All | ⏳ | Article node count ≈ 50 000 |
 | 5.4 | 🔲 Add Chunk nodes + `HAS_CHUNK` edges from `stage3_chunks.parquet`; keep `chunk_id`, `doc_uid`, `doc_id`, `rowidx`, `part_idx`, `breadcrumb` metadata | All | ⏳ | Chunk node count = 74 107; every chunk has parent `ART` |

@@ -68,9 +68,9 @@
 
 ---
 
-## Knowledge Graph & Concept Extraction — Chunk-First Approach
+## Knowledge Graph & Concept Extraction — Chunk-First Approach - KL
 
-### Checkpoint 14/06/2026 - System Design Update
+### Checkpoint 14/06/2026 - System Design Update 
 
 **Scope**: Updated all markdown specifications (KG.md, PLAN.md, G-LRAG_SPECIFICATIONS.md, PROGRESS.md) to implement **chunk-centric concept extraction** while preserving DOC and ART as standard layers.
 
@@ -108,7 +108,39 @@
    - `G-LRAG_SPECIFICATIONS.md`: Section 8.2 (node types with CHUNK), Section 8.5 and 8.8 (concept extraction procedure and stats).
    - `PROGRESS.md`: This checkpoint documenting the system-wide update.
 
-**Next steps**: 
+**Next steps**:
 - Stage 5 (graph build) implementation must enforce chunk-first concept extraction.
 - Update Stage 6 (indexing) if needed to reflect chunk as retrieval unit.
 - Verify quality gates during graph build to ensure no orphan chunks and no `ART -> CONCEPT` edges.
+
+### Checkpoint 15/06/2026 - Stage 5.2 (DOC nodes) - VKB
+
+- Implement `src/data/stage5_build_graph.py` as an **incremental** graph builder. The script is designed to be called repeatedly so each sub-stage (5.2 DOC, 5.3 ART, 5.4 CHUNK, 5.5 doc-doc edges, 5.6 CONCEPT) can append into the same persisted `networkx.MultiDiGraph`.
+- Stage 5.2 scope (this checkpoint): **DOC nodes only**.
+  - Input: `data/stage1_sme_docs.parquet`.
+  - Output: `data/kg.gpickle` (DOC-only at this stage).
+  - Node key format: `DOC:{doc_id}` (per `KG.md` §3.1).
+  - Node attributes (full set, KG.md §3.1, exceeds the minimal PLAN.md 5.2 list): `type=Document`, `doc_id`, `law_id`, `ten`, `loai`, `nganh`, `linh_vuc`, `ngay_ban_hanh`, `tinh_trang_hieu_luc`, `ngay_co_hieu_luc`, `ngay_het_hieu_luc`. NaN values normalized to `None` so `linh_vuc` and `ngay_het_hieu_luc` cleanly distinguish "missing" from "empty string".
+  - Persistence: `pickle.HIGHEST_PROTOCOL` per `KG.md` §8.7.
+  - CLI: `--stage1-path`, `--output-path`, `--append`. The `--append` flag loads an existing `kg.gpickle`, updates DOC attrs in place, and re-persists. Wired up now so future stages can extend the graph without rebuilding.
+- **Quality gates** (run before persist):
+  1. Every input row produces exactly one DOC node (no silent drops).
+  2. All nodes have `type == "Document"`, non-empty `law_id`, non-empty `ten`.
+  3. Node count within `[3000, 20000]` window (widened from PLAN.md `[3000, 8000]` to match the runtime bound enforced in `src/data/stage1_filter.py`, which currently emits ~14k SME docs after the document-type expansion).
+- **Run results** (executed 2026-06-15):
+  - Command: `conda run --no-capture-output -n R2AI_26 python Road2AI_ApplePie/src/data/stage5_build_graph.py`
+  - Loaded **14,694** SME documents from `stage1_sme_docs.parquet`.
+  - Created **14,694** DOC nodes; 0 edges (DOC-only).
+  - Output: `data/kg.gpickle` (4.67 MB).
+  - Attribute coverage on DOC nodes:
+    - `law_id`, `ten`, `loai`, `ngay_ban_hanh`, `tinh_trang_hieu_luc`, `ngay_co_hieu_luc`: **100.0%**
+    - `nganh`: **73.8%**
+    - `linh_vuc`: **37.2%**
+    - `ngay_het_hieu_luc`: **1.0%** (expected — only set when a document has been replaced/expired)
+  - Smoke test: round-tripped the gpickle through `pickle.load` and verified node type is `MultiDiGraph` with the expected node count and a sample DOC node carrying the full attribute set.
+- **Note on PLAN.md acceptance window**: PLAN.md task 5.2 specifies node count in `[3000, 8000]`, derived from an earlier (narrower) Stage 1 filter scope. The current `stage1_filter.py` quality gate accepts `[3000, 20000]` (see `src/data/stage1_filter.py` line 105). Stage 5.2 mirrors the live Stage 1 bound so we don't fail on a stale spec.
+- **Next steps for Stage 5**:
+  - 5.3 ART nodes + `HAS_ARTICLE` edges from `stage2_articles.parquet` (use `--append`).
+  - 5.4 CHUNK nodes + `HAS_CHUNK` edges from `stage3_chunks.parquet` (use `--append`).
+  - 5.5 doc-doc edges from the `relationships` config via `RELATIONSHIP_MAP`.
+  - 5.6 CONCEPT nodes + `MENTIONS` edges via chunk-first rule-based extraction.
