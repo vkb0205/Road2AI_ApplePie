@@ -6,3 +6,6 @@ tmp_duplicate_sample.txt
 __pycache__/
 .env
 data/stage3_chunks.parquet
+
+data/relationships.jsonl
+data/kg.gpickle

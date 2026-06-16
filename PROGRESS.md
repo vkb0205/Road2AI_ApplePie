@@ -144,3 +144,105 @@
   - 5.4 CHUNK nodes + `HAS_CHUNK` edges from `stage3_chunks.parquet` (use `--append`).
   - 5.5 doc-doc edges from the `relationships` config via `RELATIONSHIP_MAP`.
   - 5.6 CONCEPT nodes + `MENTIONS` edges via chunk-first rule-based extraction.
+
+### Checkpoint 16/06/2026 - Stage 5.3 (ART nodes + HAS_ARTICLE edges) - VKB
+
+- OpenSpec change `stage-5-3-article-nodes` covers the proposal, design (six locked decisions), specs (`kg-article-layer`, `kg-build-cli`), and tasks. See `openspec/changes/stage-5-3-article-nodes/`.
+- **CLI refactor** in `src/data/stage5_build_graph.py`:
+  - Replaced single hard-coded entry point with `--stage {5.2,5.3,5.4,5.5,5.6,all}` dispatcher (`required=True`).
+  - Added `--stage2-path` and `--orphan-articles-path` flags; preserved `--stage1-path`, `--output-path`, `--append`.
+  - Stages 5.3–5.6 require `--append`; missing flag produces a fast-fail usage error.
+  - Stage 5.4–5.6 are scaffolded as `NotImplementedError` stubs; `--stage all` skips them with a clear log message.
+- **Stage 5.3 builder**:
+  - Inner-joins `stage2_articles.parquet` against existing DOC nodes; orphan rows (none in current data) export to `data/stage5_orphan_articles.jsonl`.
+  - ART node key format: `ART:{doc_uid}` where `doc_uid = {law_id}|{ten_van_ban}|{dieu_so}` (per `KG.md` §3.2).
+  - Locked attribute set excludes `noi_dung` to keep `kg.gpickle` lean (per design Decision 2): `type, doc_uid, doc_id, law_id, ten_van_ban, dieu_so, dieu_ten, phan, chuong, muc, loai_van_ban, ngay_ban_hanh, start_char, end_char`.
+  - Empty strings normalized to `None` via the existing `_normalize_value()` helper.
+  - HAS_ARTICLE edges use explicit `key="HAS_ARTICLE"` and a single attr `relation="HAS_ARTICLE"`; idempotent on `--append` re-runs.
+- **Quality gates** (`run_article_quality_gates`): ART count in `[20_000, 100_000]`; no duplicate `ART:{doc_uid}` keys; every ART has at least one parent DOC via HAS_ARTICLE; every HAS_ARTICLE edge has source `Document`, target `Article`, key `HAS_ARTICLE`, relation `HAS_ARTICLE`, matching `doc_id`; required attrs non-null on every ART. Failure raises `AssertionError` BEFORE persistence so `kg.gpickle` is never overwritten in a bad state.
+- **Run results** (executed 2026-06-16):
+  - Command: `python -m src.data.stage5_build_graph --stage 5.3 --append`
+  - Input: `data/stage2_articles.parquet` (56,269 article rows).
+  - Joined: **56,269** | Orphans: **0** (current SME filter is a strict superset of all parsed articles).
+  - Added **56,269** ART nodes and **56,269** HAS_ARTICLE edges; quality gates passed.
+  - Output: `data/kg.gpickle` (**48.50 MB**, up from 4.67 MB DOC-only).
+  - Total graph: **70,963 nodes** (14,694 DOC + 56,269 ART) + **56,269 edges**.
+  - `data/stage5_orphan_articles.jsonl` written empty (0 records) per the spec scenario "Orphans are written even when the count is zero".
+  - **Idempotency**: re-ran the same command and confirmed 0 new nodes / 0 new edges added; node count, edge count, and file size identical.
+  - Attribute coverage on ART nodes:
+    - `doc_uid`, `doc_id`, `law_id`, `ten_van_ban`, `dieu_so`, `dieu_ten`, `loai_van_ban`, `ngay_ban_hanh`, `start_char`, `end_char`: **100.0%**
+    - `chuong`: **47.9%**, `muc`: **13.3%**, `phan`: **2.3%** (expected — most documents do not use the full Phần/Chương/Mục hierarchy)
+- **Tests**: `tests/test_stage5_articles.py` covers partition, attribute schema (locked + `noi_dung` excluded), edge minimality, idempotency, orphan JSONL shape (incl. zero-orphan), three quality-gate failure modes, CLI fast-fail without `--stage` and without `--append`, and a Stage 5.2 round-trip via the new CLI surface. **14/14 passing.**
+- **Note on the SME-filter / Stage 2 alignment**: with zero orphans, the inner-join policy and an "add all" policy converge in practice for the current corpus. The orphan-export contract still has value as a regression guard — if the SME filter is later narrowed, orphans will surface to the JSONL without crashing the build.
+- **Next steps**:
+  - 5.4 CHUNK nodes + `HAS_CHUNK` edges from `stage3_chunks.parquet` (use `--append`); skip orphan chunks whose parent ART is missing (none expected given current data).
+  - 5.5 doc-doc edges from `relationships` config via `RELATIONSHIP_MAP`.
+  - 5.6 CONCEPT nodes + `MENTIONS` edges via chunk-first rule-based extraction.
+
+### Checkpoint 16/06/2026 - Stage 5.4 (CHUNK nodes + HAS_CHUNK edges) - VKB
+
+- **Stage 5.4 builder** in `src/data/stage5_build_graph.py`:
+  - Input: `data/stage3_chunks.parquet` (74,107 chunk rows).
+  - Inner-joins chunks against existing ART nodes via `ART:{doc_uid}`; orphan chunks (parent ART missing) export to `data/stage5_orphan_chunks.jsonl`.
+  - CHUNK node key format: `CHUNK:{chunk_id}` (per `KG.md` §3.3).
+  - Node attributes (lean, excludes `chunk_text`): `type=Chunk`, `chunk_id`, `doc_uid`, `doc_id`, `rowidx`, `part_idx`, `breadcrumb`.
+  - HAS_CHUNK edges use explicit `key="HAS_CHUNK"` and attr `relation="HAS_CHUNK"`; idempotent on `--append` re-runs.
+  - Quality gates (`run_chunk_quality_gates`): CHUNK count in `[20_000, 74_107]`; no duplicate keys; every CHUNK has parent ART via HAS_CHUNK; edge source/target types validated; `doc_uid` consistency between ART and CHUNK.
+- **Run results** (executed 2026-06-16):
+  - Command: `python -m src.data.stage5_build_graph --stage 5.4 --append`
+  - Joined: **74,107** | Orphans: **0** (all chunks have parent ART).
+  - Added **74,107** CHUNK nodes and **74,107** HAS_CHUNK edges; quality gates passed.
+  - Output: `data/kg.gpickle` — **145,070 nodes** (14,694 DOC + 56,269 ART + 74,107 CHUNK) + **130,376 edges** (56,269 HAS_ARTICLE + 74,107 HAS_CHUNK).
+
+### Checkpoint 16/06/2026 - Stage 5.5 (DOC → DOC cross-document edges) - VKB
+
+- **Stage 5.5 builder** in `src/data/stage5_build_graph.py`:
+  - Input: `data/relationships.jsonl` (897,890 raw rows) + `config/relationship_mapping.yaml`.
+  - Builds canonical-direction DOC → DOC edges using the relationship mapping pipeline:
+    1. Load `RELATIONSHIP_MAP` (11 Vietnamese labels → canonical enums) and `RELATION_WHITELIST` (8 canonical relations).
+    2. Collect SME doc IDs from existing DOC nodes in graph (14,694 endpoints).
+    3. Filter relationships to rows where **both** `doc_id` and `other_doc_id` are SME docs.
+    4. Map raw labels through `RELATIONSHIP_MAP`; keep only if mapped enum is in `RELATION_WHITELIST`.
+    5. Drop self-loops (`doc_id == other_doc_id`).
+    6. Deduplicate by `(source, target, relation)` triple.
+  - Edge schema: `key=relation_enum`, single attr `relation=relation_enum`.
+  - Dropped rows exported to `data/stage5_dropped_relationships.jsonl`.
+
+- **Pipeline funnel analysis** (inspected 2026-06-16):
+
+  | Step | Rows |
+  |------|------|
+  | Raw relationship rows (after cleaning) | 897,890 |
+  | After SME filter (both endpoints are DOC nodes) | 8,111 |
+  | Dropped (at least one endpoint not SME) | 889,779 |
+  | Kept by label mapping + whitelist | 7,386 |
+  | Self-loops dropped | 24 |
+  | Labels not in whitelist (reverse-only labels) | 701 |
+  | **Unique deduplicated edges** | **7,378** |
+
+- **Kept edges by canonical relation**:
+
+  | Relation | Rows | Description |
+  |----------|------|-------------|
+  | BASED_ON | 5,028 | doc_id căn cứ vào other_doc_id |
+  | CITES_REF | 1,599 | doc_id dẫn chiếu other_doc_id |
+  | DETAILS | 487 | doc_id hướng dẫn / quy định chi tiết |
+  | AMENDS | 202 | doc_id sửa đổi / bổ sung |
+  | REPLACES | 62 | doc_id thay thế / hết hiệu lực |
+  | RELATED_CONTENT | 8 | Văn bản liên quan khác |
+
+- **Dropped labels from SME-filtered set** (reverse-direction labels, correctly excluded per KG.md §6):
+  - `Văn bản được HD, QĐ chi tiết` (487) — reverse of DETAILS
+  - `Văn bản được bổ sung` (200) — reverse of AMENDS
+  - `Văn bản bị hết hiệu lực 1 phần` (12) — reverse of REPLACES
+  - `Văn bản được sửa đổi` (2) — reverse of AMENDS
+
+- **Root cause of original failure**: The acceptance window `[50_000, 350_000]` was estimated from the full dataset (pre-SME filter) and assumed both canonical + reverse directions were retained. With the SME filter restricting both endpoints to ~14.7k curated docs, only ~1% of raw relationship rows survive. The canonical-only policy further halves eligible rows.
+
+- **Fix applied**: Lowered `DOC_DOC_EDGE_COUNT_MIN` from `50_000` to `5_000` in `src/data/stage5_build_graph.py` (line 150). This reflects the actual data volume while still catching degenerate builds (e.g. empty mapping or broken join). Updated comment explains the rationale.
+
+- **Tests**: `tests/test_stage5_doc_doc_edges.py` — **26/26 passing** after the constant change. Tests use monkeypatched acceptance bands so they are independent of the module-level constants.
+
+- **Next steps**:
+  - Re-run `--stage 5.5 --append` to confirm the gate passes with the updated constant.
+  - 5.6 CONCEPT nodes + `MENTIONS` edges via chunk-first rule-based extraction.

@@ -3,9 +3,11 @@
 | Field | Value |
 |---|---|
 | System name | G-LRAG (Graph-enhanced Legal Retrieval Augmented Generation) |
-| Document version | 3.0 |
-| Last updated | 2026-06-05 |
+| Document version | 3.1 |
+| Last updated | 2026-06-16 |
 | Status | Approved for implementation |
+
+> Changes in v3.1: §8 knowledge graph aligned with `KG.md` (canonical-direction-only relations; reverse-only labels and `RELATED_LANGUAGE` dropped; CHUNK node added to §8.2; build procedure split per Stage 5.x; edge-attribute key standardized to `relation`). §10.4 graph expansion now reads canonical edges in both directions instead of separate reverse edges. §11.5 graph-context construction synthesizes reverse labels in code.
 
 ---
 
@@ -671,80 +673,82 @@ Notes on the Vietnamese legal-text format that drive these patterns:
 
 | Type | Key format | Attributes |
 |---|---|---|
-| Document | `DOC:{doc_id}` | `type`, `law_id`, `ten`, `loai`, `nganh`, `ngay_ban_hanh` |
-| Article | `ART:{doc_uid}` | `type`, `doc_uid`, `law_id`, `ten_van_ban`, `dieu`, `summary` |
-| Concept | `CONCEPT:{name_lower}` | `type`, `name` |
+| Document | `DOC:{doc_id}` | `type`, `doc_id`, `law_id`, `ten`, `loai`, `nganh`, `linh_vuc`, `ngay_ban_hanh`, `tinh_trang_hieu_luc`, `ngay_co_hieu_luc`, `ngay_het_hieu_luc` |
+| Article | `ART:{doc_uid}` | `type`, `doc_uid`, `doc_id`, `law_id`, `ten_van_ban`, `dieu_so`, `dieu_ten`, `phan`, `chuong`, `muc`, `short` (optional), `enriched_text` (optional) |
+| Chunk | `CHUNK:{chunk_id}` | `type`, `chunk_id`, `doc_uid`, `doc_id`, `rowidx`, `part_idx`, `breadcrumb`, `law_id` (optional), `dieu_so` (optional) |
+| Concept | `CONCEPT:{name_lower}` | `type`, `name`, `name_lower` |
+
+`DOC` is the central node: every original legal relation lives at the document layer. `ART` is the citation unit (answers cite `Điều X`) and bridges a document to its enforceable content. `CHUNK` is the retrieval unit and the primary source for concept extraction, sitting as an intermediate layer between `ART` and `CONCEPT` without becoming a central legal node. `CONCEPT` is an auxiliary semantic layer that groups recurring legal topics across documents via their chunks.
 
 ### 8.3 Edge types
 
+Only canonical-direction edges are stored. Reverse traversal is handled at query time in code. All `DOC → DOC` edges come from the source `relationships` dataset; no LLM-generated doc-doc edges.
+
 | Edge label | From | To | Source |
 |---|---|---|---|
-| `HAS_ARTICLE` | Document | Article | Derived from Stage 2 / optional Stage 4 |
-| `AMENDS` | Document | Document | `relationships` config |
-| `AMENDED_BY` | Document | Document | `relationships` config |
-| `REPLACES` | Document | Document | `relationships` config |
-| `REPLACED_BY` | Document | Document | `relationships` config |
-| `DETAILS` | Document | Document | `relationships` config |
-| `DETAILED_BY` | Document | Document | `relationships` config |
-| `CITES_REF` | Document | Document | `relationships` config |
-| `CITED_BY_REF` | Document | Document | `relationships` config |
-| `BASED_ON` | Document | Document | `relationships` config |
-| `BASIS_OF` | Document | Document | `relationships` config |
-| `CONSOLIDATES` | Document | Document | `relationships` config |
-| `CONSOLIDATED_BY` | Document | Document | `relationships` config |
-| `CORRECTS` | Document | Document | `relationships` config |
-| `CORRECTED_BY` | Document | Document | `relationships` config |
-| `RELATED_LANGUAGE` | Document | Document | `relationships` config |
-| `RELATED_CONTENT` | Document | Document | `relationships` config |
+| `HAS_ARTICLE` | Document | Article | Derived from Stage 2 (mandatory) |
 | `HAS_CHUNK` | Article | Chunk | Derived from Stage 3 (`stage3_chunks.parquet`) |
-| `MENTIONS` | Chunk | Concept | Rule-based string match on chunk text; optional enriched text if available, but chunk text is the primary source |
+| `AMENDS` | Document | Document | `relationships` dataset (canonical direction) |
+| `REPLACES` | Document | Document | `relationships` dataset (canonical direction) |
+| `DETAILS` | Document | Document | `relationships` dataset (canonical direction) |
+| `CITES_REF` | Document | Document | `relationships` dataset (canonical direction) |
+| `BASED_ON` | Document | Document | `relationships` dataset (canonical direction) |
+| `CONSOLIDATES` | Document | Document | `relationships` dataset (canonical direction) |
+| `CORRECTS` | Document | Document | `relationships` dataset (canonical direction) |
+| `RELATED_CONTENT` | Document | Document | `relationships` dataset (keep only if label is clean) |
+| `MENTIONS` | Chunk | Concept | Rule-based string match on chunk text (primary); optional `enriched_text` fallback if Stage 4 exists |
+
+**Not stored:** reverse-only labels (`AMENDED_BY`, `REPLACED_BY`, `DETAILED_BY`, `CITED_BY_REF`, `CONSOLIDATED_BY`, `CORRECTED_BY`) and `RELATED_LANGUAGE`. Reverse hops are computed in code at query time.
 
 ### 8.4 Relationship label mapping
 
-The `relationship` field in the source data uses 14 distinct Vietnamese labels that form 7 reciprocal pairs plus 2 standalone relations. The full mapping:
+The `relationship` field in the source dataset uses Vietnamese labels. Only the canonical-direction labels are mapped; reverse-direction labels and `RELATED_LANGUAGE` are deliberately excluded so they fall into the dropped set during graph build. The full mapping is maintained in [`config/relationship_mapping.yaml`](config/relationship_mapping.yaml).
 
 ```yaml
 RELATIONSHIP_MAP:
-  # Amendment pair
+  # Amendment (canonical direction: the amending document points to the amended one)
   "Văn bản sửa đổi bổ sung": "AMENDS"
-  "Văn bản bị sửa đổi bổ sung": "AMENDED_BY"
 
-  # Replacement pair
+  # Replacement
   "Văn bản thay thế": "REPLACES"
-  "Văn bản bị thay thế": "REPLACED_BY"
 
-  # Guidance pair (most valuable for graph expansion)
+  # Guidance / detailing (most valuable for procedure/condition queries)
   "Văn bản hướng dẫn": "DETAILS"
-  "Văn bản được hướng dẫn": "DETAILED_BY"
 
-  # Citation pair (cross-reference)
-  "Văn bản được dẫn chiếu": "CITED_BY_REF"
+  # Cross-reference / citation
+  "Văn bản được dẫn chiếu": "CITES_REF"
 
-  # Legal basis pair
-  "Văn bản được căn cứ": "BASIS_OF"
+  # Legal basis
+  "Văn bản được căn cứ": "BASED_ON"
 
-  # Consolidation pair
+  # Consolidation
   "Văn bản hợp nhất": "CONSOLIDATES"
-  "Văn bản được hợp nhất": "CONSOLIDATED_BY"
 
-  # Correction pair
+  # Correction
   "Văn bản đính chính": "CORRECTS"
-  "Văn bản bị đính chính": "CORRECTED_BY"
 
-  # Standalone relations
-  "Văn bản liên quan ngôn ngữ": "RELATED_LANGUAGE"
+  # Same-content (retain only if experimentally clean)
   "Văn bản liên quan cùng nội dung": "RELATED_CONTENT"
+
+# Labels explicitly dropped — reverse-only or low-value:
+DROPPED_LABELS:
+  - "Văn bản bị sửa đổi bổ sung"   # reverse of AMENDS
+  - "Văn bản bị thay thế"          # reverse of REPLACES
+  - "Văn bản được hướng dẫn"       # reverse of DETAILS
+  - "Văn bản được hợp nhất"        # reverse of CONSOLIDATES
+  - "Văn bản bị đính chính"        # reverse of CORRECTS
+  - "Văn bản liên quan ngôn ngữ"   # RELATED_LANGUAGE — dropped
 ```
 
-Unmapped labels are stored verbatim under the key `rel` and logged as warnings during graph build.
+Labels not in `RELATIONSHIP_MAP` are logged as warnings and skipped during graph build.
 
 **Edges used by graph expansion at retrieval time** (Section 10.4):
 
 ```
-{DETAILS, DETAILED_BY, AMENDS, AMENDED_BY, REPLACES, REPLACED_BY, CITES_REF, BASIS_OF}
+{DETAILS, AMENDS, REPLACES, CITES_REF, BASED_ON}
 ```
 
-`CONSOLIDATES`, `CORRECTS`, `RELATED_LANGUAGE`, `RELATED_CONTENT` are stored but not traversed at inference time.
+Reverse hops over these same edges are also traversed in code (e.g. following an incoming `DETAILS` edge to find the more-specific document). `CONSOLIDATES`, `CORRECTS`, `RELATED_CONTENT` are stored but not traversed during inference.
 
 ### 8.5 Concept seed list
 
@@ -802,39 +806,71 @@ LEGAL_CONCEPTS:
 
 ### 8.6 Build procedure
 
-**Step 1** — Document nodes from `stage1_sme_docs.parquet`:
+The build runs as five sequential sub-stages. Each sub-stage appends to the same persisted `kg.gpickle`.
+
+**Step 1 (Stage 5.2)** — Document nodes from `stage1_sme_docs.parquet`:
 
 ```python
 for row in sme_docs.itertuples():
     G.add_node(f"DOC:{row.id}",
                type="Document",
+               doc_id=str(row.id),
                law_id=row.law_id,
                ten=row.ten_van_ban,
                loai=row.loai_van_ban,
                nganh=row.nganh,
-               ngay_ban_hanh=row.ngay_ban_hanh)
+               linh_vuc=row.linh_vuc,
+               ngay_ban_hanh=row.ngay_ban_hanh,
+               tinh_trang_hieu_luc=row.tinh_trang_hieu_luc,
+               ngay_co_hieu_luc=row.ngay_co_hieu_luc,
+               ngay_het_hieu_luc=row.ngay_het_hieu_luc)
 ```
 
-**Step 2** — Article nodes and `HAS_ARTICLE` edges from `stage2_articles.parquet` (or optional Stage 4 metadata if available):
+**Step 2 (Stage 5.3)** — Article nodes and `HAS_ARTICLE` edges from `stage2_articles.parquet`:
 
 ```python
 for art in articles.drop_duplicates("doc_uid").itertuples():
     art_id = f"ART:{art.doc_uid}"
     G.add_node(art_id, type="Article",
                doc_uid=art.doc_uid,
+               doc_id=str(art.doc_id),
                law_id=art.law_id,
                ten_van_ban=art.ten_van_ban,
-               dieu=art.dieu_so)
+               dieu_so=art.dieu_so,
+               dieu_ten=art.dieu_ten,
+               phan=art.phan,
+               chuong=art.chuong,
+               muc=art.muc)
+    # Optional Stage 4 fields — only if present
     if hasattr(art, "short"):
-        G.nodes[art_id]["summary"] = art.short
+        G.nodes[art_id]["short"] = art.short
     if hasattr(art, "enriched_text"):
         G.nodes[art_id]["enriched_text"] = art.enriched_text
-    G.add_edge(f"DOC:{art.doc_id}", art_id, rel="HAS_ARTICLE")
+    G.add_edge(f"DOC:{art.doc_id}", art_id, relation="HAS_ARTICLE")
 ```
 
-**Step 3** — Cross-document edges from `relationships`:
+**Step 3 (Stage 5.4)** — Chunk nodes and `HAS_CHUNK` edges from `stage3_chunks.parquet`:
 
 ```python
+for ch in chunks.itertuples():
+    chunk_key = f"CHUNK:{ch.chunk_id}"
+    G.add_node(chunk_key,
+               type="Chunk",
+               chunk_id=ch.chunk_id,
+               doc_uid=ch.doc_uid,
+               doc_id=str(ch.doc_id),
+               rowidx=ch.rowidx,
+               part_idx=ch.part_idx,
+               breadcrumb=ch.breadcrumb)
+    G.add_edge(f"ART:{ch.doc_uid}", chunk_key, relation="HAS_CHUNK")
+```
+
+**Step 4 (Stage 5.5)** — Cross-document edges from `relationships` dataset:
+
+```python
+RELATIONSHIP_MAP = load_yaml("config/relationship_mapping.yaml")["RELATIONSHIP_MAP"]
+RELATION_WHITELIST = set(load_yaml("config/relationship_mapping.yaml")["RELATION_WHITELIST"])
+
 rels = load_dataset("th1nhng0/vietnamese-legal-documents",
                     "relationships", split="data").to_pandas()
 sme_ids = set(sme_docs["id"].astype(str))
@@ -842,48 +878,41 @@ rels = rels[rels["doc_id"].astype(str).isin(sme_ids)
           & rels["other_doc_id"].astype(str).isin(sme_ids)]
 
 for r in rels.itertuples():
-    rel_enum = RELATIONSHIP_MAP.get(r.relationship, r.relationship)
-    G.add_edge(f"DOC:{r.doc_id}", f"DOC:{r.other_doc_id}", rel=rel_enum)
+    rel_enum = RELATIONSHIP_MAP.get(r.relationship)
+    if rel_enum is None or rel_enum not in RELATION_WHITELIST:
+        # Log unmapped / dropped labels and skip — no reverse edges created
+        continue
+    G.add_edge(f"DOC:{r.doc_id}", f"DOC:{r.other_doc_id}", relation=rel_enum)
 ```
 
-**Step 4** — Chunk nodes and `HAS_CHUNK` edges from `stage3_chunks.parquet`:
-
-```python
-for ch in chunks.itertuples():
-    chunk_id = f"CHUNK:{ch.chunk_id}"
-    G.add_node(chunk_id,
-               type="Chunk",
-               chunk_id=ch.chunk_id,
-               doc_uid=ch.doc_uid,
-               doc_id=ch.doc_id,
-               rowidx=ch.rowidx,
-               part_idx=ch.part_idx,
-               breadcrumb=ch.breadcrumb)
-    G.add_edge(f"ART:{ch.doc_uid}", chunk_id, rel="HAS_CHUNK")
-```
-
-**Step 5** — Concept nodes and `MENTIONS` edges (chunk-first extraction):
+**Step 5 (Stage 5.6)** — Concept nodes and `MENTIONS` edges (chunk-first extraction):
 
 ```python
 for c in LEGAL_CONCEPTS:
-    G.add_node(f"CONCEPT:{c.lower()}", type="Concept", name=c)
+    norm = c.lower()
+    G.add_node(f"CONCEPT:{norm}", type="Concept", name=c, name_lower=norm)
 
-# Chunk-first concept extraction: primary source is chunk text
+# Primary source: chunk_text from stage3_chunks.parquet
 for ch in chunks.itertuples():
-    # Primary: chunk_text (mandatory)
     text_lower = ch.chunk_text.lower() if hasattr(ch, "chunk_text") else None
-    
-    # Secondary: optional enriched_text from Stage 4, but only if chunk_text check fails
+
+    # Fallback to enriched_text only when chunk_text is absent
     if text_lower is None and hasattr(ch, "enriched_text"):
         text_lower = ch.enriched_text.lower()
-    
+
     if text_lower is None:
         continue
 
+    concepts_matched = 0
     for c in LEGAL_CONCEPTS:
+        if concepts_matched >= 3:          # max 3 concepts per chunk
+            break
         if c.lower() in text_lower:
-            G.add_edge(f"CHUNK:{ch.chunk_id}",
-                       f"CONCEPT:{c.lower()}", rel="MENTIONS")
+            chunk_key  = f"CHUNK:{ch.chunk_id}"
+            concept_key = f"CONCEPT:{c.lower()}"
+            if not G.has_edge(chunk_key, concept_key):  # dedup (chunk_id, concept_id)
+                G.add_edge(chunk_key, concept_key, relation="MENTIONS")
+                concepts_matched += 1
 ```
 
 ### 8.7 Persistence
@@ -900,11 +929,13 @@ with open("kg.gpickle", "wb") as f:
 | Document nodes | ~4,000 |
 | Article nodes | ~50,000 |
 | Chunk nodes | ~74,107 |
-| Concept nodes | ~50-100 |
+| Concept nodes | ~50–100 |
 | `HAS_ARTICLE` edges | ~50,000 |
 | `HAS_CHUNK` edges | ~74,107 |
-| Cross-document edges | ~150,000-250,000 |
-| `MENTIONS` edges | ~30,000-50,000 |
+| Cross-document edges (canonical direction only) | ~50,000–175,000 |
+| `MENTIONS` edges | ~30,000–50,000 |
+
+Cross-document edge count is lower than the old spec because reverse-direction labels and `RELATED_LANGUAGE` are no longer stored (KG.md §6). The old spec's range of 150k–350k included both directions of every pair; the new range reflects only the canonical half of each pair.
 
 ---
 
@@ -1015,7 +1046,22 @@ Candidates are sorted by score descending; top `FUSED_TOP` are kept.
 
 ### 10.4 Graph expansion algorithm
 
+The KG stores only the canonical direction of each cross-document relation (KG.md §2.1). Reverse hops are reconstructed at query time by reading incoming edges over the same canonical relations.
+
 ```python
+# Cross-document relations traversed during expansion (canonical direction).
+# Reverse hops are walked via G.in_edges over the same set, so there is no
+# separate AMENDED_BY / REPLACED_BY / DETAILED_BY / CITED_BY_REF / BASIS_OF
+# entry — those are derived in code.
+EXPANSION_DOC_RELS = {
+    "DETAILS",
+    "AMENDS",
+    "REPLACES",
+    "CITES_REF",
+    "BASED_ON",
+}
+
+
 def graph_expand(candidates, discount_doc=0.6, discount_concept=0.3, top_n=50):
     expanded = dict(candidates)
     for idx, score in candidates:
@@ -1024,26 +1070,29 @@ def graph_expand(candidates, discount_doc=0.6, discount_concept=0.3, top_n=50):
         if art_node not in G:
             continue
 
-        # 1-hop A: find parent document
+        # 1-hop A: find parent document via incoming HAS_ARTICLE edge
         doc_node = next(
             (p for p, _, d in G.in_edges(art_node, data=True)
-             if d.get("rel") == "HAS_ARTICLE"),
-            None
+             if d.get("relation") == "HAS_ARTICLE"),
+            None,
         )
         if doc_node is None:
             continue
 
-        # 1-hop B: traverse cross-document relations
-        DOC_RELS = {
-            "DETAILS", "DETAILED_BY",
-            "AMENDS", "AMENDED_BY",
-            "REPLACES", "REPLACED_BY",
-            "CITES_REF", "BASIS_OF"
-        }
+        # 1-hop B: traverse cross-document relations in BOTH directions
+        # (canonical out + canonical in) since reverse edges are not stored.
+        neighbor_docs = set()
         for _, nb_doc, edge in G.out_edges(doc_node, data=True):
-            if edge["rel"] not in DOC_RELS:
-                continue
-            for _, nb_art in G.out_edges(nb_doc):
+            if edge.get("relation") in EXPANSION_DOC_RELS:
+                neighbor_docs.add(nb_doc)
+        for nb_doc, _, edge in G.in_edges(doc_node, data=True):
+            if edge.get("relation") in EXPANSION_DOC_RELS:
+                neighbor_docs.add(nb_doc)
+
+        for nb_doc in neighbor_docs:
+            for _, nb_art, edge in G.out_edges(nb_doc, data=True):
+                if edge.get("relation") != "HAS_ARTICLE":
+                    continue
                 if G.nodes[nb_art].get("type") != "Article":
                     continue
                 nb_uid = G.nodes[nb_art]["doc_uid"]
@@ -1052,25 +1101,25 @@ def graph_expand(candidates, discount_doc=0.6, discount_concept=0.3, top_n=50):
                     continue
                 expanded[nb_idx] = max(
                     expanded.get(nb_idx, 0.0),
-                    score * discount_doc
+                    score * discount_doc,
                 )
 
-        # 1.5-hop: concept co-mention via chunk layer
+        # 1.5-hop: concept co-mention via the chunk layer (CHUNK -> CONCEPT).
         for _, chunk_node, edge in G.out_edges(art_node, data=True):
-            if edge.get("rel") != "HAS_CHUNK":
+            if edge.get("relation") != "HAS_CHUNK":
                 continue
             for _, concept, edge2 in G.out_edges(chunk_node, data=True):
-                if edge2.get("rel") != "MENTIONS":
+                if edge2.get("relation") != "MENTIONS":
                     continue
                 for sibling_chunk, _, edge3 in G.in_edges(concept, data=True):
-                    if edge3.get("rel") != "MENTIONS":
+                    if edge3.get("relation") != "MENTIONS":
                         continue
                     if sibling_chunk == chunk_node or not sibling_chunk.startswith("CHUNK:"):
                         continue
                     sib_art = next(
                         (p for p, _, d in G.in_edges(sibling_chunk, data=True)
-                         if d.get("rel") == "HAS_CHUNK"),
-                        None
+                         if d.get("relation") == "HAS_CHUNK"),
+                        None,
                     )
                     if sib_art is None or sib_art == art_node:
                         continue
@@ -1164,7 +1213,21 @@ Items are joined with double newlines.
 
 ### 11.5 Graph context construction
 
-For each unique document found in the top-K hits, list outgoing `DETAILS`, `AMENDS`, `REPLACES` neighbors:
+For each unique document found in the top-K hits, list its `DETAILS`, `AMENDS`, `REPLACES` neighbors. Because only canonical-direction edges are stored (KG.md §2.1), both outgoing and incoming edges are read so the surfaced context covers the bi-directional view (e.g. "this decree is detailed by …" and "this decree details …"):
+
+```python
+INTERESTING_RELS = {"DETAILS", "AMENDS", "REPLACES"}
+
+for _, nb_doc, edge in G.out_edges(doc_node, data=True):
+    if edge.get("relation") in INTERESTING_RELS:
+        emit(edge["relation"], G.nodes[nb_doc]["ten"])
+
+for nb_doc, _, edge in G.in_edges(doc_node, data=True):
+    if edge.get("relation") in INTERESTING_RELS:
+        emit(edge["relation"] + "_BY", G.nodes[nb_doc]["ten"])  # synthesized reverse label
+```
+
+Emit one bullet per neighbor:
 
 ```
 • {REL_ENUM}: {neighbor_document_title}

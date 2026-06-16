@@ -1,0 +1,93 @@
+# Relationship mapping for the G-LRAG knowledge graph (Stage 5.5).
+#
+# Source of truth: KG.md §5 (Bảng relation chốt), §6 (Relation nào không giữ),
+# §7.1 (Nguồn tạo từng relation), §12 (Khuyến nghị triển khai cuối).
+#
+# Design rules from KG.md:
+#   - Keep only the CANONICAL direction of each relation. Reverse traversal is
+#     handled in code at query time, never by storing a separate reverse edge.
+#   - Drop reverse-only labels (AMENDED_BY, REPLACED_BY, DETAILED_BY,
+#     CITED_BY_REF, CONSOLIDATED_BY, CORRECTED_BY) and the low-value
+#     RELATED_LANGUAGE label.
+#   - All DOC -> DOC relations come from the source `relationships` dataset;
+#     no LLM-generated doc-doc edges.
+#
+# Stage 5.5 build procedure:
+#   1. Filter the `relationships` dataset to edges where both doc_id and
+#      other_doc_id are SME documents (present as DOC nodes).
+#   2. Map the raw Vietnamese label through RELATIONSHIP_MAP.
+#   3. Keep the edge only if the mapped value is in RELATION_WHITELIST.
+#   4. Drop labels listed in DROPPED_LABELS (and any label not in the map).
+#   5. Never create a separate reverse edge.
+#
+# IMPORTANT: The labels below are taken from the actual `relationships.jsonl`
+# file in the dataset (as of 2026-06-16). Only canonical-direction labels are
+# mapped; reverse-direction labels are intentionally absent so they are dropped
+# during the build.
+
+# Vietnamese source label -> canonical relation enum.
+RELATIONSHIP_MAP:
+  # === Canonical-direction labels (kept) ===
+
+  # Amendment / supplement — doc_id sửa đổi / bổ sung other_doc_id
+  "Văn bản sửa đổi": "AMENDS"
+  "Văn bản bổ sung": "AMENDS"
+
+  # Replacement / expiry — doc_id makes other_doc_id expire (full or partial)
+  "Văn bản hết hiệu lực": "REPLACES"
+  "Văn bản quy định hết hiệu lực": "REPLACES"
+  "Văn bản quy định hết hiệu lực 1 phần": "REPLACES"
+
+  # Guidance / detailing — doc_id hướng dẫn, quy định chi tiết other_doc_id
+  "Văn bản HD, QĐ chi tiết": "DETAILS"
+
+  # Cross-reference / citation — doc_id dẫn chiếu other_doc_id
+  "Văn bản dẫn chiếu": "CITES_REF"
+
+  # Legal basis — doc_id căn cứ vào other_doc_id (doc_id is based on other_doc_id)
+  "Văn bản căn cứ": "BASED_ON"
+
+  # Suspension — doc_id suspends other_doc_id (treat as a correction-class relation)
+  "Văn bản đình chỉ": "CORRECTS"
+  "Văn bản đình chỉ 1 phần": "CORRECTS"
+
+  # Same-content / misc related — keep if experimentally clean
+  "Văn bản liên quan khác": "RELATED_CONTENT"
+
+# Canonical relations retained as DOC -> DOC edges in the final KG.
+# An edge is kept only if its mapped value appears here.
+RELATION_WHITELIST:
+  - "AMENDS"
+  - "REPLACES"
+  - "DETAILS"
+  - "CITES_REF"
+  - "BASED_ON"
+  - "CONSOLIDATES"
+  - "CORRECTS"
+  - "RELATED_CONTENT"
+
+# Raw labels explicitly excluded from the KG (KG.md §6).
+# Reverse-only relations are reconstructed in code at query time.
+DROPPED_LABELS:
+  - "Văn bản được sửa đổi"            # reverse of AMENDS
+  - "Văn bản được bổ sung"            # reverse of AMENDS
+  - "Văn bản bị hết hiệu lực 1 phần"  # reverse of REPLACES (partial)
+  - "Văn bản được HD, QĐ chi tiết"    # reverse of DETAILS
+  - "Văn bản bị đình chỉ"             # reverse of suspend
+  - "Văn bản bị đình chỉ 1 phần"      # reverse of suspend (partial)
+
+# Relations traversed during graph expansion at retrieval time
+# (G-LRAG_SPECIFICATIONS.md §10.4). Canonical direction only; reverse hops are
+# performed in code over these same edges.
+EXPANSION_RELATIONS:
+  - "DETAILS"
+  - "AMENDS"
+  - "REPLACES"
+  - "CITES_REF"
+  - "BASED_ON"
+
+# Stored but NOT traversed at inference time.
+NON_EXPANSION_RELATIONS:
+  - "CONSOLIDATES"
+  - "CORRECTS"
+  - "RELATED_CONTENT"
