@@ -2342,7 +2342,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     load_dotenv(project_root / ".env")
     output_path = resolve_path(args.output_path, project_root / "data" / "kg.gpickle")
 
-    print(f"Stage 5 builder | --stage={args.stage} | output={output_path}")
+    print(f"Stage 5 builder | --stage={args.stage} | output=    {output_path}")
     print(f"Mode: {'APPEND' if args.append else 'FRESH'}")
 
     num_partitions = getattr(args, "num_partitions", 0)
@@ -2380,14 +2380,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Resolve the actual file to load/save: in partition mode each worker
     # writes to its own dedicated file so they never collide.
-    if args.stage == "5.6" and num_partitions > 1:
+    if args.stage == "5.6" and num_partitions > 1 and partition_idx is not None:
         stage_output_path = _partition_output_path(output_path, partition_idx)
     else:
         stage_output_path = output_path
 
     if args.append:
         try:
-            G = load_existing_graph(stage_output_path)
+            path_to_load = stage_output_path
+            # For partition workers, if the partition file does not exist, fall back to base graph
+            if args.stage == "5.6" and num_partitions > 1 and partition_idx is not None and not stage_output_path.exists():
+                path_to_load = output_path
+            G = load_existing_graph(path_to_load)
         except FileNotFoundError as exc:
             parser.error(str(exc))
         except TypeError as exc:
