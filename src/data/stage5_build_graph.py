@@ -1513,6 +1513,10 @@ def add_mentions_edges_llm(
         openai_client = OpenAI(**client_kwargs)
 
     concepts_by_lower = {concept.lower(): concept for concept in concepts}
+
+    # Build eligible items with synthetic short IDs so the LLM never sees
+    # the long, special-character-heavy real chunk_id values. The real
+    # chunk_id is recovered from the positional index after the call returns.
     eligible_items: List[Dict[str, str]] = []
     for row in chunks.itertuples(index=False):
         chunk_id = str(row.chunk_id)
@@ -1526,10 +1530,41 @@ def add_mentions_edges_llm(
             }
         )
 
+    # Map: position in eligible_items -> real chunk_id
+    idx_to_chunk_id: Dict[int, str] = {
+        i: item["source_id"] for i, item in enumerate(eligible_items)
+    }
+
     edges_added = 0
     chunks_with_mentions = 0
     if batch_size <= 0:
         raise ValueError(f"LLM batch size must be positive; got {batch_size}.")
+
+    def _run_batch(batch_items):
+        """Run one batch through the LLM. Returns parsed result dict or raises."""
+        if provider == "gemini":
+            return gemini_extract_mentions(llm, batch_items, concepts)
+        return openai_compatible_extract_mentions(
+            openai_client, model_name, batch_items, concepts
+        )
+
+    def _process_result(result, batch_items):
+        """Apply LLM result to the graph. Returns (edges_added, chunks_with_mentions)."""
+        ea = 0
+        cwm = 0
+        by_source = {
+            str(item.get("source_id")): item for item in result.get("items", [])
+        }
+        for item in batch_items:
+            source_id = item["source_id"]
+            chunk_key = f"CHUNK:{source_id}"
+            matches = _canonicalize_llm_concepts(
+                by_source.get(source_id, {}).get("concepts", []), concepts_by_lower
+            )
+            if matches:
+                cwm += 1
+                ea += _add_mentions_for_matches(G, chunk_key, matches)
+        return ea, cwm
 
     total_batches = math.ceil(len(eligible_items) / batch_size)
     for batch_start in tqdm(
@@ -1540,33 +1575,72 @@ def add_mentions_edges_llm(
         leave=False,
     ):
         batch = eligible_items[batch_start : batch_start + batch_size]
+        # Swap in synthetic short IDs for the LLM call
+        synth_batch = [
+            {"source_id": f"c{i}", "text": item["text"]}
+            for i, item in enumerate(batch, start=batch_start)
+        ]
         try:
-            if provider == "gemini":
-                result = gemini_extract_mentions(llm, batch, concepts)
-            else:
-                result = openai_compatible_extract_mentions(
-                    openai_client, model_name, batch, concepts
-                )
+            result = _run_batch(synth_batch)
         except (ValueError, json.JSONDecodeError) as exc:
-            batch_ids = [it.get("source_id", "?") for it in batch]
+            batch_real_ids = [
+                idx_to_chunk_id.get(batch_start + i, "?")
+                for i in range(len(batch))
+            ]
             print(
                 f"\n  [WARN] LLM extraction failed for batch starting at idx "
                 f"{batch_start}: {exc}\n"
-                f"  Chunk IDs in failed batch: {batch_ids}\n"
-                f"  Skipping batch and continuing.\n",
+                f"  Chunk IDs in failed batch: {batch_real_ids}\n"
+                f"  Retrying each chunk individually...\n",
                 file=sys.stderr,
             )
+            # Per-item fallback: try each chunk solo before giving up entirely
+            for j, item in enumerate(batch):
+                synth_single = [
+                    {"source_id": f"c{batch_start + j}", "text": item["text"]}
+                ]
+                try:
+                    single_result = _run_batch(synth_single)
+                except (ValueError, json.JSONDecodeError) as exc2:
+                    print(
+                        f"\n  [WARN] Individual chunk also failed "
+                        f"(idx={batch_start + j}, "
+                        f"id={idx_to_chunk_id.get(batch_start + j, '?')}): "
+                        f"{exc2}\n",
+                        file=sys.stderr,
+                    )
+                    continue
+                real_id = idx_to_chunk_id[batch_start + j]
+                single_result["items"] = [
+                    {**it, "source_id": real_id}
+                    for it in single_result.get("items", [])
+                ]
+                ea, cwm = _process_result(
+                    single_result,
+                    [{"source_id": real_id, "text": item["text"]}],
+                )
+                edges_added += ea
+                chunks_with_mentions += cwm
             continue
-        by_source = {str(item.get("source_id")): item for item in result.get("items", [])}
-        for item in batch:
-            source_id = item["source_id"]
-            chunk_key = f"CHUNK:{source_id}"
-            matches = _canonicalize_llm_concepts(
-                by_source.get(source_id, {}).get("concepts", []), concepts_by_lower
-            )
-            if matches:
-                chunks_with_mentions += 1
-            edges_added += _add_mentions_for_matches(G, chunk_key, matches)
+        # Remap synthetic IDs back to real chunk_ids in the result
+        real_items = []
+        for it in result.get("items", []):
+            synth_id = str(it.get("source_id", ""))
+            # synth_id is like "c42" — extract the index
+            if synth_id.startswith("c") and synth_id[1:].isdigit():
+                idx = int(synth_id[1:])
+                real_id = idx_to_chunk_id.get(idx)
+                if real_id is not None:
+                    real_items.append({**it, "source_id": real_id})
+        result["items"] = real_items
+        # Build a real-id batch view for _process_result
+        real_batch = [
+            {"source_id": idx_to_chunk_id[batch_start + i], "text": item["text"]}
+            for i, item in enumerate(batch)
+        ]
+        ea, cwm = _process_result(result, real_batch)
+        edges_added += ea
+        chunks_with_mentions += cwm
     if edges_added == 0 and total_batches > 0:
         print(
             "\n  [WARN] No MENTIONS edges were added after processing all batches. "

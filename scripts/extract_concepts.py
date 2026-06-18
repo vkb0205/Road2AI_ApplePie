@@ -153,6 +153,17 @@ Schema bắt buộc:
 }
 """
 
+def _clean_json_string(s: str) -> str:
+    """Helper to remove comments and trailing commas before parsing JSON."""
+    # Remove single line comments
+    s = re.sub(r'//.*$', '', s, flags=re.MULTILINE)
+    # Remove multi-line comments
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.DOTALL)
+    # Remove trailing commas before closing braces/brackets
+    s = re.sub(r',\s*([\]}])', r'\1', s)
+    return s.strip()
+
+
 def _parse_json_object_text(txt):
     """Parse JSON from LLM response text, tolerating markdown fences and extra text.
 
@@ -168,7 +179,7 @@ def _parse_json_object_text(txt):
 
     # Strategy 1: direct parse (handles response_format='json_object')
     try:
-        return json.loads(raw)
+        return json.loads(_clean_json_string(raw))
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -179,7 +190,7 @@ def _parse_json_object_text(txt):
     text = re.sub(r'```\s*$', '', text, flags=re.MULTILINE)
     text = text.strip()
     try:
-        return json.loads(text)
+        return json.loads(_clean_json_string(text))
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -188,7 +199,7 @@ def _parse_json_object_text(txt):
     if m:
         candidate = m.group(0)
         try:
-            return json.loads(candidate)
+            return json.loads(_clean_json_string(candidate))
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -197,7 +208,7 @@ def _parse_json_object_text(txt):
     if m:
         candidate = m.group(0)
         try:
-            wrapped = json.loads(candidate)
+            wrapped = json.loads(_clean_json_string(candidate))
             return {"items": wrapped}
         except (json.JSONDecodeError, ValueError):
             pass
@@ -262,7 +273,8 @@ def openai_compatible_extract_mentions(client, model_name, batch_items, allowed_
         {
             "role": "system",
             "content": "Bạn chỉ trả về JSON hợp lệ theo schema được yêu cầu. "
-                       "Phải bắt đầu bằng { và kết thúc bằng }, không được dùng markdown fence.",
+                       "Phải bắt đầu bằng { và kết thúc bằng }, không được dùng markdown fence. "
+                       "Không viết suy nghĩ, không suy luận, không dùng thẻ <think>.",
         },
         {
             "role": "user",
