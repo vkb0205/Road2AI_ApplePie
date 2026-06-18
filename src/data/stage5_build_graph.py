@@ -1451,17 +1451,24 @@ def add_mentions_edges_llm(
         ) from exc
 
     provider = provider.lower().replace("_", "-")
-    if provider not in {"gemini", "openai-compatible"}:
+    if provider not in {"gemini", "openai-compatible", "deepseek"}:
         raise ValueError(
             "Unsupported LLM provider "
-            f"{provider!r}; expected 'gemini' or 'openai-compatible'."
+            f"{provider!r}; expected 'gemini', 'openai-compatible', or 'deepseek'."
         )
+
+    # Adjust model name default if it wasn't customized
+    if model_name == "gemini-2.0-flash":
+        if provider == "deepseek":
+            model_name = "deepseek-v4-flash"
+        elif provider == "openai-compatible":
+            model_name = "gpt-4o-mini"
 
     llm = None
     openai_client = None
-    # Resolve base_url from explicit arg, then BASE_URL env var.
-    resolved_base_url = base_url or os.getenv("BASE_URL")
+    # Resolve base_url from explicit arg, then provider-specific or default env var.
     if provider == "gemini":
+        resolved_base_url = base_url or os.getenv("BASE_URL")
         try:
             import google.generativeai as genai
         except ImportError as exc:
@@ -1484,14 +1491,21 @@ def add_mentions_edges_llm(
             from openai import OpenAI
         except ImportError as exc:
             raise ImportError(
-                "OpenAI-compatible MENTIONS extraction requires the openai package. "
+                f"{provider.upper()} MENTIONS extraction requires the openai package. "
                 "Install it with `pip install openai`."
             ) from exc
-        resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+
+        if provider == "deepseek":
+            resolved_api_key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("API_KEY")
+            resolved_base_url = base_url or os.getenv("DEEPSEEK_BASE_URL") or os.getenv("BASE_URL") or "https://api.deepseek.com"
+        else:
+            resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+            resolved_base_url = base_url or os.getenv("BASE_URL")
+
         if not resolved_api_key:
             raise ValueError(
-                "OpenAI-compatible API key is required for --llm-provider "
-                "openai-compatible. Provide --llm-api-key or set OPENAI_API_KEY or API_KEY."
+                f"{provider.upper()} API key is required for --mentions-source llm. Provide "
+                f"--llm-api-key or set appropriate environment variables."
             )
         client_kwargs: Dict[str, str] = {"api_key": resolved_api_key}
         if resolved_base_url:
@@ -2197,7 +2211,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--llm-provider",
-        choices=("gemini", "openai-compatible"),
+        choices=("gemini", "openai-compatible", "deepseek"),
         default="gemini",
         help="LLM provider for --mentions-source llm.",
     )
@@ -2206,21 +2220,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "API key for --mentions-source llm. Overrides GEMINI_API_KEY for "
-            "Gemini or OPENAI_API_KEY for OpenAI-compatible providers."
+            "Gemini, OPENAI_API_KEY for OpenAI-compatible, or DEEPSEEK_API_KEY for Deepseek."
         ),
     )
     parser.add_argument(
         "--llm-base-url",
         default=None,
         help=(
-            "Custom API endpoint for --mentions-source llm: Gemini api_endpoint "
-            "or OpenAI-compatible base_url."
+            "Custom API endpoint for --mentions-source llm: Gemini api_endpoint, "
+            "OpenAI-compatible base_url, or Deepseek base_url."
         ),
     )
     parser.add_argument(
         "--llm-model-name",
         default="gemini-2.0-flash",
-        help="Model name for --mentions-source llm.",
+        help=(
+            "Model name for --mentions-source llm. Defaults to 'gemini-2.0-flash' "
+            "for Gemini, 'deepseek-v4-flash' for Deepseek, or 'gpt-4o-mini' for OpenAI-compatible."
+        ),
     )
     parser.add_argument(
         "--llm-batch-size",
