@@ -244,5 +244,81 @@
 - **Tests**: `tests/test_stage5_doc_doc_edges.py` — **26/26 passing** after the constant change. Tests use monkeypatched acceptance bands so they are independent of the module-level constants.
 
 - **Next steps**:
-  - Re-run `--stage 5.5 --append` to confirm the gate passes with the updated constant.
-  - 5.6 CONCEPT nodes + `MENTIONS` edges via chunk-first rule-based extraction.
+  - Stage 5.6 CONCEPT nodes + `MENTIONS` edges via chunk-first rule-based extraction is complete.
+  - Proceed to Stage 5.7/5.8 persistence/readability validation and full graph invariant checks.
+
+## Stage 5.6 Concept Nodes + Chunk-First `MENTIONS` Edges - Zoo
+
+**Date:** 2026-06-18
+
+**Scope:** Implemented PLAN.md task 5.6 in `src/data/stage5_build_graph.py`: curated concept vocabulary loading, deterministic chunk-text matching, CONCEPT node creation, and `CHUNK -> CONCEPT` `MENTIONS` edges.
+
+**Implementation details:**
+- Added Stage 5.6 helpers to `src/data/stage5_build_graph.py`:
+  - `load_legal_concepts()` validates `LEGAL_CONCEPTS` in `config/legal_concepts.yaml` and enforces the 50-100 concept acceptance window.
+  - `load_stage3_chunks_for_concepts()` requires `chunk_text` from `stage3_chunks.parquet` as the primary/mandatory matching source.
+  - `add_concept_nodes()` creates `CONCEPT:{name_lower}` nodes with `type`, `name`, and `name_lower` attributes.
+  - `add_mentions_edges()` creates idempotent `MENTIONS` edges keyed as `MENTIONS`, with `relation="MENTIONS"` only.
+  - `run_concept_quality_gates()` enforces concept count bounds, valid concept attrs, and `MENTIONS` source/target invariant (`Chunk -> Concept`).
+- Added CLI support for `--legal-concepts-path`; `--stage 5.6 --append` now executes the implementation instead of the old `NotImplementedError` stub.
+- Updated `--stage all` to include Stage 5.6 after Stage 5.5.
+- Populated `config/legal_concepts.yaml` with 80 SME-relevant curated legal concepts.
+- Added `tests/test_stage5_concepts.py` covering concept schema, matching, idempotency, chunk-first edge invariants, config loading, and CLI end-to-end execution.
+
+**Run results:**
+- Command: `./bin/python Road2AI_ApplePie/src/data/stage5_build_graph.py --stage 5.6 --append`
+- Input chunks: **74,107** rows from `data/stage3_chunks.parquet`.
+- Concept vocabulary: **80** curated concepts.
+- Added: **80** CONCEPT nodes.
+- Added: **72,916** `MENTIONS` edges.
+- Matched chunks: **41,696** chunks with at least one concept.
+- Final graph: **145,150** nodes / **210,670** edges.
+- Persisted graph: `data/kg.gpickle` = **155.11 MB**.
+
+**Tests:**
+- Initial system Python did not have pytest installed (`/opt/miniconda3/bin/python: No module named pytest`).
+- Repo environment command passed: `./bin/python -m pytest Road2AI_ApplePie/tests/test_stage5_concepts.py Road2AI_ApplePie/tests/test_stage5_chunks.py Road2AI_ApplePie/tests/test_stage5_doc_doc_edges.py -q`
+- Result: **47 passed in 1.09s**.
+
+**Status:** Stage 5.6 is complete and recorded in `PLAN.md`.
+
+## Stage 5.7/5.8 Final Graph Persistence + Validation - Zoo
+
+**Date:** 2026-06-18
+
+**Scope:** Implemented and executed PLAN.md tasks 5.7 and 5.8 for the final Stage 5 knowledge graph artifact.
+
+**Implementation details:**
+- Extended `src/data/stage5_build_graph.py` CLI stages to include `--stage {5.7,5.8}` and updated `--stage all` so the full Stage 5 build now finishes with persistence/readability validation and graph-wide invariant checks.
+- Stage 5.7 re-persists the graph with `pickle.HIGHEST_PROTOCOL`, reloads the file with `pickle.load`, verifies the object is a `networkx.MultiDiGraph`, and prints an `nx.info`-equivalent summary plus node counts by type.
+- Stage 5.8 adds `run_full_graph_quality_gates()` to enforce the final chunk-first schema:
+  - Allowed typed edge paths: `DOC -> DOC`, `DOC -> ART`, `ART -> CHUNK`, `CHUNK -> CONCEPT`.
+  - Every ART has a parent DOC via `HAS_ARTICLE`.
+  - Every CHUNK has exactly one parent ART via `HAS_CHUNK`.
+  - `MENTIONS` edges are `CHUNK -> CONCEPT` only.
+  - No `ART -> CONCEPT` edges are allowed.
+  - Existing DOC-DOC edges are validated against the relationship whitelist from `config/relationship_mapping.yaml`.
+- Strengthened `run_chunk_quality_gates()` so duplicate/multiple CHUNK parents are rejected, not just missing parents.
+- Added `tests/test_stage5_final_validation.py` covering Stage 5.7 pickle protocol/readability, Stage 5.8 graph-wide validation, duplicate chunk-parent rejection, `ART -> CONCEPT` rejection, and CLI validation of an existing graph.
+
+**Run results:**
+- Command: `./bin/python Road2AI_ApplePie/src/data/stage5_build_graph.py --stage 5.7 --append --output-path Road2AI_ApplePie/data/kg.gpickle && ./bin/python Road2AI_ApplePie/src/data/stage5_build_graph.py --stage 5.8 --append --output-path Road2AI_ApplePie/data/kg.gpickle`
+- Stage 5.7 re-wrote `data/kg.gpickle` using pickle protocol **5** (`pickle.HIGHEST_PROTOCOL`) and round-trip loaded it successfully.
+- Final graph: **145,150** nodes / **210,670** edges.
+- Node counts by type:
+  - Document: **14,694**
+  - Article: **56,269**
+  - Chunk: **74,107**
+  - Concept: **80**
+- Edge quality gates passed:
+  - `HAS_ARTICLE`: **56,269** edges; every ART parented.
+  - `HAS_CHUNK`: **74,107** edges; every CHUNK parented exactly once.
+  - `MENTIONS`: **72,916** `CHUNK -> CONCEPT` edges.
+  - DOC-DOC: **7,378** edges across **6** canonical relations.
+- Persisted graph: `data/kg.gpickle` = **155.10 MB**.
+
+**Tests:**
+- Command: `./bin/python -m pytest Road2AI_ApplePie/tests/test_stage5_final_validation.py Road2AI_ApplePie/tests/test_stage5_chunks.py Road2AI_ApplePie/tests/test_stage5_concepts.py Road2AI_ApplePie/tests/test_stage5_doc_doc_edges.py -q`
+- Result: **52 passed in 1.04s**.
+
+**Status:** Stage 5.7 and Stage 5.8 are complete and recorded in `PLAN.md`.

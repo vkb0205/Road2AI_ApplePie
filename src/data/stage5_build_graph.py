@@ -24,8 +24,8 @@ Currently implemented:
       (filtered to SME doc IDs, mapped via ``config/relationship_mapping.yaml``,
       dropped labels logged to ``data/stage5_dropped_relationships.jsonl``).
 
-Stage 5.6 is scaffolded as a ``NotImplementedError`` stub to be filled in
-by a later change.
+Stage 5.6 adds curated CONCEPT nodes and chunk-first ``MENTIONS`` edges from
+``stage3_chunks.parquet``.
 
 Inputs:
     - ``data/stage1_sme_docs.parquet`` (Stage 5.2)
@@ -51,10 +51,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import pickle
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from tqdm.auto import tqdm
 
 import pandas as pd
 
@@ -73,6 +76,22 @@ except ImportError as exc:  # pragma: no cover - import guard
         "networkx is required to run src/data/stage5_build_graph.py. "
         "Install it with `pip install networkx` or use the repo requirements file."
     ) from exc
+
+
+def load_dotenv(path: Path) -> None:
+    """Load environment variables from .env file."""
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and os.environ.get(key) is None:
+                os.environ[key] = value
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +138,9 @@ REQUIRED_STAGE3_COLUMNS = (
     "breadcrumb",
 )
 
+# Stage 5.6 requires chunk text as the primary evidence source for concepts.
+REQUIRED_STAGE3_CONCEPT_COLUMNS = REQUIRED_STAGE3_COLUMNS + ("chunk_text",)
+
 # Columns required from the relationships dataset (per G-LRAG_SPECIFICATIONS.md §5.8).
 REQUIRED_RELATIONSHIPS_COLUMNS = (
     "doc_id",
@@ -161,6 +183,18 @@ HAS_ARTICLE_EDGE_KEY = "HAS_ARTICLE"
 HAS_CHUNK_RELATION = "HAS_CHUNK"
 HAS_CHUNK_EDGE_KEY = "HAS_CHUNK"
 
+# Edge identifiers for the concept layer.
+MENTIONS_RELATION = "MENTIONS"
+MENTIONS_EDGE_KEY = "MENTIONS"
+
+# Concept layer acceptance bounds (PLAN.md task 5.6).
+CONCEPT_COUNT_MIN = 50
+CONCEPT_COUNT_MAX = 100
+MAX_CONCEPTS_PER_CHUNK = 3
+
+# Path to the legal concepts YAML (relative to project root).
+LEGAL_CONCEPTS_CONFIG = "config/legal_concepts.yaml"
+
 # Default Hugging Face source for the relationships dataset (Stage 5.5).
 DEFAULT_RELATIONSHIPS_PATH = (
     "hf://datasets/th1nhng0/vietnamese-legal-documents/data/relationships.parquet"
@@ -173,8 +207,8 @@ DOC_DOC_RELATION_ATTR = "relation"
 RELATIONSHIP_MAPPING_CONFIG = "config/relationship_mapping.yaml"
 
 # Allowed values for the --stage CLI argument.
-ALLOWED_STAGES = ("5.2", "5.3", "5.4", "5.5", "5.6", "all")
-STAGES_REQUIRING_APPEND = {"5.3", "5.4", "5.5", "5.6"}
+ALLOWED_STAGES = ("5.2", "5.3", "5.4", "5.5", "5.6", "5.7", "5.8", "all")
+STAGES_REQUIRING_APPEND = {"5.3", "5.4", "5.5", "5.6", "5.7", "5.8"}
 
 
 # ---------------------------------------------------------------------------
@@ -893,9 +927,17 @@ def run_chunk_quality_gates(
             f"sample: {sample}"
         )
 
+    multiple_parents = {node: count for node, count in parent_count.items() if count != 1}
+    if multiple_parents:
+        sample = sorted(multiple_parents.items())[:5]
+        raise AssertionError(
+            f"{len(multiple_parents)} CHUNK nodes do not have exactly one parent ART "
+            f"via HAS_CHUNK; sample: {sample}"
+        )
+
     print(
         f"  CHUNK quality gates passed: {chunk_count} CHUNK nodes, "
-        f"{len(has_chunk_edges)} HAS_CHUNK edges, all parented."
+        f"{len(has_chunk_edges)} HAS_CHUNK edges, all parented exactly once."
     )
 
 
@@ -1192,6 +1234,475 @@ def run_doc_doc_quality_gates(
 
 
 # ---------------------------------------------------------------------------
+# Stage 5.6 — Concept nodes + MENTIONS edges
+# ---------------------------------------------------------------------------
+
+def load_legal_concepts(path: Path) -> List[str]:
+    """Load the curated legal concept vocabulary from YAML.
+
+    Expected schema: ``LEGAL_CONCEPTS`` is a list of 50-100 non-empty strings.
+    Concepts are de-duplicated case-insensitively while preserving order.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Legal concepts config not found: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    raw = cfg.get("LEGAL_CONCEPTS")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"LEGAL_CONCEPTS must be a non-empty list in {path}; "
+            f"got {type(raw).__name__}."
+        )
+
+    concepts: List[str] = []
+    seen: Set[str] = set()
+    for item in raw:
+        concept = str(item).strip()
+        if not concept:
+            continue
+        key = concept.lower()
+        if key not in seen:
+            seen.add(key)
+            concepts.append(concept)
+
+    count = len(concepts)
+    if not (CONCEPT_COUNT_MIN <= count <= CONCEPT_COUNT_MAX):
+        raise ValueError(
+            f"LEGAL_CONCEPTS count {count} outside acceptance window "
+            f"[{CONCEPT_COUNT_MIN}, {CONCEPT_COUNT_MAX}]."
+        )
+    return concepts
+
+
+def load_stage3_chunks_for_concepts(path: Path) -> pd.DataFrame:
+    """Load Stage 3 chunks and require ``chunk_text`` for concept extraction."""
+    df = load_stage3_chunks(path)
+    missing = [c for c in REQUIRED_STAGE3_CONCEPT_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Stage 3 parquet is missing columns required for Stage 5.6: {missing}. "
+            f"Available columns: {list(df.columns)}"
+        )
+    return df
+
+
+def build_concept_attrs(concept: str) -> Dict[str, Any]:
+    """Build the locked attribute dict for one CONCEPT node."""
+    name = concept.strip()
+    return {"type": "Concept", "name": name, "name_lower": name.lower()}
+
+
+def add_concept_nodes(G: "nx.MultiDiGraph", concepts: List[str]) -> int:
+    """Add curated CONCEPT nodes; return newly-created node count."""
+    added = 0
+    for concept in concepts:
+        attrs = build_concept_attrs(concept)
+        node_id = f"CONCEPT:{attrs['name_lower']}"
+        if node_id in G.nodes:
+            G.nodes[node_id].update(attrs)
+        else:
+            G.add_node(node_id, **attrs)
+            added += 1
+    return added
+
+
+def match_concepts_in_text(text: Any, concepts: List[str]) -> List[str]:
+    """Return up to ``MAX_CONCEPTS_PER_CHUNK`` concepts found in chunk text."""
+    if text is None:
+        return []
+    text_norm = str(text).lower()
+    if not text_norm.strip():
+        return []
+    matches: List[str] = []
+    for concept in concepts:
+        if len(matches) >= MAX_CONCEPTS_PER_CHUNK:
+            break
+        if concept.lower() in text_norm:
+            matches.append(concept)
+    return matches
+
+
+def _add_mentions_for_matches(
+    G: "nx.MultiDiGraph", chunk_key: str, matches: List[str]
+) -> int:
+    """Add MENTIONS edges for already-normalized concept matches."""
+    edges_added = 0
+    for concept in matches[:MAX_CONCEPTS_PER_CHUNK]:
+        concept_key = f"CONCEPT:{concept.lower()}"
+        if concept_key not in G.nodes:
+            continue
+        if not G.has_edge(chunk_key, concept_key, key=MENTIONS_EDGE_KEY):
+            G.add_edge(
+                chunk_key,
+                concept_key,
+                key=MENTIONS_EDGE_KEY,
+                relation=MENTIONS_RELATION,
+            )
+            edges_added += 1
+    return edges_added
+
+
+def add_mentions_edges(
+    G: "nx.MultiDiGraph", chunks: pd.DataFrame, concepts: List[str]
+) -> Tuple[int, int]:
+    """Add CHUNK -> CONCEPT MENTIONS edges from Stage 3 chunk text.
+
+    Only chunks already present in the graph are eligible. Returns
+    ``(edges_added, chunks_with_mentions)``.
+    """
+    edges_added = 0
+    chunks_with_mentions = 0
+    for row in tqdm(
+        chunks.itertuples(index=False),
+        total=len(chunks),
+        desc="  Matching concepts in chunks",
+        unit=" chunk",
+        leave=False,
+    ):
+        chunk_id = str(row.chunk_id)
+        chunk_key = f"CHUNK:{chunk_id}"
+        if chunk_key not in G.nodes or G.nodes[chunk_key].get("type") != "Chunk":
+            continue
+
+        matches = match_concepts_in_text(getattr(row, "chunk_text", None), concepts)
+        if matches:
+            chunks_with_mentions += 1
+        edges_added += _add_mentions_for_matches(G, chunk_key, matches)
+    return edges_added, chunks_with_mentions
+
+
+def _canonicalize_llm_concepts(raw_concepts: Any, concepts_by_lower: Dict[str, str]) -> List[str]:
+    """Map LLM-returned concept names to curated concept strings."""
+    if not isinstance(raw_concepts, list):
+        return []
+    matches: List[str] = []
+    seen: Set[str] = set()
+    for item in raw_concepts:
+        key = str(item).strip().lower()
+        concept = concepts_by_lower.get(key)
+        if concept and key not in seen:
+            seen.add(key)
+            matches.append(concept)
+        if len(matches) >= MAX_CONCEPTS_PER_CHUNK:
+            break
+    return matches
+
+
+def add_mentions_edges_llm(
+    G: "nx.MultiDiGraph",
+    chunks: pd.DataFrame,
+    concepts: List[str],
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model_name: str = "gemini-2.0-flash",
+    batch_size: int = 10,
+    provider: str = "gemini",
+) -> Tuple[int, int]:
+    """Add CHUNK -> CONCEPT MENTIONS edges using the script LLM extractor.
+
+    The LLM is only allowed to select concepts that already exist in the curated
+    Stage 5.6 vocabulary, preserving the fixed CONCEPT node acceptance window.
+    """
+    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    try:
+        from extract_concepts import (
+            gemini_extract_mentions,
+            openai_compatible_extract_mentions,
+            tokenize_for_prompt,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "LLM-generated MENTIONS require scripts/extract_concepts.py helpers "
+            "to be importable."
+        ) from exc
+
+    provider = provider.lower().replace("_", "-")
+    if provider not in {"gemini", "openai-compatible"}:
+        raise ValueError(
+            "Unsupported LLM provider "
+            f"{provider!r}; expected 'gemini' or 'openai-compatible'."
+        )
+
+    llm = None
+    openai_client = None
+    # Resolve base_url from explicit arg, then BASE_URL env var.
+    resolved_base_url = base_url or os.getenv("BASE_URL")
+    if provider == "gemini":
+        try:
+            import google.generativeai as genai
+        except ImportError as exc:
+            raise ImportError(
+                "Gemini MENTIONS extraction requires google-generativeai."
+            ) from exc
+        resolved_api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
+        if not resolved_api_key:
+            raise ValueError(
+                "Gemini API key is required for --mentions-source llm. Provide "
+                "--llm-api-key or set GEMINI_API_KEY or API_KEY."
+            )
+        client_options: Dict[str, str] = {}
+        if resolved_base_url:
+            client_options["api_endpoint"] = resolved_base_url
+        genai.configure(api_key=resolved_api_key, client_options=client_options)
+        llm = genai.GenerativeModel(model_name)
+    else:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "OpenAI-compatible MENTIONS extraction requires the openai package. "
+                "Install it with `pip install openai`."
+            ) from exc
+        resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+        if not resolved_api_key:
+            raise ValueError(
+                "OpenAI-compatible API key is required for --llm-provider "
+                "openai-compatible. Provide --llm-api-key or set OPENAI_API_KEY or API_KEY."
+            )
+        client_kwargs: Dict[str, str] = {"api_key": resolved_api_key}
+        if resolved_base_url:
+            client_kwargs["base_url"] = resolved_base_url
+        openai_client = OpenAI(**client_kwargs)
+
+    concepts_by_lower = {concept.lower(): concept for concept in concepts}
+    eligible_items: List[Dict[str, str]] = []
+    for row in chunks.itertuples(index=False):
+        chunk_id = str(row.chunk_id)
+        chunk_key = f"CHUNK:{chunk_id}"
+        if chunk_key not in G.nodes or G.nodes[chunk_key].get("type") != "Chunk":
+            continue
+        eligible_items.append(
+            {
+                "source_id": chunk_id,
+                "text": tokenize_for_prompt(getattr(row, "chunk_text", None)),
+            }
+        )
+
+    edges_added = 0
+    chunks_with_mentions = 0
+    if batch_size <= 0:
+        raise ValueError(f"LLM batch size must be positive; got {batch_size}.")
+
+    total_batches = math.ceil(len(eligible_items) / batch_size)
+    for batch_start in tqdm(
+        range(0, len(eligible_items), batch_size),
+        total=total_batches,
+        desc="  LLM concept extraction",
+        unit=" batch",
+        leave=False,
+    ):
+        batch = eligible_items[batch_start : batch_start + batch_size]
+        try:
+            if provider == "gemini":
+                result = gemini_extract_mentions(llm, batch, concepts)
+            else:
+                result = openai_compatible_extract_mentions(
+                    openai_client, model_name, batch, concepts
+                )
+        except (ValueError, json.JSONDecodeError) as exc:
+            batch_ids = [it.get("source_id", "?") for it in batch]
+            print(
+                f"\n  [WARN] LLM extraction failed for batch starting at idx "
+                f"{batch_start}: {exc}\n"
+                f"  Chunk IDs in failed batch: {batch_ids}\n"
+                f"  Skipping batch and continuing.\n",
+                file=sys.stderr,
+            )
+            continue
+        by_source = {str(item.get("source_id")): item for item in result.get("items", [])}
+        for item in batch:
+            source_id = item["source_id"]
+            chunk_key = f"CHUNK:{source_id}"
+            matches = _canonicalize_llm_concepts(
+                by_source.get(source_id, {}).get("concepts", []), concepts_by_lower
+            )
+            if matches:
+                chunks_with_mentions += 1
+            edges_added += _add_mentions_for_matches(G, chunk_key, matches)
+    if edges_added == 0 and total_batches > 0:
+        print(
+            "\n  [WARN] No MENTIONS edges were added after processing all batches. "
+            "Check LLM provider / model compatibility.\n",
+            file=sys.stderr,
+        )
+    return edges_added, chunks_with_mentions
+
+
+def run_concept_quality_gates(
+    G: "nx.MultiDiGraph",
+    expected_band: Tuple[int, int] = (CONCEPT_COUNT_MIN, CONCEPT_COUNT_MAX),
+) -> None:
+    """Validate concept nodes and chunk-first MENTIONS edge invariants."""
+    concept_nodes = [(n, d) for n, d in G.nodes(data=True) if d.get("type") == "Concept"]
+    concept_count = len(concept_nodes)
+    lo, hi = expected_band
+    if not (lo <= concept_count <= hi):
+        raise AssertionError(
+            f"CONCEPT node count {concept_count} outside acceptance window [{lo}, {hi}]."
+        )
+
+    for node_id, attrs in concept_nodes:
+        if not attrs.get("name") or not attrs.get("name_lower"):
+            raise AssertionError(f"CONCEPT node {node_id} has empty name/name_lower.")
+        if node_id != f"CONCEPT:{attrs.get('name_lower')}":
+            raise AssertionError(
+                f"CONCEPT node key {node_id!r} does not match name_lower "
+                f"{attrs.get('name_lower')!r}."
+            )
+
+    mentions_edges = [
+        (u, v, k, d)
+        for u, v, k, d in G.edges(keys=True, data=True)
+        if d.get("relation") == MENTIONS_RELATION
+    ]
+    for u, v, k, d in mentions_edges:
+        if G.nodes[u].get("type") != "Chunk":
+            raise AssertionError(
+                f"MENTIONS edge {u} -> {v} source is not a Chunk node "
+                f"(type={G.nodes[u].get('type')!r})."
+            )
+        if G.nodes[v].get("type") != "Concept":
+            raise AssertionError(
+                f"MENTIONS edge {u} -> {v} target is not a Concept node "
+                f"(type={G.nodes[v].get('type')!r})."
+            )
+        if k != MENTIONS_EDGE_KEY:
+            raise AssertionError(
+                f"MENTIONS edge {u} -> {v} has unexpected edge key {k!r}; "
+                f"expected {MENTIONS_EDGE_KEY!r}."
+            )
+
+    art_to_concept = [
+        (u, v)
+        for u, v, d in G.edges(data=True)
+        if G.nodes[u].get("type") == "Article" and G.nodes[v].get("type") == "Concept"
+    ]
+    if art_to_concept:
+        raise AssertionError(
+            f"Found {len(art_to_concept)} ART -> CONCEPT edges; Stage 5.6 requires "
+            "MENTIONS edges to be CHUNK -> CONCEPT only."
+        )
+
+    print(
+        f"  CONCEPT quality gates passed: {concept_count} CONCEPT nodes, "
+        f"{len(mentions_edges)} CHUNK -> CONCEPT MENTIONS edges."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 5.7 / 5.8 — Final persistence and validation
+# ---------------------------------------------------------------------------
+
+def _assert_graph_readable(path: Path) -> "nx.MultiDiGraph":
+    """Round-trip-load ``path`` and verify it contains a NetworkX MultiDiGraph."""
+    G = load_existing_graph(path)
+    print(
+        f"  Readable graph: {G.number_of_nodes()} nodes, "
+        f"{G.number_of_edges()} edges."
+    )
+    return G
+
+
+def _print_graph_info(G: "nx.MultiDiGraph") -> None:
+    """Print a stable replacement for deprecated ``nx.info(G)`` output."""
+    print(
+        "  nx.info equivalent: "
+        f"MultiDiGraph with {G.number_of_nodes()} nodes and "
+        f"{G.number_of_edges()} edges"
+    )
+    type_counts: Dict[str, int] = {}
+    for _node, attrs in G.nodes(data=True):
+        node_type = str(attrs.get("type", "(missing)"))
+        type_counts[node_type] = type_counts.get(node_type, 0) + 1
+    print("  Node counts by type:")
+    for node_type, count in sorted(type_counts.items()):
+        print(f"    {node_type:<10} {count:>8,}")
+
+
+def run_full_graph_quality_gates(G: "nx.MultiDiGraph", whitelist: Set[str]) -> None:
+    """Validate final Stage 5 graph invariants for the chunk-first KG."""
+    doc_count = sum(1 for _n, d in G.nodes(data=True) if d.get("type") == "Document")
+    if not (DOC_COUNT_MIN <= doc_count <= DOC_COUNT_MAX):
+        raise AssertionError(
+            f"DOC node count {doc_count} outside acceptance window "
+            f"[{DOC_COUNT_MIN}, {DOC_COUNT_MAX}]."
+        )
+
+    run_article_quality_gates(G, expected_band=(ART_COUNT_MIN, ART_COUNT_MAX))
+    run_chunk_quality_gates(G, expected_band=(CHUNK_COUNT_MIN, CHUNK_COUNT_MAX))
+    run_concept_quality_gates(G, expected_band=(CONCEPT_COUNT_MIN, CONCEPT_COUNT_MAX))
+
+    doc_doc_edges = [
+        (u, v, k, d)
+        for u, v, k, d in G.edges(keys=True, data=True)
+        if G.nodes.get(u, {}).get("type") == "Document"
+        and G.nodes.get(v, {}).get("type") == "Document"
+    ]
+    if doc_doc_edges:
+        run_doc_doc_quality_gates(
+            G,
+            whitelist=whitelist,
+            expected_band=(DOC_DOC_EDGE_COUNT_MIN, DOC_DOC_EDGE_COUNT_MAX),
+        )
+
+    invalid_type_edges: List[Tuple[str, str, str, str]] = []
+    allowed = {
+        ("Document", "Document"),
+        ("Document", "Article"),
+        ("Article", "Chunk"),
+        ("Chunk", "Concept"),
+    }
+    for u, v, _k, data in G.edges(keys=True, data=True):
+        src_type = G.nodes[u].get("type")
+        dst_type = G.nodes[v].get("type")
+        if (src_type, dst_type) not in allowed:
+            invalid_type_edges.append((u, v, str(src_type), str(dst_type)))
+
+    if invalid_type_edges:
+        raise AssertionError(
+            f"Found {len(invalid_type_edges)} edges outside DOC->DOC, DOC->ART, "
+            f"ART->CHUNK, CHUNK->CONCEPT schema; sample: {invalid_type_edges[:5]}"
+        )
+
+    print("  Full graph quality gates passed: DOC -> ART -> CHUNK -> CONCEPT enforced.")
+
+
+def _run_stage_5_7(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiDiGraph":
+    """Stage 5.7: re-persist graph with ``pickle.HIGHEST_PROTOCOL`` and verify readable."""
+    output_path = resolve_path(
+        args.output_path,
+        Path(__file__).resolve().parents[2] / "data" / "kg.gpickle",
+    )
+    print("Stage 5.7: Persist graph with pickle.HIGHEST_PROTOCOL")
+    print("=" * 50)
+    persist_graph(G, output_path)
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"  Re-wrote {output_path} ({size_mb:.2f} MB) with protocol {pickle.HIGHEST_PROTOCOL}.")
+    reloaded = _assert_graph_readable(output_path)
+    _print_graph_info(reloaded)
+    return reloaded
+
+
+def _run_stage_5_8(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiDiGraph":
+    """Stage 5.8: final graph invariant validation for chunk-first pipeline."""
+    project_root = Path(__file__).resolve().parents[2]
+    mapping_path = resolve_path(
+        args.relationship_mapping_path,
+        project_root / RELATIONSHIP_MAPPING_CONFIG,
+    )
+    print("Stage 5.8: Validate final graph quality gates")
+    print("=" * 50)
+    print(f"  Mapping config: {mapping_path}")
+    whitelist = load_relationship_mapping(mapping_path)["RELATION_WHITELIST"]
+    run_full_graph_quality_gates(G, whitelist=whitelist)
+    _print_graph_info(G)
+    return G
+
+
+# ---------------------------------------------------------------------------
 # Stage runners
 # ---------------------------------------------------------------------------
 
@@ -1389,10 +1900,64 @@ def _run_stage_5_5(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
 
 
 def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiDiGraph":
-    raise NotImplementedError(
-        "Stage 5.6 (CONCEPT nodes + MENTIONS edges) is not yet implemented. "
-        "See PLAN.md task 5.6 for scope and acceptance criteria."
+    """Stage 5.6 builder: add CONCEPT nodes + chunk-first MENTIONS edges."""
+    project_root = Path(__file__).resolve().parents[2]
+    stage3_path = resolve_path(
+        args.stage3_path, project_root / "data" / "stage3_chunks.parquet"
     )
+    concepts_path = resolve_path(
+        args.legal_concepts_path,
+        project_root / LEGAL_CONCEPTS_CONFIG,
+    )
+
+    print("Stage 5.6: Build CONCEPT nodes + CHUNK -> CONCEPT MENTIONS edges")
+    print("=" * 50)
+    print(f"  Stage 3 input  : {stage3_path}")
+    print(f"  Concepts config: {concepts_path}")
+
+    print("\n[1/5] Loading legal concept vocabulary")
+    concepts = load_legal_concepts(concepts_path)
+    print(f"  Loaded {len(concepts):,} curated concepts.")
+
+    print("\n[2/5] Loading Stage 3 chunks with chunk_text")
+    chunks = load_stage3_chunks_for_concepts(stage3_path)
+    print(f"  Loaded {len(chunks):,} chunk rows for concept extraction.")
+
+    print("\n[3/5] Adding CONCEPT nodes")
+    nodes_added = add_concept_nodes(G, concepts)
+    print(f"  Added {nodes_added:,} new CONCEPT nodes.")
+
+    print("\n[4/5] Adding CHUNK -> CONCEPT MENTIONS edges")
+    mentions_source = getattr(args, "mentions_source", "substring")
+    if mentions_source == "llm":
+        print(
+            "  Using LLM-generated MENTIONS via scripts/extract_concepts.py "
+            f"with provider {args.llm_provider!r} and model {args.llm_model_name!r}."
+        )
+        edges_added, chunks_with_mentions = add_mentions_edges_llm(
+            G,
+            chunks,
+            concepts,
+            api_key=args.llm_api_key,
+            base_url=args.llm_base_url,
+            model_name=args.llm_model_name,
+            batch_size=args.llm_batch_size,
+            provider=args.llm_provider,
+        )
+    else:
+        print("  Using deterministic substring matching.")
+        edges_added, chunks_with_mentions = add_mentions_edges(G, chunks, concepts)
+    print(
+        f"  Added {edges_added:,} new MENTIONS edges; "
+        f"{chunks_with_mentions:,} chunks matched at least one concept."
+    )
+
+    print("\n[5/5] Concept quality gates")
+    run_concept_quality_gates(
+        G,
+        expected_band=(CONCEPT_COUNT_MIN, CONCEPT_COUNT_MAX),
+    )
+    return G
 
 
 STAGE_RUNNERS = {
@@ -1401,6 +1966,8 @@ STAGE_RUNNERS = {
     "5.4": _run_stage_5_4,
     "5.5": _run_stage_5_5,
     "5.6": _run_stage_5_6,
+    "5.7": _run_stage_5_7,
+    "5.8": _run_stage_5_8,
 }
 
 
@@ -1419,8 +1986,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Sub-stage to run. 5.2=DOC nodes, 5.3=ART nodes + HAS_ARTICLE edges, "
             "5.4=CHUNK nodes + HAS_CHUNK edges, 5.5=cross-document edges from "
-            "the relationships dataset, 5.6=CONCEPT nodes (TBD), "
-            "all=run every implemented stage in order."
+            "the relationships dataset, 5.6=CONCEPT nodes + MENTIONS edges, "
+            "5.7=final pickle persistence/readability check, 5.8=final graph "
+            "validation, all=run every implemented stage in order."
         ),
     )
     parser.add_argument(
@@ -1479,6 +2047,57 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--legal-concepts-path",
+        default=None,
+        help=(
+            "Path to legal concepts YAML "
+            "(default: config/legal_concepts.yaml)"
+        ),
+    )
+    parser.add_argument(
+        "--mentions-source",
+        choices=("substring", "llm"),
+        default="substring",
+        help=(
+            "How Stage 5.6 generates CHUNK -> CONCEPT MENTIONS edges: "
+            "deterministic substring matching or LLM extraction via "
+            "scripts/extract_concepts.py."
+        ),
+    )
+    parser.add_argument(
+        "--llm-provider",
+        choices=("gemini", "openai-compatible"),
+        default="gemini",
+        help="LLM provider for --mentions-source llm.",
+    )
+    parser.add_argument(
+        "--llm-api-key",
+        default=None,
+        help=(
+            "API key for --mentions-source llm. Overrides GEMINI_API_KEY for "
+            "Gemini or OPENAI_API_KEY for OpenAI-compatible providers."
+        ),
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        default=None,
+        help=(
+            "Custom API endpoint for --mentions-source llm: Gemini api_endpoint "
+            "or OpenAI-compatible base_url."
+        ),
+    )
+    parser.add_argument(
+        "--llm-model-name",
+        default="gemini-2.0-flash",
+        help="Model name for --mentions-source llm.",
+    )
+    parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=10,
+        help="Number of chunks per LLM request for --mentions-source llm.",
+    )
+    parser.add_argument(
         "--output-path",
         default=None,
         help="Output path for kg.gpickle (default: data/kg.gpickle)",
@@ -1488,7 +2107,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Load existing kg.gpickle and append/update nodes instead of "
-            "starting fresh. Required for stages 5.3-5.6."
+            "starting fresh. Required for stages 5.3-5.8."
         ),
     )
     return parser
@@ -1510,7 +2129,7 @@ def _run_single_stage(
 def _run_all_stages(
     args: argparse.Namespace, output_path: Path
 ) -> "nx.MultiDiGraph":
-    """Run 5.2 fresh, then 5.3, 5.4, 5.5; log-and-skip 5.6 stub."""
+    """Run 5.2 fresh, then 5.3, 5.4, 5.5, 5.6, 5.7 and 5.8."""
     print("Stage all: running every implemented sub-stage in order")
     print("=" * 50)
 
@@ -1531,13 +2150,17 @@ def _run_all_stages(
     G = _run_stage_5_5(args, G)
     _persist_and_report(G, output_path, label="Stage 5.5")
 
-    for stage in ("5.6",):
-        print(f"\n--- Stage {stage} ---")
-        try:
-            G = STAGE_RUNNERS[stage](args, G)
-            _persist_and_report(G, output_path, label=f"Stage {stage}")
-        except NotImplementedError as exc:
-            print(f"  Skipped: {exc}")
+    print("\n--- Stage 5.6 (append) ---")
+    G = _run_stage_5_6(args, G)
+    _persist_and_report(G, output_path, label="Stage 5.6")
+
+    print("\n--- Stage 5.7 (append) ---")
+    G = _run_stage_5_7(args, G)
+    _persist_and_report(G, output_path, label="Stage 5.7")
+
+    print("\n--- Stage 5.8 (append) ---")
+    G = _run_stage_5_8(args, G)
+    _persist_and_report(G, output_path, label="Stage 5.8")
 
     return G
 
@@ -1547,6 +2170,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     project_root = Path(__file__).resolve().parents[2]
+    # Load .env configuration before any API calls.
+    load_dotenv(project_root / ".env")
     output_path = resolve_path(args.output_path, project_root / "data" / "kg.gpickle")
 
     print(f"Stage 5 builder | --stage={args.stage} | output={output_path}")
