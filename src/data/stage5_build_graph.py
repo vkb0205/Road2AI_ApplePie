@@ -207,7 +207,10 @@ DOC_DOC_RELATION_ATTR = "relation"
 RELATIONSHIP_MAPPING_CONFIG = "config/relationship_mapping.yaml"
 
 # Allowed values for the --stage CLI argument.
-ALLOWED_STAGES = ("5.2", "5.3", "5.4", "5.5", "5.6", "5.7", "5.8", "all")
+ALLOWED_STAGES = (
+    "5.2", "5.3", "5.4", "5.5", "5.6", "5.7", "5.8",
+    "all", "merge-partitions",
+)
 STAGES_REQUIRING_APPEND = {"5.3", "5.4", "5.5", "5.6", "5.7", "5.8"}
 
 
@@ -276,6 +279,34 @@ def _persist_and_report(G: "nx.MultiDiGraph", output_path: Path, label: str) -> 
         f"  Graph summary after {label}: "
         f"{G.number_of_nodes()} nodes, {G.number_of_edges()} edges."
     )
+
+
+def _partition_output_path(base_path: Path, partition_idx: int) -> Path:
+    """Derive a partition-specific save path from a base path.
+
+    Example: ``data/kg.gpickle`` + idx=3 → ``data/kg_part_3.gpickle``.
+    This naming convention is used by both the partition run (Stage 5.6
+    with ``--partition-idx``) and the merge step (``--stage merge-partitions``).
+    """
+    stem = base_path.stem
+    suffix = base_path.suffix
+    parent = base_path.parent
+    return parent / f"{stem}_part_{partition_idx}{suffix}"
+
+
+def _partition_df(df: pd.DataFrame, num_partitions: int, partition_idx: int) -> pd.DataFrame:
+    """Select a non-overlapping row subset for one partition using modular arithmetic.
+
+    Each partition processes ``~1/num_partitions`` of the rows so that multiple
+    Stage 5.6 invocations can run in parallel on disjoint chunk subsets.
+    """
+    if num_partitions <= 0:
+        raise ValueError(f"num_partitions must be >= 1; got {num_partitions}")
+    if not (0 <= partition_idx < num_partitions):
+        raise ValueError(
+            f"partition_idx {partition_idx} out of range [0, {num_partitions})."
+        )
+    return df.iloc[partition_idx::num_partitions].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1900,7 +1931,12 @@ def _run_stage_5_5(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
 
 
 def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiDiGraph":
-    """Stage 5.6 builder: add CONCEPT nodes + chunk-first MENTIONS edges."""
+    """Stage 5.6 builder: add CONCEPT nodes + chunk-first MENTIONS edges.
+
+    When ``--num-partitions`` is provided, only a row-wise slice of the chunks
+    is processed so that multiple processes can run concurrently on disjoint
+    subsets.
+    """
     project_root = Path(__file__).resolve().parents[2]
     stage3_path = resolve_path(
         args.stage3_path, project_root / "data" / "stage3_chunks.parquet"
@@ -1921,7 +1957,18 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
 
     print("\n[2/5] Loading Stage 3 chunks with chunk_text")
     chunks = load_stage3_chunks_for_concepts(stage3_path)
-    print(f"  Loaded {len(chunks):,} chunk rows for concept extraction.")
+
+    # --- Partition slicing ---------------------------------------------------
+    num_partitions = getattr(args, "num_partitions", 0)
+    partition_idx = getattr(args, "partition_idx", 0)
+    if num_partitions and num_partitions > 1:
+        chunks = _partition_df(chunks, num_partitions, partition_idx)
+        print(
+            f"  Running partition {partition_idx} of {num_partitions}: "
+            f"{len(chunks):,} chunk rows (of {len(chunks) * num_partitions:,} total)."
+        )
+    else:
+        print(f"  Loaded {len(chunks):,} chunk rows for concept extraction.")
 
     print("\n[3/5] Adding CONCEPT nodes")
     nodes_added = add_concept_nodes(G, concepts)
@@ -1960,6 +2007,89 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
     return G
 
 
+def _run_merge_partitions(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiDiGraph":
+    """Merge partition output files back into the main graph.
+
+    Walks ``output_path``-derived partition files (e.g. ``kg_part_0.gpickle``
+    through ``kg_part_{num_partitions - 1}.gpickle``) and merges their
+    CONCEPT nodes and MENTIONS edges into the base graph read from
+    ``output_path``.
+
+    Usage::
+
+        python -m src.data.stage5_build_graph --stage merge-partitions --append
+            --num-partitions 10 --output-path data/kg.gpickle
+    """
+    project_root = Path(__file__).resolve().parents[2]
+    output_path = resolve_path(args.output_path, project_root / "data" / "kg.gpickle")
+    num_partitions = getattr(args, "num_partitions", 0)
+
+    print("Stage merge-partitions: Merge partition graphs into main graph")
+    print("=" * 50)
+    print(f"  Base graph     : {output_path}")
+    print(f"  Number of parts : {num_partitions}")
+
+    if num_partitions < 2:
+        raise ValueError(
+            f"--num-partitions must be >= 2 for merge; got {num_partitions}."
+        )
+
+    G_loaded = False
+    for idx in range(num_partitions):
+        part_path = _partition_output_path(output_path, idx)
+        if not part_path.exists():
+            print(
+                f"  [WARN] Partition file {part_path} not found, skipping.",
+                file=sys.stderr,
+            )
+            continue
+        with part_path.open("rb") as f:
+            part_G: nx.MultiDiGraph = pickle.load(f)
+        if not G_loaded:
+            # On the first valid partition, seed from the main graph (or create fresh).
+            if output_path.exists():
+                G = load_existing_graph(output_path)
+            G_loaded = True
+
+        # Merge Concept nodes
+        concept_nodes = [
+            (n, d) for n, d in part_G.nodes(data=True) if d.get("type") == "Concept"
+        ]
+        for node_id, attrs in concept_nodes:
+            if node_id not in G.nodes:
+                G.add_node(node_id, **attrs)
+            else:
+                G.nodes[node_id].update(attrs)
+
+        # Merge MENTIONS edges
+        mentions_added = 0
+        for u, v, k, d in part_G.edges(keys=True, data=True):
+            if d.get("relation") != MENTIONS_RELATION:
+                continue
+            if not G.has_edge(u, v, key=k):
+                G.add_edge(u, v, key=k, **d)
+                mentions_added += 1
+
+        print(
+            f"  Part {idx}: merged {len(concept_nodes)} Concept nodes, "
+            f"{mentions_added} new MENTIONS edges."
+        )
+
+        # Clean up partition file to avoid double-merge in a re-run.
+        part_path.unlink(missing_ok=True)
+        print(f"  Removed {part_path}.")
+
+    if not G_loaded:
+        print("  [WARN] No partition files found; graph is unchanged.")
+    else:
+        print(
+            f"\n  Merge complete: {G.number_of_nodes()} nodes, "
+            f"{G.number_of_edges()} edges."
+        )
+
+    return G
+
+
 STAGE_RUNNERS = {
     "5.2": _run_stage_5_2,
     "5.3": _run_stage_5_3,
@@ -1968,6 +2098,7 @@ STAGE_RUNNERS = {
     "5.6": _run_stage_5_6,
     "5.7": _run_stage_5_7,
     "5.8": _run_stage_5_8,
+    "merge-partitions": _run_merge_partitions,
 }
 
 
@@ -2110,6 +2241,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "starting fresh. Required for stages 5.3-5.8."
         ),
     )
+    parser.add_argument(
+        "--num-partitions",
+        type=int,
+        default=0,
+        help=(
+            "Split Stage 5.6 chunk processing into this many disjoint "
+            "partitions for parallel execution. Pass --stage 5.6 --append "
+            "--partition-idx N for each worker, then run "
+            "--stage merge-partitions --append --num-partitions N to merge."
+        ),
+    )
+    parser.add_argument(
+        "--partition-idx",
+        type=int,
+        default=0,
+        help=(
+            "Zero-based partition index for this worker "
+            "(requires --num-partitions)."
+        ),
+    )
     return parser
 
 
@@ -2177,6 +2328,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Stage 5 builder | --stage={args.stage} | output={output_path}")
     print(f"Mode: {'APPEND' if args.append else 'FRESH'}")
 
+    num_partitions = getattr(args, "num_partitions", 0)
+    partition_idx = getattr(args, "partition_idx", 0)
+    if num_partitions > 1:
+        print(
+            f"  Partition mode: {num_partitions} partitions, "
+            f"this worker = idx {partition_idx}."
+        )
+
+    # --- merge-partitions special case --------------------------------------
+    # This stage reads partition files on its own and does not require --append.
+    if args.stage == "merge-partitions":
+        _run_single_stage(args.stage, args, nx.MultiDiGraph(), output_path)
+        return 0
+
+    # --- "all" stage --------------------------------------------------------
     if args.stage == "all":
         # --stage all manages its own append semantics between sub-stages.
         if args.append:
@@ -2187,16 +2353,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         _run_all_stages(args, output_path)
         return 0
 
-    # Single-stage path.
+    # --- Single-stage path ---------------------------------------------------
+    # Stages 5.3-5.8 require --append (they load a graph built by prior stages).
     if args.stage in STAGES_REQUIRING_APPEND and not args.append:
         parser.error(
             f"Stage {args.stage} depends on prior stages and requires --append. "
             f"Run --stage 5.2 first, then re-invoke with --stage {args.stage} --append."
         )
 
+    # Resolve the actual file to load/save: in partition mode each worker
+    # writes to its own dedicated file so they never collide.
+    if args.stage == "5.6" and num_partitions > 1:
+        stage_output_path = _partition_output_path(output_path, partition_idx)
+    else:
+        stage_output_path = output_path
+
     if args.append:
         try:
-            G = load_existing_graph(output_path)
+            G = load_existing_graph(stage_output_path)
         except FileNotFoundError as exc:
             parser.error(str(exc))
         except TypeError as exc:
@@ -2209,7 +2383,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         G = nx.MultiDiGraph()
         print("  Created new MultiDiGraph.")
 
-    _run_single_stage(args.stage, args, G, output_path)
+    _run_single_stage(args.stage, args, G, stage_output_path)
     return 0
 
 
