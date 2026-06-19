@@ -2718,11 +2718,16 @@ def _run_stage_5_6_push(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.M
             f"  Using LLM-generated MENTIONS with provider {args.llm_provider!r} "
             f"and model {args.llm_model_name!r}."
         )
-        # We still need a graph to pass to add_mentions_edges_llm, but we'll
-        # create an empty one and ignore the result. The tracker will be populated.
-        empty_G = nx.MultiDiGraph()
+        # We need a graph for the chunk lookup, but we don't need to persist it.
+        # Populate minimal CHUNK nodes so the eligibility check passes.
+        G_push = nx.MultiDiGraph()
+        for row in chunks.itertuples(index=False):
+            chunk_id = str(row.chunk_id)
+            chunk_key = f"CHUNK:{chunk_id}"
+            if chunk_key not in G_push.nodes:
+                G_push.add_node(chunk_key, type="Chunk")
         edges_added, chunks_with_mentions = add_mentions_edges_llm(
-            empty_G,
+            G_push,
             chunks,
             concepts,
             api_key=args.llm_api_key,
@@ -2736,9 +2741,14 @@ def _run_stage_5_6_push(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.M
         )
     else:
         print("  Using deterministic substring matching.")
-        empty_G = nx.MultiDiGraph()
+        G_push = nx.MultiDiGraph()
+        for row in chunks.itertuples(index=False):
+            chunk_id = str(row.chunk_id)
+            chunk_key = f"CHUNK:{chunk_id}"
+            if chunk_key not in G_push.nodes:
+                G_push.add_node(chunk_key, type="Chunk")
         edges_added, chunks_with_mentions = add_mentions_edges(
-            empty_G, chunks, concepts,
+            G_push, chunks, concepts,
             tracker=tracker,
             mentions_source=mentions_source,
             checkpoint_path=None,  # No checkpointing in push-only mode
