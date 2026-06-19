@@ -2432,6 +2432,28 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
     else:
         print(f"  Loaded {len(chunks):,} chunk rows for concept extraction.")
 
+    # --- Skip already-processed chunks ---------------------------------------
+    # If a tracker is configured, query the chunk_concept_mentions table
+    # to find chunks that already have concept extraction results. Those
+    # chunks are skipped to make Stage 5.6 resumable and idempotent.
+    if tracker is not None:
+        print("\n[2.5/5] Checking for already-processed chunks in chunk_concept_mentions")
+        try:
+            processed_chunk_ids = tracker.already_processed()
+            before_count = len(chunks)
+            chunks = chunks.loc[~chunks["chunk_id"].isin(processed_chunk_ids)].reset_index(drop=True)
+            skipped = before_count - len(chunks)
+            if skipped:
+                print(f"  Skipped {skipped:,} chunks already present in chunk_concept_mentions.")
+            else:
+                print("  No previously processed chunks found; all chunks will be processed.")
+        except Exception as exc:
+            print(
+                f"  [WARN] Failed to fetch processed chunk IDs from tracker: {exc}. "
+                "Proceeding with all chunks.",
+                file=sys.stderr,
+            )
+
     print("\n[3/5] Adding CONCEPT nodes")
     nodes_added = add_concept_nodes(G, concepts)
     print(f"  Added {nodes_added:,} new CONCEPT nodes.")
