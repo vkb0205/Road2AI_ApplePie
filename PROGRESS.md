@@ -322,3 +322,78 @@
 - Result: **52 passed in 1.04s**.
 
 **Status:** Stage 5.7 and Stage 5.8 are complete and recorded in `PLAN.md`.
+
+### Checkpoint 19/06/2026 — Zoo
+- **Created SQL schema** at [`Road2AI_ApplePie/sql/00_schema.sql`](Road2AI_ApplePie/sql/00_schema.sql) covering all pipeline stages and KG relations:
+- **Core entity tables**: `documents` (Stage 1), `articles` (Stage 2), `chunks` (Stage 3), `concepts` (Stage 5.6), `relation_types` (enum lookup), `pipeline_metadata` (provenance tracking).
+- **KG edge tables** following the `DOC → ART → CHUNK → CONCEPT` hierarchy:
+- `edges_doc_article` (HAS_ARTICLE, 1:N, 56,269 edges)
+- `edges_article_chunk` (HAS_CHUNK, 1:N, 74,107 edges)
+- `edges_chunk_concept` (MENTIONS, N:M, max 3/chunk, 72,916 edges)
+- `edges_doc_doc` (cross-document: AMENDS, REPLACES, DETAILS, CITES_REF, BASED_ON, CONSOLIDATES, CORRECTS, RELATED_CONTENT — 7,378 edges)
+- **Views**: `v_article_details` (articles with doc metadata), `v_chunk_with_summary` (chunks with Stage 4 summaries), `v_graph_edges` (unified adjacency list), `v_doc_expansion_edges` (retrieval-time traversal edges).
+- **Constraints**: self-loop CHECK on `edges_doc_doc`, FK enforcement via `relation_types` lookup table, GIN-indexed `tsvector` FTS on `articles.noi_dung`.
+- **Schema designed for PostgreSQL**; all PKs/FKs match the actual data formats (`doc_uid` as `TEXT PK`, `chunk_id` as `TEXT PK`, `doc_id` as `BIGINT`).
+
+### Checkpoint 19/06/2026 - VKB
+- **Removed `summaries` table from SQL schema** in [`Road2AI_ApplePie/sql/00_schema.sql`](Road2AI_ApplePie/sql/00_schema.sql):
+  - Deleted the entire `summaries` table definition (CREATE TABLE, index, comments) — Stage 4 summary injection was already deprioritized (Checkpoint 11/06/2026).
+  - Removed the `v_chunk_with_summary` view that LEFT JOINed on the removed table.
+  - Updated file header to no longer reference "summaries" or "Stage 4".
+  - Updated pipeline notation from `1 → 2 → 3 → 4 → 5` to `1 → 2 → 3 → 5` reflecting Stage 4 removal.
+- **Added `process_concept` boolean attribute to CHUNK nodes** in [`Road2AI_ApplePie/src/data/stage5_build_graph.py`](Road2AI_ApplePie/src/data/stage5_build_graph.py):
+  - Extended `build_chunk_attrs()` to include `"process_concept": False` as a default attribute on every CHUNK node.
+  - Tracks whether Stage 5.6 concept extraction (`MENTIONS` edge creation) has been applied per chunk.
+  - Updated docstring to explain the attribute's purpose.
+
+### Checkpoint 19/06/2026 - Zoo
+- **Schema deployed to Supabase**: Executed [`Road2AI_ApplePie/sql/00_schema.sql`](Road2AI_ApplePie/sql/00_schema.sql) against project `hhpjeioyojcbromdiyvp.supabase.co`:
+  - Created **6 tables**: `documents`, `articles`, `chunks`, `concepts`, `chunk_processing`, `pipeline_metadata`.
+  - Created **1 view**: `v_article_details` (full article details with document-level metadata).
+  - Created **23 indexes** (including GIN FTS index on `articles.noi_dung_tsv`).
+- **Migration 01 — `chunk_concept_mentions` table**: Created [`Road2AI_ApplePie/sql/01_chunk_concept_mentions.sql`](Road2AI_ApplePie/sql/01_chunk_concept_mentions.sql).
+  - Normalised per-mention rows: `(chunk_id, concept_name)` with `UNIQUE` constraint for idempotent inserts.
+  - Columns: `id` (identity PK), `chunk_id`, `doc_uid`, `doc_id`, `concept_name`, `mentions_source`, `created_at`.
+  - Indexes on `chunk_id`, `concept_name`, `doc_id`, `mentions_source`.
+  - Migrated to Supabase with 0 errors.
+- **Stage 5.6 DB tracker integration** in [`Road2AI_ApplePie/src/data/stage5_build_graph.py`](Road2AI_ApplePie/src/data/stage5_build_graph.py):
+  - Added `MENTIONS_INSERT_SQL` constant to `ChunkProcessingTracker` class for inserting into `chunk_concept_mentions`.
+  - Added `record_mention()` method — inserts one chunk→concept mention row (idempotent via `ON CONFLICT DO NOTHING`).
+  - Added `record_chunk_mentions()` method — batch-inserts all concept matches for a single chunk.
+  - Modified `_add_mentions_for_matches()` to return `(edges_added, matched_concepts)` tuple so callers know which concepts matched.
+  - Modified `add_mentions_edges()` (substring) and `add_mentions_edges_llm()` (LLM) to accept optional `tracker: ChunkProcessingTracker` and `mentions_source` params; when tracker is provided, every chunk→concept mention is written to Supabase.
+  - Modified `_run_stage_5_6()` to initialize `ChunkProcessingTracker` from `--db-connection-string` CLI argument or `DATABASE_URL` env var, pass it to both mention functions, and close the connection after processing.
+  - Added `--db-connection-string` CLI argument (`--db-connection-string "postgresql://postgres:...@db....supabase.co:5432/postgres"`).
+- **Usage**:
+  ```bash
+  # Substring matching with Supabase persistence:
+  python -m src.data.stage5_build_graph --stage 5.6 --append \
+    --db-connection-string "postgresql://postgres:YOUR_PASS@db.hhpjeioyojcbromdiyvp.supabase.co:5432/postgres"
+
+  # Or via DATABASE_URL env var:
+  export DATABASE_URL="postgresql://postgres:YOUR_PASS@db.hhpjeioyojcbromdiyvp.supabase.co:5432/postgres"
+  python -m src.data.stage5_build_graph --stage 5.6 --append
+  ```
+  
+  ### Checkpoint 19/06/2026 - Zoo
+  
+  - **Per-chunk Supabase push** confirmed in [`Road2AI_ApplePie/src/data/stage5_build_graph.py`](Road2AI_ApplePie/src/data/stage5_build_graph.py):
+    - Substring mode (`add_mentions_edges()`): pushes chunk→concept mentions to `chunk_concept_mentions` table **per chunk** as each chunk with matches is processed — not accumulated and pushed at the end.
+    - LLM mode (`add_mentions_edges_llm()`): pushes mentions per chunk after each LLM batch is processed.
+    - DB connection uses `autocommit = True`, so each write is committed immediately.
+    - Added terminal verbose: after Stage 5.6 completes, prints `Pushed {edges_added:,} chunk→concept relations to Supabase.` showing the total count uploaded.
+  
+  - **Per-chunk graph checkpointing** added for partition mode (`--num-partitions > 1`):
+    - `add_mentions_edges()` and `add_mentions_edges_llm()` accept a new `checkpoint_path: Optional[Path]` parameter.
+    - When set (partition mode), the graph is checkpointed via `persist_graph(G, checkpoint_path)` after **every processed chunk**.
+    - This means `kg_part_x.gpickle` is written incrementally: if an interruption occurs mid-way, the file contains all MENTIONS edges up to the last checkpointed chunk — no data loss.
+    - Terminal verbose prints `Checkpointed {checkpoint_path} after chunk {chunk_id}.` for each checkpoint.
+    - Activated at [`_run_stage_5_6()`](Road2AI_ApplePie/src/data/stage5_build_graph.py:2261) only in partition mode (>1 partition).
+  
+  - **Example partition run**:
+    ```bash
+    python -m src.data.stage5_build_graph --stage 5.6 --append \
+      --num-partitions 10 --partition-idx 3 \
+      --db-connection-string "postgresql://postgres:...@db....supabase.co:5432/postgres"
+    ```
+    This processes ~1/10th of all chunks, pushes each matched chunk's mentions to Supabase immediately, and checkpoints `kg_part_3.gpickle` after every processed chunk.

@@ -77,6 +77,15 @@ except ImportError as exc:  # pragma: no cover - import guard
         "Install it with `pip install networkx` or use the repo requirements file."
     ) from exc
 
+try:
+    import psycopg2
+except ImportError as exc:  # pragma: no cover - import guard
+    raise ImportError(
+        "psycopg2 is required for DB-backed chunk tracking in "
+        "src/data/stage5_build_graph.py. Install it with "
+        "`pip install psycopg2-binary` or use the repo requirements file."
+    ) from exc
+
 
 def load_dotenv(path: Path) -> None:
     """Load environment variables from .env file."""
@@ -212,6 +221,121 @@ ALLOWED_STAGES = (
     "all", "merge-partitions",
 )
 STAGES_REQUIRING_APPEND = {"5.3", "5.4", "5.5", "5.6", "5.7", "5.8"}
+
+# Default connection string for the Supabase chunk_processing tracker.
+# Resolved from env var DATABASE_URL or --db-connection-string CLI arg.
+DEFAULT_DB_CONNECTION_STRING = ""
+
+
+# ---------------------------------------------------------------------------
+# DB-backed chunk processing tracker (Stage 5.6)
+# ---------------------------------------------------------------------------
+
+class ChunkProcessingTracker:
+    """Records which chunks have had concept extraction applied.
+
+    Writes to a Supabase/Postgres ``chunk_processing`` table so the pipeline
+    can monitor progress, resume after interruption, and skip already-processed
+    chunks on re-run.
+    """
+
+    INSERT_SQL = """
+        INSERT INTO chunk_processing
+            (chunk_id, doc_uid, doc_id, mentions_source, concepts_found, concepts_count)
+        VALUES
+            (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (chunk_id) DO UPDATE SET
+            processed_at    = now(),
+            mentions_source = EXCLUDED.mentions_source,
+            concepts_found  = EXCLUDED.concepts_found,
+            concepts_count  = EXCLUDED.concepts_count
+    """
+
+    MENTIONS_INSERT_SQL = """
+        INSERT INTO chunk_concept_mentions
+            (chunk_id, doc_uid, doc_id, concept_name, mentions_source)
+        VALUES
+            (%s, %s, %s, %s, %s)
+        ON CONFLICT (chunk_id, concept_name) DO NOTHING
+    """
+
+    SELECT_PROCESSED_SQL = """
+        SELECT chunk_id FROM chunk_processing
+    """
+
+    def __init__(self, connection_string: str):
+        if not connection_string:
+            raise ValueError(
+                "DATABASE_URL is not set and no --db-connection-string was provided."
+            )
+        self._conn = psycopg2.connect(connection_string)
+        self._conn.autocommit = True
+
+    def close(self) -> None:
+        """Close the database connection."""
+        if self._conn and not self._conn.closed:
+            self._conn.close()
+
+    def already_processed(self) -> Set[str]:
+        """Return the set of chunk_ids that have processing records."""
+        with self._conn.cursor() as cur:
+            cur.execute(self.SELECT_PROCESSED_SQL)
+            return {row[0] for row in cur.fetchall()}
+
+    def record_chunk(
+        self,
+        chunk_id: str,
+        doc_uid: str,
+        doc_id: str,
+        mentions_source: str,
+        concepts_found: List[str],
+    ) -> None:
+        """Insert or update a processing record for one chunk."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                self.INSERT_SQL,
+                (
+                    chunk_id,
+                    doc_uid,
+                    doc_id,
+                    mentions_source,
+                    concepts_found,
+                    len(concepts_found),
+                ),
+            )
+
+    def record_mention(
+        self,
+        chunk_id: str,
+        doc_uid: str,
+        doc_id: str,
+        concept_name: str,
+        mentions_source: str,
+    ) -> None:
+        """Insert one chunk → concept mention row (idempotent)."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                self.MENTIONS_INSERT_SQL,
+                (chunk_id, doc_uid, doc_id, concept_name, mentions_source),
+            )
+
+    def record_chunk_mentions(
+        self,
+        chunk_id: str,
+        doc_uid: str,
+        doc_id: str,
+        mentions_source: str,
+        concept_names: List[str],
+    ) -> None:
+        """Insert all chunk → concept mentions for one chunk in a single transaction."""
+        if not concept_names:
+            return
+        with self._conn.cursor() as cur:
+            for concept_name in concept_names:
+                cur.execute(
+                    self.MENTIONS_INSERT_SQL,
+                    (chunk_id, doc_uid, doc_id, concept_name, mentions_source),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -760,8 +884,10 @@ def build_chunk_attrs(row: pd.Series) -> Dict[str, Any]:
     """Build the attribute dict for one CHUNK node per ``KG.md`` §3.3.
 
     Minimal metadata only: ``chunk_id``, ``doc_uid``, ``doc_id``, ``rowidx``,
-    ``part_idx`` and ``breadcrumb``. The full ``chunk_text`` is deliberately
-    excluded to keep ``kg.gpickle`` lean (the text lives in Stage 3 / indexes).
+    ``part_idx`` and ``breadcrumb``. A ``process_concept`` boolean (default
+    ``False``) tracks whether Stage 5.6 concept extraction has been applied
+    to this chunk. The full ``chunk_text`` is deliberately excluded to keep
+    ``kg.gpickle`` lean (the text lives in Stage 3 / indexes).
     Empty strings are normalized to ``None``.
     """
     return {
@@ -772,6 +898,7 @@ def build_chunk_attrs(row: pd.Series) -> Dict[str, Any]:
         "rowidx": _normalize_value(row.get("rowidx")),
         "part_idx": _normalize_value(row.get("part_idx")),
         "breadcrumb": _normalize_value(row.get("breadcrumb")),
+        "process_concept": False,
     }
 
 
@@ -1356,9 +1483,15 @@ def match_concepts_in_text(text: Any, concepts: List[str]) -> List[str]:
 
 def _add_mentions_for_matches(
     G: "nx.MultiDiGraph", chunk_key: str, matches: List[str]
-) -> int:
-    """Add MENTIONS edges for already-normalized concept matches."""
+) -> Tuple[int, List[str]]:
+    """Add MENTIONS edges for already-normalized concept matches.
+
+    Returns ``(edges_added, actually_matched_concepts)`` where
+    ``actually_matched_concepts`` is the subset of ``matches`` that
+    correspond to existing CONCEPT nodes and were actually linked.
+    """
     edges_added = 0
+    matched: List[str] = []
     for concept in matches[:MAX_CONCEPTS_PER_CHUNK]:
         concept_key = f"CONCEPT:{concept.lower()}"
         if concept_key not in G.nodes:
@@ -1371,16 +1504,29 @@ def _add_mentions_for_matches(
                 relation=MENTIONS_RELATION,
             )
             edges_added += 1
-    return edges_added
+        matched.append(concept)
+    return edges_added, matched
 
 
 def add_mentions_edges(
-    G: "nx.MultiDiGraph", chunks: pd.DataFrame, concepts: List[str]
+    G: "nx.MultiDiGraph",
+    chunks: pd.DataFrame,
+    concepts: List[str],
+    tracker: Optional[ChunkProcessingTracker] = None,
+    mentions_source: str = "substring",
+    checkpoint_path: Optional[Path] = None,
 ) -> Tuple[int, int]:
     """Add CHUNK -> CONCEPT MENTIONS edges from Stage 3 chunk text.
 
     Only chunks already present in the graph are eligible. Returns
     ``(edges_added, chunks_with_mentions)``.
+
+    When ``tracker`` is provided, every mention is also written to the
+    Supabase ``chunk_concept_mentions`` table for durable persistence.
+
+    When ``checkpoint_path`` is provided, the graph is persisted after every
+    processed chunk so partition outputs (``kg_part_x.gpickle``) survive
+    interruption.
     """
     edges_added = 0
     chunks_with_mentions = 0
@@ -1392,6 +1538,8 @@ def add_mentions_edges(
         leave=False,
     ):
         chunk_id = str(row.chunk_id)
+        doc_uid = str(row.doc_uid)
+        doc_id = str(row.doc_id)
         chunk_key = f"CHUNK:{chunk_id}"
         if chunk_key not in G.nodes or G.nodes[chunk_key].get("type") != "Chunk":
             continue
@@ -1399,7 +1547,22 @@ def add_mentions_edges(
         matches = match_concepts_in_text(getattr(row, "chunk_text", None), concepts)
         if matches:
             chunks_with_mentions += 1
-        edges_added += _add_mentions_for_matches(G, chunk_key, matches)
+        added, matched = _add_mentions_for_matches(G, chunk_key, matches)
+        edges_added += added
+
+        # Persist to Supabase if tracker is available
+        if tracker is not None and matched:
+            tracker.record_chunk_mentions(
+                chunk_id=chunk_id,
+                doc_uid=doc_uid,
+                doc_id=doc_id,
+                mentions_source=mentions_source,
+                concept_names=matched,
+            )
+
+        if checkpoint_path is not None:
+            persist_graph(G, checkpoint_path)
+            print(f"  Checkpointed {checkpoint_path} after chunk {chunk_id}.")
     return edges_added, chunks_with_mentions
 
 
@@ -1429,6 +1592,9 @@ def add_mentions_edges_llm(
     model_name: str = "gemini-2.0-flash",
     batch_size: int = 10,
     provider: str = "gemini",
+    tracker: Optional[ChunkProcessingTracker] = None,
+    mentions_source: str = "llm",
+    checkpoint_path: Optional[Path] = None,
 ) -> Tuple[int, int]:
     """Add CHUNK -> CONCEPT MENTIONS edges using the script LLM extractor.
 
@@ -1563,7 +1729,22 @@ def add_mentions_edges_llm(
             )
             if matches:
                 cwm += 1
-                ea += _add_mentions_for_matches(G, chunk_key, matches)
+            added, matched = _add_mentions_for_matches(G, chunk_key, matches)
+            ea += added
+
+            # Persist to Supabase if tracker is available
+            if tracker is not None and matched:
+                tracker.record_chunk_mentions(
+                    chunk_id=source_id,
+                    doc_uid="",
+                    doc_id="",
+                    mentions_source=mentions_source,
+                    concept_names=matched,
+                )
+
+            if checkpoint_path is not None:
+                persist_graph(G, checkpoint_path)
+                print(f"  Checkpointed {checkpoint_path} after chunk {source_id}.")
         return ea, cwm
 
     total_batches = math.ceil(len(eligible_items) / batch_size)
@@ -2024,6 +2205,10 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
     When ``--num-partitions`` is provided, only a row-wise slice of the chunks
     is processed so that multiple processes can run concurrently on disjoint
     subsets.
+
+    When ``--db-connection-string`` is provided, every chunk→concept mention
+    is also written to the Supabase ``chunk_concept_mentions`` table for
+    durable persistence.
     """
     project_root = Path(__file__).resolve().parents[2]
     stage3_path = resolve_path(
@@ -2038,6 +2223,15 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
     print("=" * 50)
     print(f"  Stage 3 input  : {stage3_path}")
     print(f"  Concepts config: {concepts_path}")
+
+    # --- DB tracker setup ----------------------------------------------------
+    db_conn_str = getattr(args, "db_connection_string", "") or os.getenv("DATABASE_URL", "")
+    tracker: Optional[ChunkProcessingTracker] = None
+    if db_conn_str:
+        tracker = ChunkProcessingTracker(db_conn_str)
+        print(f"  DB tracker enabled: writing mentions to chunk_concept_mentions")
+    else:
+        print("  DB tracker disabled (set --db-connection-string or DATABASE_URL)")
 
     print("\n[1/5] Loading legal concept vocabulary")
     concepts = load_legal_concepts(concepts_path)
@@ -2064,6 +2258,11 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
 
     print("\n[4/5] Adding CHUNK -> CONCEPT MENTIONS edges")
     mentions_source = getattr(args, "mentions_source", "substring")
+    output_path = resolve_path(args.output_path, project_root / "data" / "kg.gpickle")
+    checkpoint_path = None
+    if num_partitions and num_partitions > 1:
+        checkpoint_path = _partition_output_path(output_path, partition_idx)
+        print(f"  Per-chunk graph checkpoint enabled: {checkpoint_path}")
     if mentions_source == "llm":
         print(
             "  Using LLM-generated MENTIONS via scripts/extract_concepts.py "
@@ -2078,14 +2277,29 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
             model_name=args.llm_model_name,
             batch_size=args.llm_batch_size,
             provider=args.llm_provider,
+            tracker=tracker,
+            mentions_source=mentions_source,
+            checkpoint_path=checkpoint_path,
         )
     else:
         print("  Using deterministic substring matching.")
-        edges_added, chunks_with_mentions = add_mentions_edges(G, chunks, concepts)
+        edges_added, chunks_with_mentions = add_mentions_edges(
+            G, chunks, concepts,
+            tracker=tracker,
+            mentions_source=mentions_source,
+            checkpoint_path=checkpoint_path,
+        )
     print(
         f"  Added {edges_added:,} new MENTIONS edges; "
         f"{chunks_with_mentions:,} chunks matched at least one concept."
     )
+    if tracker is not None:
+        print(f"  Pushed {edges_added:,} chunk→concept relations to Supabase.")
+
+    # --- Clean up DB connection ----------------------------------------------
+    if tracker is not None:
+        tracker.close()
+        print("  DB tracker connection closed.")
 
     print("\n[5/5] Concept quality gates")
     run_concept_quality_gates(
@@ -2350,6 +2564,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Zero-based partition index for this worker "
             "(requires --num-partitions)."
+        ),
+    )
+    parser.add_argument(
+        "--db-connection-string",
+        type=str,
+        default="",
+        help=(
+            "PostgreSQL connection string for the Supabase chunk_concept_mentions "
+            "table. Falls back to DATABASE_URL env var. When set, every "
+            "chunk→concept mention is written to the DB for durable tracking."
         ),
     )
     return parser
