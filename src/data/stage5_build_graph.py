@@ -2679,7 +2679,19 @@ def _run_stage_5_6_push(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.M
 
     print("\n[2/4] Loading Stage 3 chunks with chunk_text")
     chunks = load_stage3_chunks_for_concepts(stage3_path)
-    print(f"  Loaded {len(chunks):,} chunk rows for concept extraction.")
+
+    # --- Partition slicing -------------------------------------------------------
+    num_partitions = getattr(args, "num_partitions", 0)
+    partition_idx = getattr(args, "partition_idx", 0)
+    if num_partitions and num_partitions > 1:
+        chunks = _partition_df(chunks, num_partitions, partition_idx)
+        total_chunks = len(chunks) * num_partitions
+        print(
+            f"  Running partition {partition_idx} of {num_partitions}: "
+            f"{len(chunks):,} chunk rows (of ~{total_chunks:,} total)."
+        )
+    else:
+        print(f"  Loaded {len(chunks):,} chunk rows for concept extraction.")
 
     # --- Skip already-processed chunks -----------------------------------------
     print("\n[2.5/4] Checking for already-processed chunks in chunk_concept_mentions")
