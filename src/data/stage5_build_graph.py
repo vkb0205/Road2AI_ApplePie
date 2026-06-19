@@ -6,7 +6,7 @@ This module is designed to be called multiple times so each sub-stage
 to the same persisted ``networkx.MultiDiGraph``.
 
 CLI:
-    python -m src.data.stage5_build_graph --stage {5.2,5.3,5.4,5.5,5.6,all} \
+    python -m src.data.stage5_build_graph --stage {5.2,5.3,5.4,5.5,5.6,5.6-push,all} \
         [--append] [--stage1-path PATH] [--stage2-path PATH] \
         [--stage3-path PATH] [--relationships-path PATH] \
         [--orphan-articles-path PATH] [--orphan-chunks-path PATH] \
@@ -26,6 +26,10 @@ Currently implemented:
 
 Stage 5.6 adds curated CONCEPT nodes and chunk-first ``MENTIONS`` edges from
 ``stage3_chunks.parquet``.
+
+Stage 5.6-push extracts chunk->concept relations and pushes them directly to
+Supabase (via ``chunk_concept_mentions`` table) without modifying the local graph.
+Use this to collect relations incrementally; later rebuild the graph from Supabase.
 
 Inputs:
     - ``data/stage1_sme_docs.parquet`` (Stage 5.2)
@@ -213,7 +217,7 @@ RELATIONSHIP_MAPPING_CONFIG = "config/relationship_mapping.yaml"
 
 # Allowed values for the --stage CLI argument.
 ALLOWED_STAGES = (
-    "5.2", "5.3", "5.4", "5.5", "5.6", "5.7", "5.8",
+    "5.2", "5.3", "5.4", "5.5", "5.6", "5.6-push", "5.7", "5.8",
     "all", "merge-partitions",
 )
 STAGES_REQUIRING_APPEND = {"5.3", "5.4", "5.5", "5.6", "5.7", "5.8"}
@@ -2617,12 +2621,139 @@ def _run_merge_partitions(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx
     return G
 
 
+def _run_stage_5_6_push(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiDiGraph":
+    """Stage 5.6-push: extract chunk->concept relations and push to Supabase only.
+
+    This mode does NOT modify the local graph. It only:
+    - Loads legal concepts vocabulary
+    - Loads Stage 3 chunks (with chunk_text)
+    - Extracts concept mentions (substring or LLM)
+    - Pushes each mention to Supabase via the tracker
+
+    Use this to collect relations incrementally. Later, you can rebuild the
+    graph from the Supabase chunk_concept_mentions table using a future stage.
+
+    Requires either --db-connection-string or --supabase-url+--supabase-key.
+    """
+    project_root = Path(__file__).resolve().parents[2]
+    stage3_path = resolve_path(
+        args.stage3_path, project_root / "data" / "stage3_chunks.parquet"
+    )
+    concepts_path = resolve_path(
+        args.legal_concepts_path,
+        project_root / LEGAL_CONCEPTS_CONFIG,
+    )
+
+    print("Stage 5.6-push: Extract concepts and push to Supabase only")
+    print("=" * 50)
+    print(f"  Stage 3 input  : {stage3_path}")
+    print(f"  Concepts config: {concepts_path}")
+    print("  NOTE: Graph is NOT modified. Only Supabase is updated.")
+
+    # --- Tracker setup (required for this mode) ---------------------------------
+    tracker: Optional[Any] = None
+    db_conn_str = getattr(args, "db_connection_string", "") or os.getenv("DATABASE_URL", "")
+    supabase_url = getattr(args, "supabase_url", "") or os.getenv("SUPABASE_URL", "")
+    supabase_key = getattr(args, "supabase_key", "") or os.getenv("SUPABASE_KEY", "")
+
+    if db_conn_str:
+        if psycopg2 is None:
+            raise RuntimeError(
+                "psycopg2 is not available but --db-connection-string provided. "
+                "Install psycopg2-binary or use --supabase-url/--supabase-key."
+            )
+        tracker = ChunkProcessingTracker(db_conn_str)
+        print(f"  DB tracker enabled (PostgreSQL): writing to chunk_concept_mentions")
+    elif supabase_url and supabase_key:
+        tracker = SupabaseApiTracker(supabase_url, supabase_key)
+        print(f"  DB tracker enabled (Supabase API): writing to chunk_concept_mentions")
+    else:
+        raise ValueError(
+            "Stage 5.6-push requires either --db-connection-string or "
+            "--supabase-url+--supabase-key to write to Supabase."
+        )
+
+    print("\n[1/4] Loading legal concept vocabulary")
+    concepts = load_legal_concepts(concepts_path)
+    print(f"  Loaded {len(concepts):,} curated concepts.")
+
+    print("\n[2/4] Loading Stage 3 chunks with chunk_text")
+    chunks = load_stage3_chunks_for_concepts(stage3_path)
+    print(f"  Loaded {len(chunks):,} chunk rows for concept extraction.")
+
+    # --- Skip already-processed chunks -----------------------------------------
+    print("\n[2.5/4] Checking for already-processed chunks in chunk_concept_mentions")
+    try:
+        processed_chunk_ids = tracker.get_processed_chunk_ids_from_mentions()
+        before_count = len(chunks)
+        chunks = chunks.loc[~chunks["chunk_id"].isin(processed_chunk_ids)].reset_index(drop=True)
+        skipped = before_count - len(chunks)
+        if skipped:
+            print(f"  Skipped {skipped:,} chunks already present in chunk_concept_mentions.")
+        else:
+            print("  No previously processed chunks found; all chunks will be processed.")
+    except Exception as exc:
+        print(
+            f"  [WARN] Failed to fetch processed chunk IDs from tracker: {exc}. "
+            "Proceeding with all chunks.",
+            file=sys.stderr,
+        )
+
+    print("\n[3/4] Extracting concepts and pushing to Supabase")
+    mentions_source = getattr(args, "mentions_source", "substring")
+    if mentions_source == "llm":
+        print(
+            f"  Using LLM-generated MENTIONS with provider {args.llm_provider!r} "
+            f"and model {args.llm_model_name!r}."
+        )
+        # We still need a graph to pass to add_mentions_edges_llm, but we'll
+        # create an empty one and ignore the result. The tracker will be populated.
+        empty_G = nx.MultiDiGraph()
+        edges_added, chunks_with_mentions = add_mentions_edges_llm(
+            empty_G,
+            chunks,
+            concepts,
+            api_key=args.llm_api_key,
+            base_url=args.llm_base_url,
+            model_name=args.llm_model_name,
+            batch_size=args.llm_batch_size,
+            provider=args.llm_provider,
+            tracker=tracker,
+            mentions_source=mentions_source,
+            checkpoint_path=None,  # No checkpointing in push-only mode
+        )
+    else:
+        print("  Using deterministic substring matching.")
+        empty_G = nx.MultiDiGraph()
+        edges_added, chunks_with_mentions = add_mentions_edges(
+            empty_G, chunks, concepts,
+            tracker=tracker,
+            mentions_source=mentions_source,
+            checkpoint_path=None,  # No checkpointing in push-only mode
+        )
+    print(
+        f"  Pushed {edges_added:,} MENTIONS edges to Supabase; "
+        f"{chunks_with_mentions:,} chunks matched at least one concept."
+    )
+
+    # --- Clean up ----------------------------------------------------------------
+    print("\n[4/4] Closing tracker connection")
+    tracker.close()
+    print("  Tracker connection closed.")
+
+    print("\nStage 5.6-push complete. Relations are stored in Supabase.")
+    print("To rebuild the graph from Supabase, implement a future stage that")
+    print("reads chunk_concept_mentions and constructs CONCEPT nodes + MENTIONS edges.")
+    return G
+
+
 STAGE_RUNNERS = {
     "5.2": _run_stage_5_2,
     "5.3": _run_stage_5_3,
     "5.4": _run_stage_5_4,
     "5.5": _run_stage_5_5,
     "5.6": _run_stage_5_6,
+    "5.6-push": _run_stage_5_6_push,
     "5.7": _run_stage_5_7,
     "5.8": _run_stage_5_8,
     "merge-partitions": _run_merge_partitions,
@@ -2645,6 +2776,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Sub-stage to run. 5.2=DOC nodes, 5.3=ART nodes + HAS_ARTICLE edges, "
             "5.4=CHUNK nodes + HAS_CHUNK edges, 5.5=cross-document edges from "
             "the relationships dataset, 5.6=CONCEPT nodes + MENTIONS edges, "
+            "5.6-push=extract concepts and push to Supabase only (no graph changes), "
             "5.7=final pickle persistence/readability check, 5.8=final graph "
             "validation, all=run every implemented stage in order."
         ),
@@ -2829,10 +2961,14 @@ def _run_single_stage(
     G: "nx.MultiDiGraph",
     output_path: Path,
 ) -> "nx.MultiDiGraph":
-    """Dispatch to a single stage runner and persist the result."""
+    """Dispatch to a single stage runner and persist the result (unless stage doesn't modify graph)."""
     runner = STAGE_RUNNERS[stage]
     G = runner(args, G)
-    _persist_and_report(G, output_path, label=f"Stage {stage}")
+    # Skip persistence for stages that do not modify the graph
+    if stage not in ("5.6-push",):
+        _persist_and_report(G, output_path, label=f"Stage {stage}")
+    else:
+        print(f"  Skipping graph persistence for stage {stage} (no graph modifications).")
     return G
 
 
@@ -2898,6 +3034,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # --- merge-partitions special case --------------------------------------
     # This stage reads partition files on its own and does not require --append.
     if args.stage == "merge-partitions":
+        _run_single_stage(args.stage, args, nx.MultiDiGraph(), output_path)
+        return 0
+
+    # --- 5.6-push special case -----------------------------------------------
+    # This stage only pushes to Supabase and does not modify or use the graph file.
+    # It does not require --append.
+    if args.stage == "5.6-push":
         _run_single_stage(args.stage, args, nx.MultiDiGraph(), output_path)
         return 0
 

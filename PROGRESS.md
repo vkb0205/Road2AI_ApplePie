@@ -415,3 +415,27 @@
   - Works with both substring and LLM-based mentions extraction
   - Compatible with partition mode (each partition worker independently queries the database)
 - **Usage**: The feature automatically activates when a tracker is configured (via `--db-connection-string` or `--supabase-url`/`--supabase-key`). No additional CLI flags needed.
+
+### Checkpoint 19/06/2026 — Zoo (Decoupled concept extraction + rebuild-mentions design discussion)
+
+- **Discussion**: Can the `chunk_concept_mentions` table be used to reconstruct MENTIONS edges if partition `kg_part_*.gpickle` files are lost or corrupted?
+
+- **Conclusion**: Yes, conceptually — but the current code has a **gap**: there is no function that reads from `chunk_concept_mentions` and reconstructs CHUNK → CONCEPT MENTIONS edges in the graph. The existing tracker only uses the table as a **skip-list** (to avoid re-processing chunks), not as a rebuild source.
+
+- **Decoupled workflow proposed**:
+  1. Build graph up to Stage 5.5 (DOC + ART + CHUNK + HAS_ARTICLE + HAS_CHUNK + DOC-DOC edges).
+  2. Push chunk text and metadata to Supabase (separate job — not yet implemented).
+  3. Run concept extraction (substring or LLM) separately, writing results to `chunk_concept_mentions` table.
+  4. Later, **reconstruct MENTIONS edges from the table** into the Stage 5.5 graph, skipping re-extraction entirely.
+
+- **Missing feature — `--stage rebuild-mentions`**:
+  - Needs `get_all_mentions()` method on both `ChunkProcessingTracker` (SQL) and `SupabaseApiTracker` (HTTP API) — queries *all* rows from `chunk_concept_mentions`.
+  - Needs a `rebuild_mentions_from_db()` function that iterates rows and adds `CHUNK:{chunk_id} → CONCEPT:{concept_name}` MENTIONS edges.
+  - Needs to be registered as `--stage rebuild-mentions` in the CLI dispatcher.
+  - CONCEPT nodes must be created first from `config/legal_concepts.yaml` (already handled by `add_concept_nodes()`).
+  - CHUNK nodes must already exist in the graph (from Stage 5.4).
+  - Only missing MENTIONS edges are added (idempotent via `G.has_edge()` check).
+
+- **Benefit**: If partition gpickle files are lost but `chunk_concept_mentions` table is intact, this reconstructs all MENTIONS edges in seconds instead of re-running the full concept extraction pipeline (minutes/hours).
+
+- **TODO**: Implement `--stage rebuild-mentions` as a new CLI entry point.
