@@ -259,6 +259,10 @@ class ChunkProcessingTracker:
         SELECT chunk_id FROM chunk_processing
     """
 
+    SELECT_MENTIONS_CHUNK_IDS_SQL = """
+        SELECT DISTINCT chunk_id FROM chunk_concept_mentions
+    """
+
     def __init__(self, connection_string: str):
         if not connection_string:
             raise ValueError(
@@ -276,6 +280,12 @@ class ChunkProcessingTracker:
         """Return the set of chunk_ids that have processing records."""
         with self._conn.cursor() as cur:
             cur.execute(self.SELECT_PROCESSED_SQL)
+            return {row[0] for row in cur.fetchall()}
+
+    def get_processed_chunk_ids_from_mentions(self) -> Set[str]:
+        """Return the set of chunk_ids that already have concept mentions in chunk_concept_mentions."""
+        with self._conn.cursor() as cur:
+            cur.execute(self.SELECT_MENTIONS_CHUNK_IDS_SQL)
             return {row[0] for row in cur.fetchall()}
 
     def record_chunk(
@@ -407,6 +417,19 @@ class SupabaseApiTracker:
         Note: This could be large; for production consider a filtered query.
         """
         url = self._table_endpoint(self.table_chunk_processing)
+        params = {"select": "chunk_id"}
+        resp = self._session.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return {row["chunk_id"] for row in data if row.get("chunk_id")}
+
+    def get_processed_chunk_ids_from_mentions(self) -> Set[str]:
+        """Return the set of chunk_ids that already have concept mentions in chunk_concept_mentions.
+
+        Fetches distinct chunk_id values from chunk_concept_mentions table.
+        Note: This could be large; for production consider a filtered query.
+        """
+        url = self._table_endpoint(self.table_mentions)
         params = {"select": "chunk_id"}
         resp = self._session.get(url, params=params)
         resp.raise_for_status()
@@ -2439,7 +2462,7 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
     if tracker is not None:
         print("\n[2.5/5] Checking for already-processed chunks in chunk_concept_mentions")
         try:
-            processed_chunk_ids = tracker.already_processed()
+            processed_chunk_ids = tracker.get_processed_chunk_ids_from_mentions()
             before_count = len(chunks)
             chunks = chunks.loc[~chunks["chunk_id"].isin(processed_chunk_ids)].reset_index(drop=True)
             skipped = before_count - len(chunks)

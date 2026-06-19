@@ -397,3 +397,21 @@
       --db-connection-string "postgresql://postgres:...@db....supabase.co:5432/postgres"
     ```
     This processes ~1/10th of all chunks, pushes each matched chunk's mentions to Supabase immediately, and checkpoints `kg_part_3.gpickle` after every processed chunk.
+
+### Checkpoint 19/06/2026 — Zoo (Resumable Stage 5.6)
+
+- **Resumable Stage 5.6 processing**: Modified [`_run_stage_5_6()`](Road2AI_ApplePie/src/data/stage5_build_graph.py:2365) to skip chunks that already have entries in the `chunk_concept_mentions` table.
+- **Implementation** (lines 2435-2455):
+  - After partition slicing and before concept matching, calls `tracker.get_processed_chunk_ids_from_mentions()` to query distinct `chunk_id` values from the `chunk_concept_mentions` table
+  - Filters the chunks DataFrame to exclude already-processed chunks using `~chunks["chunk_id"].isin(processed_chunk_ids)`
+  - Reports the number of skipped chunks
+  - Exception handling: if the query fails, logs a warning and continues with all chunks
+- **New methods added to trackers**:
+  - `ChunkProcessingTracker.get_processed_chunk_ids_from_mentions()`: Executes `SELECT DISTINCT chunk_id FROM chunk_concept_mentions`
+  - `SupabaseApiTracker.get_processed_chunk_ids_from_mentions()`: GET `/rest/v1/chunk_concept_mentions?select=chunk_id`
+- **Benefits**:
+  - Makes Stage 5.6 truly idempotent and resumable
+  - Supports safe re-runs after interruption without duplicate work or duplicate DB entries
+  - Works with both substring and LLM-based mentions extraction
+  - Compatible with partition mode (each partition worker independently queries the database)
+- **Usage**: The feature automatically activates when a tracker is configured (via `--db-connection-string` or `--supabase-url`/`--supabase-key`). No additional CLI flags needed.
