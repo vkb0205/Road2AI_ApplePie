@@ -79,12 +79,8 @@ except ImportError as exc:  # pragma: no cover - import guard
 
 try:
     import psycopg2
-except ImportError as exc:  # pragma: no cover - import guard
-    raise ImportError(
-        "psycopg2 is required for DB-backed chunk tracking in "
-        "src/data/stage5_build_graph.py. Install it with "
-        "`pip install psycopg2-binary` or use the repo requirements file."
-    ) from exc
+except ImportError:  # pragma: no cover - optional when using Supabase API tracker
+    psycopg2 = None
 
 
 def load_dotenv(path: Path) -> None:
@@ -336,6 +332,164 @@ class ChunkProcessingTracker:
                     self.MENTIONS_INSERT_SQL,
                     (chunk_id, doc_uid, doc_id, concept_name, mentions_source),
                 )
+
+
+# ---------------------------------------------------------------------------
+# Supabase Data API Tracker (Stage 5.6)
+# ---------------------------------------------------------------------------
+
+class SupabaseApiTracker:
+    """HTTP-based tracker using Supabase Data API.
+
+    Writes chunk processing records and mentions to the Supabase tables
+    via the RESTful Data API. This works in environments where direct
+    PostgreSQL connections are blocked (e.g. Kaggle sandboxes) but HTTPS
+    outbound is allowed.
+    """
+
+    def __init__(
+        self,
+        supabase_url: str,
+        supabase_key: str,
+        table_chunk_processing: str = "chunk_processing",
+        table_mentions: str = "chunk_concept_mentions",
+    ):
+        """Initialize the tracker with Supabase credentials.
+
+        Args:
+            supabase_url: Supabase project URL, e.g. https://xyz.supabase.co
+            supabase_key: Anon/public API key (service_role key may be needed for writes)
+            table_chunk_processing: Name of the chunk_processing table
+            table_mentions: Name of the chunk_concept_mentions table
+        """
+        if not supabase_url:
+            raise ValueError("supabase_url is required")
+        if not supabase_key:
+            raise ValueError("supabase_key is required")
+
+        self.supabase_url = supabase_url.rstrip("/")
+        self.supabase_key = supabase_key
+        self.table_chunk_processing = table_chunk_processing
+        self.table_mentions = table_mentions
+        self._session = self._create_session()
+
+    def _create_session(self):
+        """Create a requests.Session with auth headers."""
+        try:
+            import requests
+        except ImportError as exc:
+            raise ImportError(
+                "requests is required for SupabaseApiTracker. "
+                "Install it with `pip install requests`."
+            ) from exc
+
+        session = requests.Session()
+        session.headers.update({
+            "apikey": self.supabase_key,
+            "Authorization": f"Bearer {self.supabase_key}",
+            "Content-Type": "application/json",
+        })
+        return session
+
+    def close(self) -> None:
+        """Close the HTTP session."""
+        if self._session:
+            self._session.close()
+
+    def _table_endpoint(self, table_name: str) -> str:
+        """Build the REST endpoint URL for a table."""
+        return f"{self.supabase_url}/rest/v1/{table_name}"
+
+    def already_processed(self) -> Set[str]:
+        """Return the set of chunk_ids that have processing records.
+
+        Fetches all chunk_id values from chunk_processing table.
+        Note: This could be large; for production consider a filtered query.
+        """
+        url = self._table_endpoint(self.table_chunk_processing)
+        params = {"select": "chunk_id"}
+        resp = self._session.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return {row["chunk_id"] for row in data if row.get("chunk_id")}
+
+    def record_chunk(
+        self,
+        chunk_id: str,
+        doc_uid: str,
+        doc_id: str,
+        mentions_source: str,
+        concepts_found: List[str],
+    ) -> None:
+        """Insert or update a processing record for one chunk via upsert.
+
+        Uses the `on_conflict` query parameter to handle duplicates.
+        """
+        url = self._table_endpoint(self.table_chunk_processing)
+        payload = {
+            "chunk_id": chunk_id,
+            "doc_uid": doc_uid,
+            "doc_id": doc_id,
+            "mentions_source": mentions_source,
+            "concepts_found": concepts_found,
+            "concepts_count": len(concepts_found),
+        }
+        # Supabase upsert: insert or update if conflict on chunk_id
+        params = {
+            "on_conflict": "chunk_id",
+        }
+        resp = self._session.post(url, json=payload, params=params)
+        if resp.status_code not in (200, 201, 204):
+            raise RuntimeError(
+                f"Failed to upsert chunk_processing record: {resp.status_code} {resp.text}"
+            )
+
+    def record_mention(
+        self,
+        chunk_id: str,
+        doc_uid: str,
+        doc_id: str,
+        concept_name: str,
+        mentions_source: str,
+    ) -> None:
+        """Insert one chunk → concept mention row (idempotent via unique constraint)."""
+        url = self._table_endpoint(self.table_mentions)
+        payload = {
+            "chunk_id": chunk_id,
+            "doc_uid": doc_uid,
+            "doc_id": doc_id,
+            "concept_name": concept_name,
+            "mentions_source": mentions_source,
+        }
+        # Don't fail on duplicate due to (chunk_id, concept_name) unique constraint
+        resp = self._session.post(url, json=payload)
+        if resp.status_code not in (200, 201, 204):
+            # Ignore duplicate key errors (23505)
+            if resp.status_code == 409:
+                return
+            raise RuntimeError(
+                f"Failed to insert chunk_concept_mentions record: {resp.status_code} {resp.text}"
+            )
+
+    def record_chunk_mentions(
+        self,
+        chunk_id: str,
+        doc_uid: str,
+        doc_id: str,
+        mentions_source: str,
+        concept_names: List[str],
+    ) -> None:
+        """Insert all chunk → concept mentions for one chunk in a single transaction."""
+        if not concept_names:
+            return
+        for concept_name in concept_names:
+            self.record_mention(
+                chunk_id=chunk_id,
+                doc_uid=doc_uid,
+                doc_id=doc_id,
+                concept_name=concept_name,
+                mentions_source=mentions_source,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1512,7 +1666,7 @@ def add_mentions_edges(
     G: "nx.MultiDiGraph",
     chunks: pd.DataFrame,
     concepts: List[str],
-    tracker: Optional[ChunkProcessingTracker] = None,
+    tracker: Optional[Any] = None,
     mentions_source: str = "substring",
     checkpoint_path: Optional[Path] = None,
 ) -> Tuple[int, int]:
@@ -1592,7 +1746,7 @@ def add_mentions_edges_llm(
     model_name: str = "gemini-2.0-flash",
     batch_size: int = 10,
     provider: str = "gemini",
-    tracker: Optional[ChunkProcessingTracker] = None,
+    tracker: Optional[Any] = None,
     mentions_source: str = "llm",
     checkpoint_path: Optional[Path] = None,
 ) -> Tuple[int, int]:
@@ -2207,8 +2361,10 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
     subsets.
 
     When ``--db-connection-string`` is provided, every chunk→concept mention
-    is also written to the Supabase ``chunk_concept_mentions`` table for
-    durable persistence.
+    is also written to the PostgreSQL ``chunk_concept_mentions`` table for
+    durable persistence. Alternatively, use ``--supabase-url`` and
+    ``--supabase-key`` to write via the Supabase Data API (HTTP-based,
+    works in restricted network environments like Kaggle).
     """
     project_root = Path(__file__).resolve().parents[2]
     stage3_path = resolve_path(
@@ -2224,14 +2380,29 @@ def _run_stage_5_6(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
     print(f"  Stage 3 input  : {stage3_path}")
     print(f"  Concepts config: {concepts_path}")
 
-    # --- DB tracker setup ----------------------------------------------------
+    # --- Tracker setup -------------------------------------------------------
+    # Tracker can be either PostgreSQL-based (ChunkProcessingTracker) or
+    # Supabase Data API-based (SupabaseApiTracker). Prefer PostgreSQL if both
+    # are configured, otherwise use whichever is available.
+    tracker: Optional[Any] = None
     db_conn_str = getattr(args, "db_connection_string", "") or os.getenv("DATABASE_URL", "")
-    tracker: Optional[ChunkProcessingTracker] = None
+    supabase_url = getattr(args, "supabase_url", "") or os.getenv("SUPABASE_URL", "")
+    supabase_key = getattr(args, "supabase_key", "") or os.getenv("SUPABASE_KEY", "")
+
     if db_conn_str:
-        tracker = ChunkProcessingTracker(db_conn_str)
-        print(f"  DB tracker enabled: writing mentions to chunk_concept_mentions")
+        if psycopg2 is None:
+            print(
+                "  [WARN] psycopg2 not available but --db-connection-string provided. "
+                "Install psycopg2-binary or use --supabase-url/--supabase-key instead."
+            )
+        else:
+            tracker = ChunkProcessingTracker(db_conn_str)
+            print(f"  DB tracker enabled (PostgreSQL): writing mentions to chunk_concept_mentions")
+    elif supabase_url and supabase_key:
+        tracker = SupabaseApiTracker(supabase_url, supabase_key)
+        print(f"  DB tracker enabled (Supabase API): writing mentions to chunk_concept_mentions")
     else:
-        print("  DB tracker disabled (set --db-connection-string or DATABASE_URL)")
+        print("  DB tracker disabled (provide --db-connection-string or --supabase-url+--supabase-key)")
 
     print("\n[1/5] Loading legal concept vocabulary")
     concepts = load_legal_concepts(concepts_path)
@@ -2574,6 +2745,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "PostgreSQL connection string for the Supabase chunk_concept_mentions "
             "table. Falls back to DATABASE_URL env var. When set, every "
             "chunk→concept mention is written to the DB for durable tracking."
+        ),
+    )
+    parser.add_argument(
+        "--supabase-url",
+        type=str,
+        default="",
+        help=(
+            "Supabase project URL (e.g. https://xyz.supabase.co). "
+            "Falls back to SUPABASE_URL env var. Used with --supabase-key "
+            "for HTTP-based tracking when direct PostgreSQL is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--supabase-key",
+        type=str,
+        default="",
+        help=(
+            "Supabase anon/public API key. Falls back to SUPABASE_KEY env var. "
+            "Required with --supabase-url for HTTP-based tracking."
         ),
     )
     return parser
