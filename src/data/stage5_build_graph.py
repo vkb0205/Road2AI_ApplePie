@@ -1846,6 +1846,8 @@ def add_mentions_edges_llm(
         eligible_items.append(
             {
                 "source_id": chunk_id,
+                "doc_uid": str(row.doc_uid),
+                "doc_id": str(row.doc_id),
                 "text": tokenize_for_prompt(getattr(row, "chunk_text", None)),
             }
         )
@@ -1877,6 +1879,8 @@ def add_mentions_edges_llm(
         }
         for item in batch_items:
             source_id = item["source_id"]
+            doc_uid = item.get("doc_uid", "")
+            doc_id = item.get("doc_id", "")
             chunk_key = f"CHUNK:{source_id}"
             matches = _canonicalize_llm_concepts(
                 by_source.get(source_id, {}).get("concepts", []), concepts_by_lower
@@ -1890,8 +1894,8 @@ def add_mentions_edges_llm(
             if tracker is not None and matched:
                 tracker.record_chunk_mentions(
                     chunk_id=source_id,
-                    doc_uid="",
-                    doc_id="",
+                    doc_uid=doc_uid,
+                    doc_id=doc_id,
                     mentions_source=mentions_source,
                     concept_names=matched,
                 )
@@ -1952,7 +1956,7 @@ def add_mentions_edges_llm(
                 ]
                 ea, cwm = _process_result(
                     single_result,
-                    [{"source_id": real_id, "text": item["text"]}],
+                    [{"source_id": real_id, "doc_uid": item["doc_uid"], "doc_id": item["doc_id"], "text": item["text"]}],
                 )
                 edges_added += ea
                 chunks_with_mentions += cwm
@@ -1970,7 +1974,12 @@ def add_mentions_edges_llm(
         result["items"] = real_items
         # Build a real-id batch view for _process_result
         real_batch = [
-            {"source_id": idx_to_chunk_id[batch_start + i], "text": item["text"]}
+            {
+                "source_id": idx_to_chunk_id[batch_start + i],
+                "doc_uid": item["doc_uid"],
+                "doc_id": item["doc_id"],
+                "text": item["text"],
+            }
             for i, item in enumerate(batch)
         ]
         ea, cwm = _process_result(result, real_batch)
