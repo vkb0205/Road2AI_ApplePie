@@ -361,6 +361,10 @@ class SupabaseApiTracker:
     outbound is allowed.
     """
 
+    # Default page size for fetching chunk IDs; the Supabase Data API caps
+    # response rows at 1 000 by default, so we page through results.
+    _FETCH_PAGE_SIZE = 1000
+
     def __init__(
         self,
         supabase_url: str,
@@ -414,31 +418,62 @@ class SupabaseApiTracker:
         """Build the REST endpoint URL for a table."""
         return f"{self.supabase_url}/rest/v1/{table_name}"
 
+    def _fetch_all_chunk_ids(self, table_name: str) -> Set[str]:
+        """Fetch **all** chunk_id values from *table_name*, handling pagination.
+
+        The Supabase Data API (PostgREST) returns at most 1 000 rows by
+        default. This helper issues sequential ``Range``-header requests to
+        page through the full set, collecting unique chunk_ids into one set.
+
+        Returns:
+            Set of unique ``chunk_id`` strings (may be empty).
+        """
+        chunk_ids: Set[str] = set()
+        page_size = self._FETCH_PAGE_SIZE
+        start = 0
+
+        while True:
+            end = start + page_size - 1
+            resp = self._session.get(
+                self._table_endpoint(table_name),
+                params={"select": "chunk_id"},
+                headers={"Range": f"{start}-{end}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if not data:
+                break
+
+            for row in data:
+                cid = row.get("chunk_id")
+                if cid is not None:
+                    chunk_ids.add(str(cid))
+
+            # If fewer rows than the page size were returned, we've reached
+            # the last (or only) page.
+            if len(data) < page_size:
+                break
+
+            start += page_size
+
+        return chunk_ids
+
     def already_processed(self) -> Set[str]:
         """Return the set of chunk_ids that have processing records.
 
-        Fetches all chunk_id values from chunk_processing table.
-        Note: This could be large; for production consider a filtered query.
+        Fetches all chunk_id values from chunk_processing table using
+        paginated requests.
         """
-        url = self._table_endpoint(self.table_chunk_processing)
-        params = {"select": "chunk_id"}
-        resp = self._session.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        return {row["chunk_id"] for row in data if row.get("chunk_id")}
+        return self._fetch_all_chunk_ids(self.table_chunk_processing)
 
     def get_processed_chunk_ids_from_mentions(self) -> Set[str]:
         """Return the set of chunk_ids that already have concept mentions in chunk_concept_mentions.
 
-        Fetches distinct chunk_id values from chunk_concept_mentions table.
-        Note: This could be large; for production consider a filtered query.
+        Fetches all distinct chunk_id values from chunk_concept_mentions table
+        using paginated requests.
         """
-        url = self._table_endpoint(self.table_mentions)
-        params = {"select": "chunk_id"}
-        resp = self._session.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        return {row["chunk_id"] for row in data if row.get("chunk_id")}
+        return self._fetch_all_chunk_ids(self.table_mentions)
 
     def record_chunk(
         self,
