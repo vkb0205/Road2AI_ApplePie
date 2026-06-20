@@ -1785,6 +1785,11 @@ def add_mentions_edges(
 def _canonicalize_llm_concepts(raw_concepts: Any, concepts_by_lower: Dict[str, str]) -> List[str]:
     """Map LLM-returned concept names to curated concept strings."""
     if not isinstance(raw_concepts, list):
+        if raw_concepts is not None:
+            print(
+                f"  [DEBUG] LLM returned non-list concepts: {raw_concepts!r}",
+                file=sys.stderr,
+            )
         return []
     matches: List[str] = []
     seen: Set[str] = set()
@@ -1794,6 +1799,11 @@ def _canonicalize_llm_concepts(raw_concepts: Any, concepts_by_lower: Dict[str, s
         if concept and key not in seen:
             seen.add(key)
             matches.append(concept)
+        elif not concept:
+            print(
+                f"  [DEBUG] LLM concept {item!r} not found in curated vocabulary",
+                file=sys.stderr,
+            )
         if len(matches) >= MAX_CONCEPTS_PER_CHUNK:
             break
     return matches
@@ -1936,8 +1946,15 @@ def add_mentions_edges_llm(
         """Apply LLM result to the graph. Returns (edges_added, chunks_with_mentions)."""
         ea = 0
         cwm = 0
+        result_items = result.get("items", [])
+        if not result_items:
+            print(
+                f"  [DEBUG] LLM returned empty items list. "
+                f"Full result: {json.dumps(result, ensure_ascii=False)[:500]}",
+                file=sys.stderr,
+            )
         by_source = {
-            str(item.get("source_id")): item for item in result.get("items", [])
+            str(item.get("source_id")): item for item in result_items
         }
         for item in batch_items:
             source_id = item["source_id"]
