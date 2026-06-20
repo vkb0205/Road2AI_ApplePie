@@ -46,34 +46,26 @@ SME_NGANH:
   - "Đầu tư"
 
 VALID_DOCUMENT_TYPES:
-  - Sắc lệnh
-  - Quyết định
-  - Chỉ thị
-  - Nghị quyết
-  - Thông tư liên tịch
-  - Thông tư
-  - Nghị định
-  - Pháp lệnh
-  - Lệnh
   - Luật
-  - Sắc luật
-  - Chương trình
-  - Công ước
-  - Nghị định thư
-  - Hiến pháp
   - Bộ luật
-  - Nghị quyết liên tịch
-  - Thông báo
+  - Hiến pháp
+  - Pháp lệnh
+  - Nghị định
+  - Thông tư
+  - Thông tư liên tịch
+  - Nghị định thư
+  - Công ước
   - Hiệp định
+  - Sắc lệnh
+  - Lệnh
+  - Sắc luật
   - Văn bản hợp nhất
-  - Công văn
-  - Bản ghi nhớ
-  - None
-  - Thỏa thuận
-  - Nghị Quyết
+  - Quyết định
+  - Nghị quyết
+  - Chỉ thị
+  - Nghị quyết liên tịch
   - Thông tư liên bộ
-  - Văn bản khác
-  - Văn bản liên quan
+  - Thỏa thuận
 
 summarization:
   model: "google/gemma-3-12b-it"
