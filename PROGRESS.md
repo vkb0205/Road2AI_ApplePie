@@ -439,3 +439,10 @@
 - **Benefit**: If partition gpickle files are lost but `chunk_concept_mentions` table is intact, this reconstructs all MENTIONS edges in seconds instead of re-running the full concept extraction pipeline (minutes/hours).
 
 - **TODO**: Implement `--stage rebuild-mentions` as a new CLI entry point.
+
+### Checkpoint 20/06/2026 — Zoo (Bugfix: Stage 5.6-push silently not pushing to Supabase)
+
+- **Bug discovered**: `--stage 5.6-push` was not pushing any data to Supabase despite concept extraction (substring or LLM) running successfully.
+- **Root cause** in [`_run_stage_5_6_push()`](Road2AI_ApplePie/src/data/stage5_build_graph.py:2721): The temporary graph `G_push` was built with only CHUNK nodes — **no CONCEPT nodes were added**. When `_add_mentions_for_matches()` ran, it checked `if concept_key not in G.nodes: continue` (line 1677). Since no `CONCEPT:*` nodes existed, every concept match was silently skipped, `matched` was always empty, and `tracker.record_chunk_mentions()` was never called. Nothing reached Supabase.
+- **Fix**: Added CONCEPT nodes to `G_push` using the existing `build_concept_attrs()` helper, matching how `_run_stage_5_6()` already does it for the non-push path. The CONCEPT node loop was placed before the `mentions_source` branch so both substring and LLM paths benefit from it.
+- **Commit**: `fix: add CONCEPT nodes to G_push in 5.6-push so mentions actually reach Supabase`

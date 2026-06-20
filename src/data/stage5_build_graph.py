@@ -2713,19 +2713,28 @@ def _run_stage_5_6_push(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.M
 
     print("\n[3/4] Extracting concepts and pushing to Supabase")
     mentions_source = getattr(args, "mentions_source", "substring")
+
+    # Build a minimal in-memory graph with CHUNK + CONCEPT nodes so that
+    # _add_mentions_for_matches() can find both node types. Without CONCEPT
+    # nodes in the graph, every concept match is silently skipped and
+    # tracker.record_chunk_mentions() is never called — nothing reaches Supabase.
+    G_push = nx.MultiDiGraph()
+    for row in chunks.itertuples(index=False):
+        chunk_id = str(row.chunk_id)
+        chunk_key = f"CHUNK:{chunk_id}"
+        if chunk_key not in G_push.nodes:
+            G_push.add_node(chunk_key, type="Chunk")
+    for concept in concepts:
+        attrs = build_concept_attrs(concept)
+        node_id = f"CONCEPT:{attrs['name_lower']}"
+        if node_id not in G_push.nodes:
+            G_push.add_node(node_id, **attrs)
+
     if mentions_source == "llm":
         print(
             f"  Using LLM-generated MENTIONS with provider {args.llm_provider!r} "
             f"and model {args.llm_model_name!r}."
         )
-        # We need a graph for the chunk lookup, but we don't need to persist it.
-        # Populate minimal CHUNK nodes so the eligibility check passes.
-        G_push = nx.MultiDiGraph()
-        for row in chunks.itertuples(index=False):
-            chunk_id = str(row.chunk_id)
-            chunk_key = f"CHUNK:{chunk_id}"
-            if chunk_key not in G_push.nodes:
-                G_push.add_node(chunk_key, type="Chunk")
         edges_added, chunks_with_mentions = add_mentions_edges_llm(
             G_push,
             chunks,
@@ -2741,12 +2750,6 @@ def _run_stage_5_6_push(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.M
         )
     else:
         print("  Using deterministic substring matching.")
-        G_push = nx.MultiDiGraph()
-        for row in chunks.itertuples(index=False):
-            chunk_id = str(row.chunk_id)
-            chunk_key = f"CHUNK:{chunk_id}"
-            if chunk_key not in G_push.nodes:
-                G_push.add_node(chunk_key, type="Chunk")
         edges_added, chunks_with_mentions = add_mentions_edges(
             G_push, chunks, concepts,
             tracker=tracker,
