@@ -55,18 +55,19 @@ The plan is organised into five phases that mirror the pipeline:
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
-| 2.1 | Implement HTML → article-level parser in `src/data/stage2_parse_html.py` (BeautifulSoup + plain-text regex) | KL | ✅ Done | 56 269 article rows from 12 633 documents |
-| 2.2 | Emit `stage2_parse_failures.jsonl` with typed reasons (`text_too_short_after_cleaning`, `zero_dieu_law_like_doc`, etc.) | KL | ✅ Done | 2 406 failure records; summary JSON present |
-| 2.3 | Apply keep/drop policy: keep fallback `Điều VB` rows and `singledieulawlikedoc`; drop the two drop-classes | KL | ✅ Done | Policy documented in PROGRESS.md |
+| 2.1 | Implement HTML → article-level parser in `src/data/stage2_parse_html.py` (BeautifulSoup + plain-text regex) | KL | ✅ Done | Current 2026-06-21 rerun produced 524 070 article rows after Stage 1 expansion |
+| 2.2 | Emit `stage2_parse_failures.jsonl` with typed reasons (`text_too_short_after_cleaning`, `zero_dieu_law_like_doc`, `zero_dieu_no_fallback`, etc.) | KL | ✅ Done | Failures logged for no-`Điều`, too-short, zero-parsable, and single-law-like review cases |
+| 2.3 | Apply keep/drop policy: drop documents with no `Điều` markers instead of emitting fallback `Điều VB`; keep `single_dieu_law_like_doc` rows for review; drop short/zero-parsable classes | KL | ✅ Updated 2026-06-21 | Policy documented in PROGRESS.md |
 | 2.4 | 🔲 Stage 2.5 manual review: inspect `single_dieu_law_like_doc` records (70) for the 5 key laws; produce `stage2_manual_fixes.json` if needed | KL | 🔲 Open | Manual review log committed; fixes file present (may be empty) |
 
 ### Stage 3 — Chunking ✅
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
-| 3.1 | Implement chunking in `src/data/stage3_chunking.py` (Khoản-aware greedy packing, 1 024 token limit, 128-token overlap) | KL | ✅ Done | 74 107 chunks from 56 269 articles |
+| 3.1 | Implement chunking in `src/data/stage3_chunking.py` (Khoản-aware greedy packing, 1 024 token limit, 128-token overlap) | KL | ✅ Done | Historical run: 74 107 chunks from 56 269 articles; current 524k-row rerun pending with batch writer |
 | 3.2 | Breadcrumb prefix injected into `chunk_text`; `chunk_id` format `{doc_uid}#{part_idx}` | KL | ✅ Done | Sample inspection passes |
-| 3.3 | 🔲 Upload `stage3_chunks.parquet` as Kaggle Dataset so Notebook 02 can mount it | All | 🔲 Open | Dataset visible in Kaggle; Notebook 02 mounts without error |
+| 3.3 | Add batch parquet writer for large Stage 2 artifacts (`--batch-size`, temp parquet, incremental `ParquetWriter`) | DB | ✅ Done 2026-06-21 | Unit test passes; avoids final all-chunks `DataFrame` OOM on 524k Stage 2 rows |
+| 3.4 | 🔲 Upload `stage3_chunks.parquet` as Kaggle Dataset so Notebook 02 can mount it | All | 🔲 Open | Dataset visible in Kaggle; Notebook 02 mounts without error |
 
 ### Stage 4 — Summary Injection ⏳
 

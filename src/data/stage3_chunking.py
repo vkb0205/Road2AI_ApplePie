@@ -11,9 +11,11 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 try:
     from transformers import AutoTokenizer
@@ -25,6 +27,7 @@ except ImportError as exc:
 
 KHOAN_SPLIT_RE = re.compile(r"(?=^\s*\d+\.\s)", re.MULTILINE)
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+CHUNK_EXTRA_COLUMNS = ["breadcrumb", "chunk_id", "part_idx", "chunk_text"]
 
 
 def resolve_path(path: Optional[str], default_path: Path) -> Path:
@@ -274,6 +277,83 @@ def merge_manual_fixes(stage2_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.D
     return merged
 
 
+def get_output_columns(stage2_df: pd.DataFrame) -> List[str]:
+    output_columns = [col for col in stage2_df.columns]
+    output_columns.extend([col for col in CHUNK_EXTRA_COLUMNS if col not in output_columns])
+    return output_columns
+
+
+def write_chunks_batched(
+    stage2_df: pd.DataFrame,
+    tokenizer: AutoTokenizer,
+    max_tokens: int,
+    output_path: Path,
+    batch_size: int,
+) -> Tuple[int, int]:
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be greater than 0.")
+
+    output_columns = get_output_columns(stage2_df)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output_path = output_path.with_name(f".{output_path.name}.tmp")
+    if temp_output_path.exists():
+        temp_output_path.unlink()
+
+    writer: Optional[pq.ParquetWriter] = None
+    schema: Optional[pa.Schema] = None
+    total_chunks = 0
+    doc_ids_with_chunks: Set[str] = set()
+
+    try:
+        total_articles = len(stage2_df)
+        for start in range(0, total_articles, batch_size):
+            end = min(start + batch_size, total_articles)
+            article_records = stage2_df.iloc[start:end].to_dict(orient="records")
+
+            chunk_rows: List[Dict] = []
+            for record in article_records:
+                chunk_rows.extend(make_chunks_for_article(record, tokenizer, max_tokens))
+
+            if not chunk_rows:
+                print(f"  Processed {end:,}/{total_articles:,} articles, no chunks in this batch.")
+                continue
+
+            batch_df = pd.DataFrame(chunk_rows)
+            batch_df = batch_df.reindex(columns=output_columns)
+            table = pa.Table.from_pandas(batch_df, schema=schema, preserve_index=False)
+
+            if writer is None:
+                schema = table.schema
+                writer = pq.ParquetWriter(temp_output_path, schema=schema, compression="snappy")
+
+            writer.write_table(table)
+            total_chunks += len(batch_df)
+            if "doc_id" in batch_df.columns:
+                doc_ids_with_chunks.update(batch_df["doc_id"].dropna().astype(str).unique())
+
+            print(
+                f"  Processed {end:,}/{total_articles:,} articles, "
+                f"wrote {total_chunks:,} chunks so far."
+            )
+    except Exception:
+        if writer is not None:
+            writer.close()
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        raise
+
+    if writer is not None:
+        writer.close()
+
+    if total_chunks == 0:
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        raise ValueError("No stage3 chunks were generated. Check Stage 2 input and article text fields.")
+
+    temp_output_path.replace(output_path)
+    return total_chunks, len(doc_ids_with_chunks)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage 3: Chunk Stage 2 articles into overlapping chunks")
     parser.add_argument("--stage2-path", default=None, help="Path to stage2_articles.parquet")
@@ -282,6 +362,12 @@ def main() -> None:
     parser.add_argument("--tokenizer", default="google/gemma-3-12b-it", help="Tokenizer model for token counting")
     parser.add_argument("--hf-token", default=None, help="Hugging Face token for gated repo access")
     parser.add_argument("--max-tokens", type=int, default=1024, help="Maximum tokens per chunk")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=5000,
+        help="Number of Stage 2 article rows to chunk and write per parquet batch",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parents[2]
@@ -315,24 +401,17 @@ def main() -> None:
 
     tokenizer = load_tokenizer(args.tokenizer, hf_token=hf_token)
 
-    output_rows: List[Dict] = []
-    for row in stage2_df.to_dict(orient="records"):
-        output_rows.extend(make_chunks_for_article(row, tokenizer, args.max_tokens))
+    total_chunks, unique_documents = write_chunks_batched(
+        stage2_df=stage2_df,
+        tokenizer=tokenizer,
+        max_tokens=args.max_tokens,
+        output_path=output_path,
+        batch_size=args.batch_size,
+    )
 
-    if not output_rows:
-        raise ValueError("No stage3 chunks were generated. Check Stage 2 input and article text fields.")
-
-    output_df = pd.DataFrame(output_rows)
-    output_columns = [col for col in stage2_df.columns if col in output_df.columns]
-    output_columns.extend([c for c in ["breadcrumb", "chunk_id", "part_idx", "chunk_text"] if c not in output_columns])
-    output_df = output_df.loc[:, output_columns]
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_df.to_parquet(output_path, index=False)
-
-    print(f"Wrote {len(output_df):,} chunks to {output_path}")
-    print(f"Unique documents: {output_df['doc_id'].nunique():,}")
-    print(f"Unique chunk IDs: {output_df['chunk_id'].nunique():,}")
+    print(f"Wrote {total_chunks:,} chunks to {output_path}")
+    print(f"Unique documents: {unique_documents:,}")
+    print(f"Chunk IDs generated: {total_chunks:,}")
 
 
 if __name__ == "__main__":

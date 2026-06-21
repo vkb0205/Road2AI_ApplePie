@@ -21,11 +21,11 @@
   - Detect `Điều` boundaries with a flexible regex supporting optional suffixes (`a`, `b`, `đ`) and separators `.` `:` `-` `–` `—` `)`.
   - Assign document hierarchy context for `Phần`, `Chương`, and `Mục` based on the most recent header before each article.
   - Drop article rows whose `noi_dung` is shorter than 30 characters (minimum content threshold).
-  - Preserve non-standard documents as a single fallback article when no `Điều` markers are found, unless the cleaned text is too short.
+  - Original behavior preserved non-standard documents as a single fallback article when no `Điều` markers are found, unless the cleaned text is too short. This behavior was superseded by the 2026-06-21 no-fallback policy below.
   - Log parse failures to `data/stage2_parse_failures.jsonl` using failure reasons: `text_too_short_after_cleaning`, `zero_dieu_law_like_doc`, `zero_parsable_dieu_law_like_doc`, `single_dieu_law_like_doc`.
   - Deduplicate `stage2_articles.parquet` by `(doc_id, dieu_so)` while keeping the longest article text.
 
-- **Final keep/drop policy** (Decided 2026-06-10):
+- **Historical keep/drop policy** (Decided 2026-06-10; superseded on 2026-06-21):
   - **Keep in output**: fallback placeholder articles (`dieu_so = "Điều VB"`) when no `Điều` markers found (flagged as `zero_dieu_law_like_doc`); single-article law-like documents (flagged as `single_dieu_law_like_doc`).
   - **Drop from output** (logged in failures only): `text_too_short_after_cleaning` (cleaned text < 30 chars) and `zero_parsable_dieu_law_like_doc` (law-like title but all parsed articles dropped due to short content).
 
@@ -446,3 +446,29 @@
 - **Root cause** in [`_run_stage_5_6_push()`](Road2AI_ApplePie/src/data/stage5_build_graph.py:2721): The temporary graph `G_push` was built with only CHUNK nodes — **no CONCEPT nodes were added**. When `_add_mentions_for_matches()` ran, it checked `if concept_key not in G.nodes: continue` (line 1677). Since no `CONCEPT:*` nodes existed, every concept match was silently skipped, `matched` was always empty, and `tracker.record_chunk_mentions()` was never called. Nothing reached Supabase.
 - **Fix**: Added CONCEPT nodes to `G_push` using the existing `build_concept_attrs()` helper, matching how `_run_stage_5_6()` already does it for the non-push path. The CONCEPT node loop was placed before the `mentions_source` branch so both substring and LLM paths benefit from it.
 - **Commit**: `fix: add CONCEPT nodes to G_push in 5.6-push so mentions actually reach Supabase`
+
+### Checkpoint 21/06/2026 — Stage 2 no-fallback policy + Stage 3 batch writer
+
+- **Stage 2 parsing policy update** in [`src/data/stage2_parse_html.py`](src/data/stage2_parse_html.py):
+  - New rule: when no `Điều` boundary is found, the document is **dropped from `stage2_articles.parquet`** instead of emitting a fallback `dieu_so = "Điều VB"` row.
+  - Failure logging is still preserved for audit:
+    - `text_too_short_after_cleaning`: cleaned text is shorter than 30 characters.
+    - `zero_dieu_law_like_doc`: no `Điều`, text is long enough, and title is law-like (`Luật`, `Bộ luật`, `Nghị định`).
+    - `zero_dieu_no_fallback`: no `Điều`, text is long enough, and title is not law-like.
+  - Existing behavior is unchanged for documents where `Điều` boundaries are detected: article rows are still parsed, short article bodies are dropped, `single_dieu_law_like_doc` is still kept and logged, and `zero_parsable_dieu_law_like_doc` remains a drop class for law-like docs whose detected articles are all too short.
+  - Added unit tests in [`tests/test_stage2_parser.py`](tests/test_stage2_parser.py) covering no-`Điều` drop behavior and the unchanged single-article law-like path.
+
+- **Stage 2 rerun impact**:
+  - After the expanded Stage 1 scope and no-fallback Stage 2 policy, the current `stage2_articles.parquet` loaded by Stage 3 contains **524,070 article rows**.
+  - This invalidates earlier downstream sizing assumptions based on the 56,269-row Stage 2 artifact; Stage 3/5 acceptance bands should be revisited after the new Stage 3 output is finalized.
+
+- **Stage 3 memory fix** in [`src/data/stage3_chunking.py`](src/data/stage3_chunking.py):
+  - Root cause: the old Stage 3 implementation accumulated every chunk in `output_rows`, then built one large `pd.DataFrame(output_rows)` at the end. On the 524,070-row Stage 2 artifact this triggered an Arrow allocation failure (~13 GB).
+  - Added `write_chunks_batched()` using `pyarrow.parquet.ParquetWriter` so chunks are written incrementally per batch instead of accumulated in memory.
+  - Added CLI flag `--batch-size` (default `5000`). For large local runs, start with `--batch-size 1000`; lower to `500` if memory remains tight.
+  - Stage 3 now writes to a temp parquet path (`.stage3_chunks.parquet.tmp`) and atomically replaces the target only after successful completion.
+  - Added unit test [`tests/test_stage3_chunking.py`](tests/test_stage3_chunking.py) to verify multi-batch parquet output.
+
+- **Tests run**:
+  - `uv run --no-project --with pytest --with pandas --with pyarrow --with transformers --with beautifulsoup4 --with tqdm python -m pytest tests/test_stage3_chunking.py tests/test_stage2_parser.py -q -p no:cacheprovider`
+  - Result: **4 passed**.

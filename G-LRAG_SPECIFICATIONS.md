@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | System name | G-LRAG (Graph-enhanced Legal Retrieval Augmented Generation) |
-| Document version | 3.1 |
-| Last updated | 2026-06-16 |
+| Document version | 3.2 |
+| Last updated | 2026-06-21 |
 | Status | Approved for implementation |
 
-> Changes in v3.1: §8 knowledge graph aligned with `KG.md` (canonical-direction-only relations; reverse-only labels and `RELATED_LANGUAGE` dropped; CHUNK node added to §8.2; build procedure split per Stage 5.x; edge-attribute key standardized to `relation`). §10.4 graph expansion now reads canonical edges in both directions instead of separate reverse edges. §11.5 graph-context construction synthesizes reverse labels in code.
+> Changes in v3.2: Stage 2 no longer emits fallback `Điều VB` rows when no `Điều` boundary is found; such documents are dropped from `stage2_articles.parquet` and logged with typed failure reasons. Stage 3 now writes `stage3_chunks.parquet` incrementally with a batch `ParquetWriter` to support the expanded Stage 2 artifact without final in-memory DataFrame OOM.
 
 ---
 
@@ -578,18 +578,20 @@ Notes on the Vietnamese legal-text format that drive these patterns:
    - `phan`, `chuong`, `muc` from the nearest preceding headers
    - `doc_uid = f"{law_id}|{ten_van_ban}|{dieu_so}"`
 5. Drop rows where `len(noi_dung) < 30`.
-6. If no `Điều` boundaries are found, build a single fallback article from the whole cleaned text.
+6. If no `Điều` boundaries are found, do not build a fallback article and do not emit an `Điều VB` row.
    - If the cleaned text is shorter than 30 characters, emit failure `text_too_short_after_cleaning`.
-7. If the title is law-like (`Luật`, `Bộ luật`, `Nghị định`) and the parser produces zero articles after fallback, emit failure `zero_dieu_law_like_doc`.
-8. If the title is law-like and the parser finds boundaries but all articles are dropped for short content, emit failure `zero_parsable_dieu_law_like_doc`.
-9. If exactly one article remains and the title is law-like, emit failure `single_dieu_law_like_doc`.
-10. Save successful article rows to `stage2_articles.parquet` and failures to `stage2_parse_failures.jsonl`.
+   - If the title is law-like (`Luật`, `Bộ luật`, `Nghị định`), emit failure `zero_dieu_law_like_doc`.
+   - Otherwise emit failure `zero_dieu_no_fallback`.
+7. If the title is law-like and the parser finds boundaries but all articles are dropped for short content, emit failure `zero_parsable_dieu_law_like_doc`.
+8. If exactly one article remains and the title is law-like, emit failure `single_dieu_law_like_doc`.
+9. Save successful article rows to `stage2_articles.parquet` and failures to `stage2_parse_failures.jsonl`.
 
-**Final keep/drop policy (Decided 2026-06-10)**
+**Current keep/drop policy (Updated 2026-06-21)**
 
-- Keep fallback document-level articles produced when no `Điều` markers are found. Fallback rows use `dieu_so = "Điều VB"` and are emitted to `stage2_articles.parquet` (they are also logged as `zero_dieu_law_like_doc` when the title is law-like).
+- Drop documents where no `Điều` markers are found. These documents are logged to `stage2_parse_failures.jsonl` but are not emitted to `stage2_articles.parquet`.
+- Do not emit fallback document-level rows with `dieu_so = "Điều VB"`.
 - Keep `single_dieu_law_like_doc` article rows (emit the single parsed article) but log the failure for manual review.
-- Drop (do not emit article rows) for `text_too_short_after_cleaning` (cleaned text < 30 characters) and for `zero_parsable_dieu_law_like_doc` (title suggests a multi-article law but parser produced no parsable article rows). Both are recorded in `stage2_parse_failures.jsonl` for audit.
+- Drop (do not emit article rows) for `text_too_short_after_cleaning` (cleaned text < 30 characters), `zero_dieu_law_like_doc`, `zero_dieu_no_fallback`, and `zero_parsable_dieu_law_like_doc`. All are recorded in `stage2_parse_failures.jsonl` for audit.
 
 **Quality gates**:
 
@@ -608,12 +610,14 @@ Notes on the Vietnamese legal-text format that drive these patterns:
 
 - `MAX_TOKENS = 1024`
 - `OVERLAP_TOKENS = 128`
+- `BATCH_SIZE = 5000` by default, configurable through `--batch-size`
 - Tokenizer: `AutoTokenizer.from_pretrained("google/gemma-3-12b-it", token=hf_token, trust_remote_code=True)`, where `hf_token` is loaded from `--hf-token`, `HF_TOKEN`, or `HUGGINGFACE_HUB_TOKEN`.
 
 **Implementation note**:
 
 - Stage 3 explicitly passes the Hugging Face auth token into tokenizer loading so that gated repos like `google/gemma-3-12b-it` are accessed with authentication instead of using unauthenticated default requests.
 - If the token is missing or invalid, tokenizer loading may still fail even when the environment variable is present.
+- Stage 3 writes chunks incrementally with `pyarrow.parquet.ParquetWriter` instead of accumulating all chunk rows in memory. Output is first written to `.stage3_chunks.parquet.tmp` and atomically replaces `stage3_chunks.parquet` only after the full run succeeds.
 
 **Algorithm**:
 
@@ -634,10 +638,12 @@ Notes on the Vietnamese legal-text format that drive these patterns:
    - At chunk boundary, prepend the last Khoản of the previous chunk to the new chunk (overlap). If a single Khoản exceeds `MAX_TOKENS`, split it further at sentence boundaries.
    - Each emitted chunk receives `chunk_id = f"{doc_uid}#{part_idx}"` with `part_idx` increasing from 0.
 5. Every chunk carries the breadcrumb as a prefix in `chunk_text`.
+6. Write chunk rows to parquet in batches. Each batch converts only the current chunk records to a DataFrame/Table, writes them through a persistent `ParquetWriter`, then releases the batch before processing the next article slice.
 
 **Validation note**:
 
 - Verified run output: `stage2_articles.parquet` with `56,269` rows produced `stage3_chunks.parquet` with `74,107` chunks and `12,633` unique documents.
+- 2026-06-21 update: the expanded Stage 2 artifact contains `524,070` article rows, so Stage 3 must use the batch writer. Start local runs with `--batch-size 1000`; lower to `500` if memory remains tight, or increase after confirming RAM headroom.
 - Observed warnings are expected for this pipeline stage: PyTorch is disabled on the local environment (`torch==2.2.1`), Windows symlink caching is degraded, and Gemma BPE tokenizer emits a cleanup warning.
 
 **Output schema**: Stage 2 schema + `breadcrumb`, `chunk_id`, `chunk_text`, `part_idx`.
@@ -1519,6 +1525,7 @@ filter:
 chunking:
   max_tokens: 1024
   overlap_tokens: 128
+  batch_size: 5000
   tokenizer: "google/gemma-3-12b-it"
   inject_breadcrumb: true
 

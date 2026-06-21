@@ -249,22 +249,25 @@ def parse_document(doc_id, html: str, metadata: Dict) -> Tuple[List[Dict], Optio
     # Locate Điều boundaries
     boundaries = locate_dieu_boundaries(text)
     
-    # Many decisions/directives do not contain formal Điều markers. Keep them
-    # as document-level fallback records instead of losing almost half the corpus.
+    # Documents without formal article markers are out of scope for article-level
+    # retrieval. Drop them instead of emitting a document-level fallback row.
     if len(boundaries) == 0:
-        records, failure = build_fallback_article(doc_id, text, metadata)
-        if failure:
-            return [], failure
-        if is_law_like_title(metadata.get("title", "")):
-            failure = {
-                "doc_id": doc_id,
-                "title": metadata.get("title", ""),
-                "num_dieu": 0,
-                "reason": "zero_dieu_law_like_doc",
-                "text_preview": text[:500]
-            }
-            return records, failure
-        return records, None
+        text = text.strip()
+        reason = (
+            "text_too_short_after_cleaning"
+            if len(text) < 30
+            else "zero_dieu_law_like_doc"
+            if is_law_like_title(metadata.get("title", ""))
+            else "zero_dieu_no_fallback"
+        )
+        failure = {
+            "doc_id": doc_id,
+            "title": metadata.get("title", ""),
+            "num_dieu": 0,
+            "reason": reason,
+            "text_preview": text[:500]
+        }
+        return [], failure
     
     # Assign hierarchy and build article records
     articles = assign_hierarchy_context(text, boundaries)
