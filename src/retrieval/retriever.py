@@ -173,6 +173,13 @@ class HybridRetriever:
         self.graph_expander = graph_expander
         self.query_encoder = query_encoder
         self.config = config or RetrievalConfig()
+        # Cross-encoder reranker is lazily loaded ONCE and reused across
+        # queries. Re-instantiating FlagReranker inside _rerank() on every
+        # retrieve() call reloads ~568M weights each time — slow and a
+        # repeated host-RAM spike that can OOM a 12 GB Colab instance
+        # (especially the 20-question dev batch in the notebook). See _rerank().
+        self._reranker: Any = None
+        self._reranker_unavailable: bool = False
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -333,15 +340,26 @@ class HybridRetriever:
         """
         if not ordered:
             return ordered
+        # If a previous call found the reranker deps unavailable, skip without
+        # re-attempting the import on every query (avoids repeated try/except).
+        if self._reranker_unavailable:
+            return ordered
         try:
             import torch  # noqa: F401
             from FlagEmbedding import FlagReranker  # lazy
-        except Exception as e:
+        except Exception:
             # No GPU / deps → skip rerank gracefully (CPU baseline path).
+            self._reranker_unavailable = True
             return ordered
 
         cfg = self.config
-        reranker = FlagReranker(cfg.rerank_model, use_fp16=True)
+        # Load the reranker once and cache it on the retriever. Re-instantiating
+        # per query re-downloads/reloads the weights and spikes host RAM (OOM
+        # risk on a 12 GB Colab instance running the 20-question dev batch).
+        # Cached reuse keeps identical outputs (same model, fp16, compute_score).
+        if self._reranker is None:
+            self._reranker = FlagReranker(cfg.rerank_model, use_fp16=True)
+        reranker = self._reranker
 
         pairs: List[Tuple[str, str]] = []
         for e in ordered:

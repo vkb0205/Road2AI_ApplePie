@@ -50,12 +50,22 @@ class FAISSIndex:
         index_path: str,
         meta_path: str,
         model_meta_path: str,
+        gpu_id: int = -1,
     ) -> None:
         self.index_path = index_path
         self.meta_path = meta_path
         self.model_meta_path = model_meta_path
-        self._index: Any = None  # faiss.Index
-        self._meta: Any = None   # pandas.DataFrame
+        # gpu_id >= 0 -> move the flat index onto that GPU. The Stage-6
+        # ``IndexFlatIP`` is 636,585 x 1024 f32 ~= 2.6 GB; on a 12 GB Colab
+        # instance keeping it on the host is the dominant RAM pressure, while
+        # the GPU (15 GB) sits idle. Moving it to the GPU frees ~2.6 GB of
+        # host RAM and makes ``search`` faster. Requires the ``faiss-gpu``
+        # package; ``-1`` (default) keeps the index on the host (CPU) for
+        # offline scripts / tests / CPU-only environments.
+        self._gpu_id = int(gpu_id)
+        self._index: Any = None  # faiss.Index (CPU or GpuIndex)
+        self._gpu_res: Any = None  # faiss.StandardGpuResources when on GPU
+        self._meta: Any = None   # pandas.DataFrame (indexed by row_idx)
         self._model_meta: Dict[str, Any] = {}
         self._dim: int = 0
         self._ntotal: int = 0
@@ -68,6 +78,12 @@ class FAISSIndex:
 
         Asserts the Stage 6 bundle contract (row_idx contiguous 0..N-1 and
         aligned with ``index.ntotal``). Returns ``self`` for chaining.
+
+        When ``gpu_id >= 0`` (and the ``faiss-gpu`` package is installed) the
+        flat index is moved onto that GPU, relocating the ~2.6 GB vector
+        matrix from host RAM to GPU memory. If faiss has no GPU support
+        (``faiss-cpu``) the index is kept on the host so the call still
+        succeeds — only the host-RAM saving is forfeited.
         """
         import numpy as np  # noqa: F401  (validate availability)
         import pandas as pd
@@ -75,9 +91,28 @@ class FAISSIndex:
 
         if not Path(self.index_path).exists():
             raise FileNotFoundError(f"FAISS index not found: {self.index_path}")
-        self._index = faiss.read_index(self.index_path)
-        self._ntotal = int(self._index.ntotal)
-        self._dim = int(self._index.d)
+        cpu_index = faiss.read_index(self.index_path)
+        self._ntotal = int(cpu_index.ntotal)
+        self._dim = int(cpu_index.d)
+
+        # ---- optionally move the flat index to GPU (saves ~2.6 GB host RAM) ----
+        # On a 12 GB Colab instance this is the single biggest host-RAM win:
+        # the 636k x 1024 f32 matrix leaves the host and lives on the (idle)
+        # 15 GB GPU. Falls back to CPU silently if faiss-gpu is unavailable.
+        self._index = cpu_index
+        self._gpu_res = None
+        if self._gpu_id >= 0 and hasattr(faiss, "index_cpu_to_gpu"):
+            try:
+                res = faiss.StandardGpuResources()
+                self._index = faiss.index_cpu_to_gpu(res, self._gpu_id, cpu_index)
+                self._gpu_res = res
+                # Drop the CPU copy so its ~2.6 GB is reclaimed by the host.
+                del cpu_index
+            except Exception:
+                # faiss-cpu or no usable GPU -> keep the CPU index; the
+                # pipeline still works, just without the host-RAM saving.
+                self._index = cpu_index
+                self._gpu_res = None
 
         self._meta = pd.read_parquet(self.meta_path)
         self._model_meta = json.loads(
@@ -107,8 +142,13 @@ class FAISSIndex:
                 "index position would not align. Refusing to use meta.iloc."
             )
         # Row-locate index for safe O(1) lookup by row_idx even if a future
-        # build reorders metadata.
-        self._meta_by_row = self._meta.set_index("row_idx", drop=False)
+        # build reorders metadata. Reindex in place and alias so we keep ONLY
+        # one DataFrame copy: the previous code held both the raw frame and a
+        # ``set_index`` copy, which duplicated the metadata sidecar in host
+        # RAM (wasteful on a 12 GB Colab instance). ``.iloc`` (positional)
+        # still works on the indexed frame, so ``iter_meta_rows`` is unaffected.
+        self._meta = self._meta.set_index("row_idx", drop=False)
+        self._meta_by_row = self._meta
         return self
 
     # ------------------------------------------------------------------ #
@@ -166,6 +206,22 @@ class FAISSIndex:
     # ------------------------------------------------------------------ #
     # Vector reconstruction (for Qdrant upload)
     # ------------------------------------------------------------------ #
+    def _index_for_reconstruct(self) -> Any:
+        """Return a CPU-backed index for vector reconstruction.
+
+        GPU flat indices do not support ``reconstruct_n``; when the index
+        lives on the GPU we copy it back to the host on demand (a one-time
+        ~2.6 GB host hit, acceptable for the offline Qdrant upload path that
+        uses this). Retrieval (``search``) never calls this.
+        """
+        if self._gpu_res is None:
+            return self._index
+        import faiss
+
+        if hasattr(faiss, "index_gpu_to_cpu"):
+            return faiss.index_gpu_to_cpu(self._index)
+        return self._index
+
     def reconstruct_all(self, batch: int = 4096) -> Any:
         """Reconstruct the full embedding matrix from the flat index.
 
@@ -183,7 +239,7 @@ class FAISSIndex:
         out = np.empty((n, d), dtype="float32")
         for start in range(0, n, batch):
             stop = min(start + batch, n)
-            out[start:stop] = self._index.reconstruct_n(start, stop - start)
+            out[start:stop] = self._index_for_reconstruct().reconstruct_n(start, stop - start)
         return out
 
     def reconstruct_rows(self, row_idxs: Sequence[int]) -> Any:
@@ -195,7 +251,7 @@ class FAISSIndex:
         idxs = [int(x) for x in row_idxs]
         out = np.empty((len(idxs), self._dim), dtype="float32")
         for i, ridx in enumerate(idxs):
-            out[i] = self._index.reconstruct(int(ridx))
+            out[i] = self._index_for_reconstruct().reconstruct(int(ridx))
         return out
 
     # ------------------------------------------------------------------ #
