@@ -80,7 +80,6 @@ CREATE TABLE chunks (
     chunk_id        TEXT PRIMARY KEY,             -- e.g. "{doc_uid}#{part_idx}"
     doc_uid         TEXT NOT NULL REFERENCES articles(doc_uid),
     doc_id          BIGINT NOT NULL REFERENCES documents(id),
-    part_idx        INTEGER NOT NULL,             -- 0-based position within article
     breadcrumb      TEXT,                         -- Hierarchical nav: "Type > Law > Part > Chapter > Article"
     chunk_text      TEXT NOT NULL,                -- Actual chunk content (with breadcrumb prepended)
     created_at      TIMESTAMP DEFAULT now()

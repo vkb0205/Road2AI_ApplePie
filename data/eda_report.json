@@ -1,0 +1,108 @@
+{
+  "node_type_counts": {
+    "Document": 114861,
+    "Article": 524070,
+    "Chunk": 636585
+  },
+  "total_nodes": 1275516,
+  "total_edges": 1540518,
+  "edge_relation_counts": {
+    "HAS_ARTICLE": 524070,
+    "REPLACES": 64631,
+    "AMENDS": 8382,
+    "BASED_ON": 260216,
+    "CITES_REF": 31768,
+    "DETAILS": 14624,
+    "RELATED_CONTENT": 229,
+    "CORRECTS": 13,
+    "HAS_CHUNK": 636585
+  },
+  "degree_by_type": {
+    "Article": {
+      "count": 524070,
+      "in_degree_min": 1,
+      "in_degree_max": 1,
+      "in_degree_avg": 1.0,
+      "out_degree_min": 1,
+      "out_degree_max": 364,
+      "out_degree_avg": 1.2146946018661628,
+      "total_degree_avg": 2.214694601866163,
+      "isolated_count": 0,
+      "isolated_pct": 0.0,
+      "degree_histogram": {
+        "101-500": 49,
+        "21-100": 619,
+        "6-20": 6188,
+        "1-5": 517214
+      }
+    },
+    "Chunk": {
+      "count": 636585,
+      "in_degree_min": 1,
+      "in_degree_max": 1,
+      "in_degree_avg": 1.0,
+      "out_degree_min": 0,
+      "out_degree_max": 0,
+      "out_degree_avg": 0.0,
+      "total_degree_avg": 1.0,
+      "isolated_count": 0,
+      "isolated_pct": 0.0,
+      "degree_histogram": {
+        "1-5": 636585
+      }
+    },
+    "Document": {
+      "count": 114861,
+      "in_degree_min": 0,
+      "in_degree_max": 19237,
+      "in_degree_avg": 3.3071538642359024,
+      "out_degree_min": 0,
+      "out_degree_max": 702,
+      "out_degree_avg": 7.869799148536057,
+      "total_degree_avg": 11.176953012771959,
+      "isolated_count": 13326,
+      "isolated_pct": 11.601849191631624,
+      "degree_histogram": {
+        "1-5": 41876,
+        "6-20": 47622,
+        "0": 13326,
+        "21-100": 11182,
+        "101-500": 765,
+        "501-2000": 79,
+        "2000+": 11
+      }
+    }
+  },
+  "components": {
+    "total_components": 29147,
+    "largest_size": 1091405,
+    "singletons": 13326,
+    "pct_in_largest": 85.56576318917207,
+    "top10_sizes": [
+      1091405,
+      2064,
+      306,
+      252,
+      245,
+      215,
+      213,
+      206,
+      194,
+      193
+    ]
+  },
+  "total_attr_chars": 653544452,
+  "attr_mb_approx": 623.2685585021973,
+  "doc_diversity": {
+    "unique_law_ids": 54287,
+    "unique_loai": 19,
+    "unique_nganh": 675
+  },
+  "chunk_per_doc": {
+    "docs_with_chunks": 80504,
+    "min": 1,
+    "max": 689,
+    "avg": 7.9074952797376525,
+    "median": 4
+  }
+}

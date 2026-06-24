@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "question": "Thủ tục đăng ký doanh nghiệp lần đầu bao gồm những bước nào? Cơ quan nào tiếp nhận hồ sơ đăng ký doanh nghiệp?"
+  },
+  {
+    "id": 2,
+    "question": "Thời hạn giải quyết hồ sơ đăng ký doanh nghiệp là bao lâu kể từ ngày nhận đủ hồ sơ hợp lệ?"
+  },
+  {
+    "id": 3,
+    "question": "Trường hợp nào người thành lập doanh nghiệp bị từ chối cấp giấy chứng nhận đăng ký doanh nghiệp?"
+  },
+  {
+    "id": 4,
+    "question": "Doanh nghiệp có thể thay đổi nội dung đăng ký doanh nghiệp bằng cách nào? Thủ tục thông báo thay đổi như thế nào?"
+  },
+  {
+    "id": 5,
+    "question": "Hình thức xử phạt vi phạm hành chính đối với hành vi gây ô nhiễm môi trường của doanh nghiệp nhỏ và vừa là gì?"
+  },
+  {
+    "id": 6,
+    "question": "Mức phạt tiền đối với hành vi xả thải vượt tiêu chuẩn quy định về bảo vệ môi trường được quy định như thế nào?"
+  },
+  {
+    "id": 7,
+    "question": "Bảo vệ môi trường trong hoạt động của doanh nghiệp bao gồm những biện pháp bắt buộc nào theo quy định hiện hành?"
+  },
+  {
+    "id": 8,
+    "question": "Thủ tục hải quan đối với hàng hoá xuất khẩu, nhập khẩu của doanh nghiệp được quy định như thế nào?"
+  },
+  {
+    "id": 9,
+    "question": "Việc kiểm tra, giám sát hải quan đối với hàng hóa nhập khẩu được thực hiện theo quy trình nào?"
+  },
+  {
+    "id": 10,
+    "question": "Quản lý thuế đối với hàng hoá xuất khẩu, nhập khẩu bao gồm những nghĩa vụ thuế nào của doanh nghiệp?"
+  },
+  {
+    "id": 11,
+    "question": "Doanh nghiệp có nghĩa vụ kê khai, nộp thuế như thế nào theo quy định về quản lý thuế?"
+  },
+  {
+    "id": 12,
+    "question": "Thời hạn nộp hồ sơ khai thuế và nộp thuế đối với doanh nghiệp được quy định ra sao?"
+  },
+  {
+    "id": 13,
+    "question": "Quyền sở hữu trí tuệ đối với sáng chế được bảo vệ như thế nào? Thời hạn bảo hộ sáng chế là bao lâu?"
+  },
+  {
+    "id": 14,
+    "question": "Doanh nghiệp có quyền nào khi bị xâm phạm quyền sở hữu công nghiệp đối với nhãn hiệu, kiểu dáng công nghiệp?"
+  },
+  {
+    "id": 15,
+    "question": "Thủ tục đăng ký nhãn hiệu tại Việt Nam bao gồm những bước nào và ai là cơ quan có thẩm quyền cấp văn bằng bảo hộ?"
+  },
+  {
+    "id": 16,
+    "question": "Doanh nghiệp nhỏ và vừa được hưởng những chính sách hỗ trợ nào về thuế khi thành lập và hoạt động kinh doanh?"
+  },
+  {
+    "id": 17,
+    "question": "Hồ sơ đăng ký doanh nghiệp bao gồm những giấy tờ gì cho loại hình công ty trách nhiệm hữu hạn một thành viên?"
+  },
+  {
+    "id": 18,
+    "question": "Điều kiện và thủ tục tạm ngừng hoạt động kinh doanh của doanh nghiệp được quy định như thế nào?"
+  },
+  {
+    "id": 19,
+    "question": "Chế độ trách nhiệm bồi thường thiệt hại do doanh nghiệp gây ra cho bên thứ ba được quy định ra sao khi doanh nghiệp hoạt động?"
+  },
+  {
+    "id": 20,
+    "question": "Nghĩa vụ nộp thuế và xử lý vi phạm về thuế đối với doanh nghiệp chậm nộp hồ sơ khai thuế được quy định như thế nào?"
+  }
+]

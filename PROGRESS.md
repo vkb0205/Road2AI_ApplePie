@@ -472,3 +472,126 @@
 - **Tests run**:
   - `uv run --no-project --with pytest --with pandas --with pyarrow --with transformers --with beautifulsoup4 --with tqdm python -m pytest tests/test_stage3_chunking.py tests/test_stage2_parser.py -q -p no:cacheprovider`
   - Result: **4 passed**.
+
+### Checkpoint 23/06/2026 — Stage 7.1 Retrieval Module + Qdrant dense backend — Zoo
+
+- **Discovery**: The entire `src/retrieval/` package was **0 lines** — wiped during the repo restructure and never re-implemented, despite `PLAN.md` task 7.1 being marked ✅. `retriever.py`, `faiss_index.py`, `bm25_index.py`, `rrf.py`, and `graph_expand.py` all returned empty. This checkpoint rebuilds the package from scratch against the test contracts in `tests/test_retrieval.py` and the Stage 6 bundle contract documented in `data/stage6_data/artifacts_guide.md`.
+
+- **Bundle invariant enforced**: `FAISS position i == chunk_meta_slim.row_idx i == chunks.row_idx i == chunks_fts.rowid i` (636,585 chunks, dim 1024, single `IndexFlatIP` with L2-normalised vectors = cosine). Every module preserves `row_idx` as the canonical key.
+
+- **Implemented modules** (all lazy on heavy deps so the package imports & unit-tests on a CPU-only checkout):
+
+  - `src/retrieval/rrf.py` (132 lines) — Reciprocal Rank Fusion.
+    - `rrf_fuse(rankings, k=60, fused_top=30, seed=42)` → list of `{row_idx, rrf_score, source, payload}` sorted by `(-rrf_score, row_idx, rng.random())` (deterministic tie-break).
+    - `rrf_score_only(rankings, k=60)` → raw `{row_idx: score}` dict (no truncation).
+
+  - `src/retrieval/bm25_index.py` (324 lines) — Lexical backends.
+    - `FTSIndex(db_path, mode="fts_fast"|"bm25_ranked")` — read-only SQLite FTS5 wrapper; `search()` returns metadata dicts, `fetch_chunks()` returns full text.
+    - **Default switched to `bm25_ranked`** (uses `ORDER BY bm25(chunks_fts)`) after `fts_fast` (unranked FTS5 order) produced F2=0.0278 vs the committed 0.0670 — see Errors below.
+    - `PureBM25(corpus, k1=1.5, b=0.75)` — in-memory Okapi BM25 fallback when FTS5 is unavailable.
+    - `tokenize_query()`, `build_fts_match_expr()` — pure query builders.
+
+  - `src/retrieval/graph_expand.py` (400 lines) — Graph expansion (PLAN task 7.3).
+    - `GraphExpander(G, row_to_uid, discount_doc=0.6, discount_concept=0.3)`.
+    - 1-hop DOC→ART expansion via `EXPANSION_DOC_RELS = ("DETAILS","AMENDS","REPLACES","CITES_REF","BASED_ON")` (canonical + reverse).
+    - 1.5-hop concept co-mention (discount 0.3) via `MENTIONS` edges.
+    - `expand()` adds `doc_expand`/`concept_expand` candidates; `build_graph_context()` renders a prompt string.
+    - `from_graph_and_meta(kg_pickle_path, meta_parquet_path)` classmethod for convenience construction.
+
+  - `src/retrieval/faiss_index.py` (301 lines) — Dense FAISS backend.
+    - `FAISSIndex(index_path, meta_path, model_meta_path).load_index()` — asserts the bundle contract on open.
+    - `search(query_vec, top_k)` → scored hits; `reconstruct_all()`/`reconstruct_rows()` for Qdrant upload (Stage 6 stores no raw `.npy`, so `IndexFlatIP.reconstruct_n` is the bridge).
+    - `BGEQueryEncoder(model_name="BAAI/bge-m3")` — lazy `encode()`/`encode_batch()` returning L2-normalised float32.
+
+  - `src/retrieval/qdrant_index.py` (363 lines) — **Qdrant dense backend (user requirement)**.
+    - `QdrantIndex(collection="glrag_bge_m3", url, api_key, vector_name="dense").ensure_ready()` — shares the exact `search(query_vec, top_k)` contract of `FAISSIndex`, so `HybridRetriever` swaps backends via `dense_backend: faiss|qdrant` with no other changes.
+    - `QdrantUploader(collection, url, api_key, dim=1024, batch_size=1000).upload_from_faiss(faiss_index, ...)` — reconstructs vectors from FAISS, upserts as points keyed by canonical `row_idx` with `chunk_meta_slim` payloads, `Cosine` distance (matching the L2-normalised FAISS vectors).
+    - Reads `QDRANT_URL` / `QDRANT_API_KEY` from env.
+
+  - `src/retrieval/retriever.py` (375 lines) — **Stage 7.1 main module**.
+    - `RetrievalConfig` dataclass: `use_dense=False, use_reranker=False, top_bm25=50, top_dense=50, rrf_k=60, fused_top=30, expanded_top=50, final_top_k=5, rerank_model="BAAI/bge-reranker-v2-m3", seed=42`.
+    - `Hit` dataclass carries `row_idx, score, source, law_id, ten_van_ban, dieu_so, chunk_id, doc_uid, chunk_text`.
+    - `make_relevant_lists(hits)` → `(docs, articles)` where `articles` keeps only `dieu_so.startswith("Điều")` (filters out non-article hits so F2 `relevant_articles` stays clean).
+    - `HybridRetriever(...).retrieve(query, fetch_text=False)` runs lexical → dense (if `use_dense`) → RRF → graph expand → rerank (if `use_reranker`) → top-K.
+    - `_rerank()` lazily imports `FlagReranker` and falls back gracefully on CPU.
+
+- **Qdrant upload script** `scripts/upload_embeddings_to_qdrant.py` (200 lines):
+  - CLI flags: `--collection`, `--url`, `--api-key`, `--batch-size`, `--include-text`, `--dry-run`, `--limit`.
+  - `--dry-run` validates the bundle (vector count, dim, metadata parity) **without** requiring `faiss`/`qdrant-client` installed — confirmed 636,585 vectors, dim 1024.
+  - `_SlicedFAISS` adapter supports `--limit` for partial trial uploads.
+
+- **Config & packaging updates**:
+  - `config/default.yaml`: added `retrieval.dense_backend: "faiss"` selector and a `qdrant:` block (collection, vector_name, dim, distance, on_disk_payload, upload_batch_size).
+  - `.env`: added `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION` placeholders.
+  - `pyproject.toml`: added optional-dependencies extras `dense`, `qdrant`, `rerank`, `generation`, `all` — so a CPU-only `pip install .` still succeeds; heavy deps are opt-in.
+  - `scripts/run_devset_baseline.py`: added `--fts-mode` flag (default `bm25_ranked`) threaded through `build_retriever()` and `run()`.
+
+- **Errors encountered & fixed**:
+  1. **Graph expansion test failure** (`test_doc_expansion_adds_neighbour_article_chunks`): the synthetic test graph's `ART` nodes carry only `doc_uid` (no `doc_id` attribute), but the initial `row_to_uid`-derived mapping required the `doc_id` attr → empty mapping → no expansion. **Fix**: rewrote the mapping to resolve the parent `DOC` node via the `HAS_ARTICLE` edge (`u`=`DOC:{doc_id}`, `v`=`ART:{doc_uid}`), with the `doc_id` attribute as a fallback; added the `_art_uid_from_node()` static helper.
+  2. **F2 baseline mismatch (0.0278 vs committed 0.0670)**: `fts_fast` returns FTS5 matches in unranked row order (`artifacts_guide.md` warns about this). **Fix**: switched the baseline runner default to `bm25_ranked` (`ORDER BY bm25(chunks_fts)`); F2=0.0670 reproduced exactly. Kept `--fts-mode fts_fast` available for fast smoke tests.
+
+- **Tests run**:
+  - `cd Road2AI_ApplePie && PYTHONPATH=src python -m pytest tests/test_retrieval.py -q -p no:cacheprovider`
+  - Result: **33 passed**, including Stage 7.1 acceptance `test_retrieve_smoke_all_devset_questions` (≥ 1 hit for all 20 dev-set questions, lexical-only) and the real-bundle `TestFTSIndexRealBundle` cases.
+
+- **Dev-set baseline (PLAN task 7.5)**:
+  - `cd Road2AI_ApplePie && PYTHONPATH=src python scripts/run_devset_baseline.py`
+  - **F2 macro = 0.0670** — matches the PLAN.md 7.5 committed baseline exactly.
+  - Graph vs no-graph ablation: **Δ = +0.0000** — consistent with the PLAN 7.3 expectation that on a CPU-only lexical baseline (no dense leg, no rerank) graph expansion adds no new winning articles; the lift is expected to appear once the dense leg (Stage 7.4, Kaggle GPU) is enabled.
+  - Results written to `dev_set/results_baseline.json` and `dev_set/results_no_graph.json` (20 records each).
+
+- **Qdrant upload dry-run**:
+  - `cd Road2AI_ApplePie && PYTHONPATH=src python scripts/upload_embeddings_to_qdrant.py --dry-run`
+  - Result: bundle validated — 636,585 vectors, dim 1024, metadata parity with `chunk_meta_slim.parquet`. No `faiss`/`qdrant-client` required for dry-run. A live upload needs `pip install -e ".[qdrant,dense]"` + a running Qdrant instance (`QDRANT_URL`).
+
+- **Status / deferred**:
+  - Stage 7.1 (Retrieval Module) ✅ complete on CPU — lexical + graph + RRF + Qdrant plumbing all working.
+  - **F2 ≥ 0.55 (PLAN task 7.4)** deferred to a Kaggle GPU run that enables the dense FAISS leg + cross-encoder rerank (`use_dense=True, use_reranker=True`) — not feasible on the local CPU checkout.
+  - Live Qdrant upload (vs dry-run) deferred until a Qdrant instance is provisioned; the script and contract are ready.
+  - `PLAN.md` task 7.1 owner line already reads "Zoo 2026-06-23".
+
+### Checkpoint 23/06/2026 — Neo4j-backed single-query retrieval test (all stages) — Zoo
+
+- **Scope**: Verified a single query flows end-to-end through **all stages** of the G-LRAG retrieval pipeline with the **graph stage (Stage 4) backed by the live self-hosted Neo4j instance** (`bolt+s://neo4j.vkb.io.vn:7687`, creds from `.env`), rather than the default in-memory `kg.gpickle` ([`GraphExpander`](Road2AI_ApplePie/src/retrieval/graph_expand.py:71)). This exercises [`Neo4jGraphExpander`](Road2AI_ApplePie/src/retrieval/neo4j_graph_expand.py:66) — the drop-in Cypher-backed twin of the pickle expander — against the real graph populated by [`scripts/upload_graph_to_neo4j.py`](Road2AI_ApplePie/scripts/upload_graph_to_neo4j.py:1).
+
+- **New script** [`scripts/test_single_query_neo4j.py`](Road2AI_ApplePie/scripts/test_single_query_neo4j.py:1) (~290 lines):
+  - Drives one query through every stage individually and prints what each produces, so the query can be confirmed "found" (or not) at each step:
+    - Stage 1 lexical — [`FTSIndex.search()`](Road2AI_ApplePie/src/retrieval/bm25_index.py:171)
+    - Stage 2 dense — FAISS (auto-enabled if `faiss`/`torch`/`FlagEmbedding` installed, else gracefully skipped)
+    - Stage 3 RRF — [`rrf_fuse()`](Road2AI_ApplePie/src/retrieval/rrf.py:42)
+    - Stage 4 graph expand — [`Neo4jGraphExpander.expand()`](Road2AI_ApplePie/src/retrieval/neo4j_graph_expand.py:182) (always Neo4j here)
+    - Stage 5 fetch metadata + text — [`fetch_chunks()`](Road2AI_ApplePie/src/retrieval/bm25_index.py:227)
+    - Stage 6 rerank — bge-reranker-v2-m3 (auto-enabled if `torch` installed, else skipped)
+    - Stage 7 build final top-K [`Hit`](Road2AI_ApplePie/src/retrieval/retriever.py:71) list
+    - Post [`make_relevant_lists()`](Road2AI_ApplePie/src/retrieval/retriever.py:103) → `(relevant_docs, relevant_articles)`
+  - Prints a final **VERDICT** line listing which stages found the query, e.g. `1.lexical, 3.rrf, 4.graph(neo4j), 5.fetch, 7.final-hit`.
+  - CLI: optional positional `query` (default = dev-set Q1), `--top-k`, `--fts-mode {bm25_ranked,fts_fast}`, `--no-dense`, `--no-rerank`. Lazy-import guards mirror the retriever's CPU-baseline path, so it runs on a machine with only `neo4j`/`pandas`/`dotenv`.
+  - Usage:
+    ```bash
+    cd Road2AI_ApplePie && PYTHONPATH=src python scripts/test_single_query_neo4j.py
+    cd Road2AI_ApplePie && PYTHONPATH=src python scripts/test_single_query_neo4j.py "thuế xuất nhập khẩu" --top-k 10
+    ```
+
+- **Run results** (executed 2026-06-23, default query *"Thủ tục đăng ký doanh nghiệp lần đầu bao gồm những bước nào?"*):
+
+  | Stage | Component | Result | Found? |
+  |---|---|---|---|
+  | 1 | Lexical leg (FTS5 BM25) | **50** hits in 9.82s over 636,585 chunks | ✅ |
+  | 2 | Dense leg (FAISS) | Skipped — `faiss`/`torch`/`FlagEmbedding` missing (CPU path) | ⚠️ auto-skipped |
+  | 3 | RRF fusion | **30** fused candidates | ✅ |
+  | 4 | **Graph expand (Neo4j)** | **50** candidates in 30.7s — `{candidate: 30, doc_expand: 20}` | ✅ |
+  | 5 | Fetch metadata + text | metadata fetched for all rows | ✅ |
+  | 6 | Rerank | Skipped — `torch` missing (graceful fallback) | ⚠️ auto-skipped |
+  | 7 | Final top-5 Hit | **5** hits | ✅ |
+  | Post | make_relevant_lists | 2 relevant_docs, 2 relevant_articles | ✅ |
+
+  - **Verdict**: `query found at stages: 1.lexical, 3.rrf, 4.graph(neo4j), 5.fetch, 7.final-hit`. Best hit: `row_idx=66090 → số 06/2023/QĐ-UBND | Điều 9` (score 0.0164).
+
+- **Neo4j connectivity & schema confirmed**: connected in 7.63s; `row_to_uid` covers all 636,585 chunks. Schema-introspection warnings from the server confirm the uploaded graph is **DOC→ART only** — the `:Chunk` and `:Concept` labels do not exist in the `neo4j` database. This is the expected graceful-degradation mode: the 1.5-hop concept co-mention path ([`_expand_concept_comention()`](Road2AI_ApplePie/src/retrieval/neo4j_graph_expand.py:312)) returns nothing (no `concept_expand` rows), while the 1-hop DOC→ART path ([`_expand_doc_hop()`](Road2AI_ApplePie/src/retrieval/neo4j_graph_expand.py:227)) is the active expansion and produced **20 `doc_expand` neighbours** (cross-document DETAILS/AMENDS/REPLACES/CITES_REF/BASED_ON edges, canonical + reverse, at ×0.6 discount) on top of the 30 lexical seeds.
+
+- **Key takeaways**:
+  1. The query is successfully found and flows through all runnable stages, with the graph stage querying the **live Neo4j** instance rather than the in-memory pickle — proving the [`Neo4jGraphExpander`](Road2AI_ApplePie/src/retrieval/neo4j_graph_expand.py:66) backend is wired correctly and returns real expansion rows.
+  2. The DOC→ART 1-hop traversal is the effective expansion on this graph; concept co-mention is a no-op because Chunk/Concept nodes were not uploaded (consistent with the smoke-test note in [`scripts/smoke_neo4j_expander.py`](Road2AI_ApplePie/scripts/smoke_neo4j_expander.py:1)). To enable `concept_expand`, a future upload must include `:Chunk`/`:Concept` nodes with `MENTIONS` edges.
+  3. Stages 2 (dense) and 6 (rerank) auto-skip on this CPU-only Mac; on a GPU box (e.g. Kaggle) they engage with no code change, fully exercising the hybrid pipeline.
+
+- **Status**: Neo4j-backed retrieval path verified end-to-end on a single query. The script is reusable for ad-hoc per-stage tracing of any query against the live graph.

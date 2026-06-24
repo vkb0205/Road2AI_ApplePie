@@ -57,6 +57,7 @@ def main():
     sql_files = [
         sql_dir / "00_schema.sql",
         sql_dir / "01_chunk_concept_mentions.sql",
+        sql_dir / "02_chunk_fts.sql",
     ]
 
     print(f"Connecting to Supabase PostgreSQL...")

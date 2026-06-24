@@ -20,6 +20,50 @@ dependencies = [
   "python-dotenv>=1.0",
 ]
 
+# Heavy GPU / retrieval deps are optional extras so a CPU-only checkout can
+# still `pip install -e .` and run the lexical-only retrieval baseline +
+# unit tests. Install the relevant extra on the GPU box:
+#   pip install -e ".[dense]"   # faiss + FlagEmbedding + torch (Stage 6/7 dense leg)
+#   pip install -e ".[qdrant]"  # qdrant-client (Stage 7 add-on)
+#   pip install -e ".[rerank]"  # cross-encoder reranker (Stage 7.4)
+#   pip install -e ".[generation]"  # generation deps (Stage 8)
+[project.optional-dependencies]
+dense = [
+  "faiss-cpu>=1.7.4",
+  "FlagEmbedding>=1.2.10",
+  "torch>=2.4.1",
+  "transformers>=4.46.0",
+  "numpy>=1.24",
+]
+qdrant = [
+  "qdrant-client>=1.9.0",
+]
+neo4j = [
+  "neo4j>=5.14",
+  "python-dotenv>=1.0",
+]
+rerank = [
+  "FlagEmbedding>=1.2.10",
+  "torch>=2.4.1",
+]
+generation = [
+  "transformers>=4.46.0",
+  "accelerate>=0.30",
+  "bitsandbytes>=0.43",
+  "torch>=2.4.1",
+]
+all = [
+  "faiss-cpu>=1.7.4",
+  "FlagEmbedding>=1.2.10",
+  "torch>=2.4.1",
+  "transformers>=4.46.0",
+  "numpy>=1.24",
+  "qdrant-client>=1.9.0",
+  "neo4j>=5.14",
+  "accelerate>=0.30",
+  "bitsandbytes>=0.43",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

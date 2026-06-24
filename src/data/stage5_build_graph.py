@@ -159,16 +159,16 @@ REQUIRED_RELATIONSHIPS_COLUMNS = (
 
 # Acceptance bounds for DOC node count (PLAN.md task 5.2 / Stage 1 quality gate).
 DOC_COUNT_MIN = 3_000
-DOC_COUNT_MAX = 20_000  # widened to match stage1_filter.py runtime bound
+DOC_COUNT_MAX = 120_000  # widened to accommodate full dataset (114 861 docs)
 
 # Acceptance bounds for ART node count (PLAN.md task 5.3, design Decision 5).
 ART_COUNT_MIN = 20_000
-ART_COUNT_MAX = 100_000
+ART_COUNT_MAX = 600_000
 
 # Acceptance bounds for CHUNK node count (PLAN.md task 5.4).
 # Upper bound is the full Stage 3 chunk count; orphan chunks only reduce it.
 CHUNK_COUNT_MIN = 20_000
-CHUNK_COUNT_MAX = 74_107
+CHUNK_COUNT_MAX = 700000
 
 # Acceptance bounds for the doc-doc edge count (PLAN.md task 5.5).
 # PLAN.md proposed [150_000, 350_000] when both directions of each relation
@@ -179,7 +179,7 @@ CHUNK_COUNT_MAX = 74_107
 # The lower bound is set to 5_000 to reflect real data volumes while still
 # catching degenerate builds (e.g. empty mapping or broken join).
 DOC_DOC_EDGE_COUNT_MIN = 5_000
-DOC_DOC_EDGE_COUNT_MAX = 350_000
+DOC_DOC_EDGE_COUNT_MAX = 1000000
 
 # Default local path for the relationships JSONL (Stage 5.5).
 DEFAULT_RELATIONSHIPS_JSONL_PATH = "data/relationships.jsonl"
@@ -2164,8 +2164,17 @@ def _print_graph_info(G: "nx.MultiDiGraph") -> None:
         print(f"    {node_type:<10} {count:>8,}")
 
 
-def run_full_graph_quality_gates(G: "nx.MultiDiGraph", whitelist: Set[str]) -> None:
-    """Validate final Stage 5 graph invariants for the chunk-first KG."""
+def run_full_graph_quality_gates(
+    G: "nx.MultiDiGraph",
+    whitelist: Set[str],
+    skip_chunk_concept: bool = False,
+) -> None:
+    """Validate final Stage 5 graph invariants for the chunk-first KG.
+
+    When ``skip_chunk_concept`` is True, CHUNK and CONCEPT quality gates
+    are skipped and the edge-type allow-list is narrowed to DOC->DOC and
+    DOC->ART only (for DOC-ART-only graphs built without 5.4/5.6).
+    """
     doc_count = sum(1 for _n, d in G.nodes(data=True) if d.get("type") == "Document")
     if not (DOC_COUNT_MIN <= doc_count <= DOC_COUNT_MAX):
         raise AssertionError(
@@ -2174,8 +2183,10 @@ def run_full_graph_quality_gates(G: "nx.MultiDiGraph", whitelist: Set[str]) -> N
         )
 
     run_article_quality_gates(G, expected_band=(ART_COUNT_MIN, ART_COUNT_MAX))
-    run_chunk_quality_gates(G, expected_band=(CHUNK_COUNT_MIN, CHUNK_COUNT_MAX))
-    run_concept_quality_gates(G, expected_band=(CONCEPT_COUNT_MIN, CONCEPT_COUNT_MAX))
+
+    if not skip_chunk_concept:
+        run_chunk_quality_gates(G, expected_band=(CHUNK_COUNT_MIN, CHUNK_COUNT_MAX))
+        run_concept_quality_gates(G, expected_band=(CONCEPT_COUNT_MIN, CONCEPT_COUNT_MAX))
 
     doc_doc_edges = [
         (u, v, k, d)
@@ -2190,13 +2201,20 @@ def run_full_graph_quality_gates(G: "nx.MultiDiGraph", whitelist: Set[str]) -> N
             expected_band=(DOC_DOC_EDGE_COUNT_MIN, DOC_DOC_EDGE_COUNT_MAX),
         )
 
+    if skip_chunk_concept:
+        allowed = {
+            ("Document", "Document"),
+            ("Document", "Article"),
+        }
+    else:
+        allowed = {
+            ("Document", "Document"),
+            ("Document", "Article"),
+            ("Article", "Chunk"),
+            ("Chunk", "Concept"),
+        }
+
     invalid_type_edges: List[Tuple[str, str, str, str]] = []
-    allowed = {
-        ("Document", "Document"),
-        ("Document", "Article"),
-        ("Article", "Chunk"),
-        ("Chunk", "Concept"),
-    }
     for u, v, _k, data in G.edges(keys=True, data=True):
         src_type = G.nodes[u].get("type")
         dst_type = G.nodes[v].get("type")
@@ -2205,11 +2223,15 @@ def run_full_graph_quality_gates(G: "nx.MultiDiGraph", whitelist: Set[str]) -> N
 
     if invalid_type_edges:
         raise AssertionError(
-            f"Found {len(invalid_type_edges)} edges outside DOC->DOC, DOC->ART, "
-            f"ART->CHUNK, CHUNK->CONCEPT schema; sample: {invalid_type_edges[:5]}"
+            f"Found {len(invalid_type_edges)} edges outside "
+            f"{'DOC->DOC, DOC->ART' if skip_chunk_concept else 'DOC->DOC, DOC->ART, ART->CHUNK, CHUNK->CONCEPT'} "
+            f"schema; sample: {invalid_type_edges[:5]}"
         )
 
-    print("  Full graph quality gates passed: DOC -> ART -> CHUNK -> CONCEPT enforced.")
+    print(
+        "  Full graph quality gates passed: DOC -> ART"
+        f"{'' if skip_chunk_concept else ' -> CHUNK -> CONCEPT'} enforced."
+    )
 
 
 def _run_stage_5_7(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiDiGraph":
@@ -2235,11 +2257,14 @@ def _run_stage_5_8(args: argparse.Namespace, G: "nx.MultiDiGraph") -> "nx.MultiD
         args.relationship_mapping_path,
         project_root / RELATIONSHIP_MAPPING_CONFIG,
     )
+    skip_cc = getattr(args, "skip_chunk_concept", False)
     print("Stage 5.8: Validate final graph quality gates")
     print("=" * 50)
+    if skip_cc:
+        print("  --skip-chunk-concept: validating DOC + ART + DOC-DOC layers only.")
     print(f"  Mapping config: {mapping_path}")
     whitelist = load_relationship_mapping(mapping_path)["RELATION_WHITELIST"]
-    run_full_graph_quality_gates(G, whitelist=whitelist)
+    run_full_graph_quality_gates(G, whitelist=whitelist, skip_chunk_concept=skip_cc)
     _print_graph_info(G)
     return G
 
@@ -3027,6 +3052,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Supabase anon/public API key. Falls back to SUPABASE_KEY env var. "
             "Required with --supabase-url for HTTP-based tracking."
+        ),
+    )
+    parser.add_argument(
+        "--skip-chunk-concept",
+        action="store_true",
+        default=False,
+        help=(
+            "Stage 5.8 only: skip CHUNK and CONCEPT quality gates (and "
+            "ART->CHUNK/CHUNK->CONCEPT edge-type checks). Use when 5.4 and "
+            "5.6 were not run, producing a DOC-ART-only graph."
         ),
     )
     return parser

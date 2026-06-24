@@ -79,3 +79,78 @@ summarization:
   temperature: 0.1
   repetition_penalty: 1.05
   seed: 42
+
+# ---- Stage 6 artifact bundle paths (artifacts_guide.md) ----
+# All four files must come from the same build (row_idx invariant).
+artifacts:
+  stage6_dir: "data/stage6_data"
+  chunk_store_sqlite: "data/stage6_data/chunk_store.sqlite"
+  chunk_meta_slim: "data/stage6_data/chunk_meta_slim.parquet"
+  faiss_index: "data/stage6_data/faiss_index__BAAI_bge-m3.index"
+  embed_model_meta: "data/stage6_data/embed_model_meta__BAAI_bge-m3.json"
+  kg_pickle: "data/kg.gpickle"
+
+embedding:
+  model: "BAAI/bge-m3"
+  dim: 1024
+  use_fp16: true
+  batch_summary: 32
+  batch_full: 8
+  max_len_summary: 256
+  max_len_full: 1024
+
+bm25:
+  k1: 1.5
+  b: 0.75
+  fts_mode: "fts_fast"   # "fts_fast" (default) or "bm25_ranked"
+  use_pyvi: false        # set true on Kaggle where pyvi is installed
+
+retrieval:
+  top_bm25: 50
+  top_dense: 50          # single FAISS full index (Stage 6 contract)
+  rrf_k: 60
+  fused_top: 30
+  graph_discount_doc: 0.6
+  graph_discount_concept: 0.3
+  expanded_top: 50
+  rerank_model: "BAAI/bge-reranker-v2-m3"
+  rerank_max_input_chars: 2000
+  final_top_k: 5
+  seed: 42
+  use_dense: true        # disable for CPU-only lexical baseline
+  use_reranker: true     # disable for CPU-only baseline
+  # ---- Dense backend selection (Stage 7 add-on) ----
+  # "faiss"  → use the Stage 6 IndexFlatIP bundle (default, in-process).
+  # "qdrant" → query the Qdrant collection built by
+  #            scripts/upload_embeddings_to_qdrant.py. Same search contract,
+  #            so the rest of the pipeline is unchanged. Set use_dense=true
+  #            and provide a query encoder in either case.
+  dense_backend: "faiss"
+  # ---- Graph expansion backend selection (Stage 7.3 add-on) ----
+  # "pickle" → load kg.gpickle into memory via GraphExpander (default,
+  #            no extra deps; needs networkx + the gpickle on disk).
+  # "neo4j"  → query a self-hosted Neo4j instance populated by
+  #            scripts/upload_graph_to_neo4j.py via Neo4jGraphExpander.
+  #            Same expand()/build_graph_context() contract, so the rest of
+  #            the pipeline is unchanged. Credentials come from .env
+  #            (NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD).
+  graph_backend: "pickle"
+
+# ---- Neo4j (Stage 7.3 add-on: remote graph expansion backend) ----
+# Connection params default to the .env vars below; override here only if you
+# need to point at a different instance. bolt+s = Bolt over TLS.
+neo4j:
+  uri: ""                # → NEO4J_URI env var (e.g. bolt+s://host:7687)
+  username: ""           # → NEO4J_USERNAME env var
+  password: ""           # → NEO4J_PASSWORD env var
+  database: ""           # → Neo4j default DB ("neo4j") when empty
+
+# ---- Qdrant (Stage 7 add-on: mirror Stage 6 embeddings for easy retrieval) ----
+qdrant:
+  collection: "glrag_bge_m3"
+  vector_name: "dense"
+  dim: 1024
+  distance: "Cosine"       # matches Stage 6 L2-normalised IndexFlatIP
+  on_disk_payload: true
+  upload_batch_size: 1000
+  # url / api_key are read from env vars QDRANT_URL / QDRANT_API_KEY (.env).

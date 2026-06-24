@@ -83,7 +83,7 @@ The plan is organised into five phases that mirror the pipeline:
 
 ## Phase 2 — Graph & Indexing
 
-### Stage 5 — Knowledge Graph ⏳
+### Stage 5 — Knowledge Graph ✅
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
@@ -96,15 +96,17 @@ The plan is organised into five phases that mirror the pipeline:
 | 5.7 | ✅ Persist graph to `kg.gpickle` using `pickle.HIGHEST_PROTOCOL`; CLI adds `--stage 5.7 --append` to re-persist and round-trip-read the final graph, then print an `nx.info`-equivalent summary plus node counts by type. | All | ✅ Done 2026-06-18 | `kg.gpickle` readable after re-write; **145 150** nodes / **210 670** edges; file size **155.10 MB** |
 | 5.8 | ✅ Validate: enforce `DOC -> ART -> CHUNK -> CONCEPT`; check every chunk has parent article; no orphan chunks; no `ART -> CONCEPT` edges. CLI adds `--stage 5.8 --append` to run final graph-wide quality gates using runtime acceptance bands and relationship whitelist config. | All | ✅ Done 2026-06-18 | Zero crash; quality gates passed; chunk-first pipeline confirmed with **56 269** ART, **74 107** CHUNK, **80** CONCEPT, **72 916** `MENTIONS`, and **7 378** DOC→DOC edges |
 
-### Stage 6 — Indexing ⏳
+### Stage 6 — Indexing ✅ (VKB, completed 2026-06-23)
+
+> **Artifact bundle redesign (vs. original PLAN):** Stage 6 produced a **SQLite FTS5** lexical backend (`chunk_store.sqlite`, 636,585 chunks) + a **single FAISS `IndexFlatIP`** (`faiss_index__BAAI_bge-m3.index`, dim 1024, L2-normalised = cosine) + `chunk_meta_slim.parquet` sidecar — **not** the original `bm25.pkl` + `faiss_summary` + `faiss_full` + `chunk_meta.npy` design. Bundle contract: **FAISS index position i == chunk_meta_slim.row_idx i == chunks.row_idx i == chunks_fts.rowid i** (must not reorder). Retrieval modules were adapted to this actual bundle.
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
-| 6.1 | 🔲 Implement BM25 index in `src/data/stage6index.py`; tokenise with `pyvi.ViTokenizer`; parameters k₁=1.5, b=0.75 | All | ⏳ | `bm25.pkl` written; query smoke test returns non-empty ranking |
-| 6.2 | 🔲 Build FAISS summary index: embed article text / optional `short + " ".join(key)` if available | All | ⏳ | `faiss_summary.index` written; dimension 1 024 |
-| 6.3 | 🔲 Build FAISS full index: embed chunk text (`stage3_chunks.parquet`) or optional `enriched_text` if Stage 4 exists | All | ⏳ | `faiss_full.index` written; row count equals indexed chunks |
-| 6.4 | 🔲 Build `chunk_meta.npy` structured array with columns `chunk_id`, `doc_uid`, `law_id`, `ten_van_ban`, `dieu_so`, `doc_id`, `row_idx`; verify 1-to-1 alignment with all three indexes | All | ⏳ | Assert `len(bm25.doc_ids) == len(faiss_summary) == len(faiss_full) == len(chunk_meta)` |
-| 6.5 | 🔲 Upload all four index artifacts as Kaggle Dataset for Notebook 04 | All | ⏳ Blocked on 6.1–6.4 | Notebook 04 mounts and loads without error |
+| 6.1 | ✅ Lexical index as **SQLite FTS5** (`chunks_fts`, tokenizer `unicode61`) with `bm25(chunks_fts)` scoring; `artifact_meta` table records `lexical_backend=fts5`, `rows=636585`, `embed_model=BAAI/bge-m3` | VKB | ✅ Done 2026-06-23 | `chunk_store.sqlite` written; query smoke test returns ranked, query-relevant hits |
+| 6.2 | — *Superseded*: no separate FAISS summary index; the single full-chunk FAISS index (6.3) serves both summary and full retrieval legs | — | ➖ N/A | — |
+| 6.3 | ✅ Build FAISS full index: embed chunk text with `BAAI/bge-m3` (dim 1024) → single `IndexFlatIP` over L2-normalised vectors (cosine via inner product) | VKB | ✅ Done 2026-06-23 | `faiss_index__BAAI_bge-m3.index` written; **636,585** rows; dim 1024 |
+| 6.4 | ✅ Build `chunk_meta_slim.parquet` sidecar (`row_idx`, `chunk_id`, `doc_uid`, `law_id`, `ten_van_ban`, `dieu_so`, `doc_id`); verified 1-to-1 alignment: `index.ntotal == meta.row_idx contiguous 0..N-1 == chunks.row_idx` | VKB | ✅ Done 2026-06-23 | Asserted in [`FAISSIndex.load_index()`](Road2AI_ApplePie/src/retrieval/faiss_index.py:85) |
+| 6.5 | ✅ Artifacts placed in `data/stage6_data/` (local) + `embed_model_meta__BAAI_bge-m3.json` model metadata | VKB | ✅ Done 2026-06-23 | Retrieval modules load without error |
 
 > **Runtime note:** Stage 6 embedding is estimated at ~4 GPU-hours on Notebook 03.
 
@@ -112,15 +114,17 @@ The plan is organised into five phases that mirror the pipeline:
 
 ## Phase 3 — Retrieval & Generation (Online Inference)
 
-### Retrieval Module ⏳
+### Retrieval Module (Stage 7) ✅ — Zoo 2026-06-23
+
+> Adapted to the actual Stage 6 bundle (SQLite FTS5 + single FAISS `IndexFlatIP`), not the original `bm25.pkl` + two-FAISS design. All heavy GPU deps (`faiss`, `FlagEmbedding`, `torch`) are imported lazily so modules import & unit-test on CPU; the full hybrid + rerank path runs on Kaggle GPU.
 
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|------------|
-| 7.1 | 🔲 Implement `src/retrieval/retriever.py`: parallel BM25 + FAISS-summary + FAISS-full (top-50 each) | All | ⏳ Blocked on Phase 2 | Returns ≥ 1 hit for all 50 devset questions |
-| 7.2 | 🔲 Implement `src/retrieval/rrf.py`: RRF fusion with k=60; keep top-30 | All | ⏳ | Output is deterministic across re-runs with seed 42 |
-| 7.3 | 🔲 Implement `src/retrieval/graphexpand.py`: 1-hop DOC → ART expansion via `DETAILS/AMENDS/REPLACES/CITESREF/BASISOF`; concept co-mention through `ART -> CHUNK -> CONCEPT <- CHUNK <- ART` with discount 0.3; output top-50 articles | All | ⏳ | Graph expansion increases recall on devset by ≥ 5 pp vs. no expansion |
-| 7.4 | 🔲 Implement cross-encoder rerank via `BAAI/bge-reranker-v2-m3` (fp16); keep final top-K = 5 | All | ⏳ | F2 macro on devset ≥ 0.55 |
-| 7.5 | 🔲 Run end-to-end retrieval on devset; record F2 macro as baseline for ablation | All | ⏳ | Baseline number committed to `devset/results_baseline.json` |
+| 7.1 | ✅ Implement [`src/retrieval/retriever.py`](Road2AI_ApplePie/src/retrieval/retriever.py): parallel lexical (FTS5) + dense (FAISS) legs (top-50 each); lazy heavy imports; `use_dense`/`use_reranker` flags enable a CPU lexical-only baseline | Zoo | ✅ Done 2026-06-23 | Returns ≥ 1 hit for all 20 devset questions (`test_retrieve_smoke_all_devset_questions`) |
+| 7.2 | ✅ Implement [`src/retrieval/rrf.py`](Road2AI_ApplePie/src/retrieval/rrf.py): RRF fusion k=60, fused_top=30, deterministic sort (score desc, row_idx asc, seeded RNG tiebreak, seed 42) | Zoo | ✅ Done 2026-06-23 | `test_determinism` — output identical across re-runs with seed 42 |
+| 7.3 | ✅ Implement [`src/retrieval/graph_expand.py`](Road2AI_ApplePie/src/retrieval/graph_expand.py): 1-hop DOC→ART expansion via `{DETAILS,AMENDS,REPLACES,CITES_REF,BASED_ON}` (canonical + reverse), discount 0.6; 1.5-hop concept co-mention (discount 0.3) with graceful degrade when CHUNK/CONCEPT nodes absent | Zoo | ✅ Done 2026-06-23 (code) / ⏳ ablation pending GPU | **CPU baseline Δ=0.0000 (expected)** — expander adds 20 new candidates per query but they are discounted below the 30 lexical candidates, so none reach top-K=5 without a cross-encoder reranker. ≥5 pp recall lift target requires the full GPU pipeline (dense leg + reranker) and will be re-measured on Kaggle. |
+| 7.4 | ✅ Implement cross-encoder rerank via `BAAI/bge-reranker-v2-m3` (fp16) in [`Retriever._rerank()`](Road2AI_ApplePie/src/retrieval/retriever.py:348); final top-K=5 | Zoo | ✅ Code done 2026-06-23 / ⏳ F2≥0.55 pending GPU run | Code complete & unit-tested; F2≥0.55 acceptance deferred to the Kaggle GPU run (laptop has no GPU) |
+| 7.5 | ✅ Run end-to-end retrieval on devset; record F2 macro as baseline | Zoo | ✅ Done 2026-06-23 | **F2 macro = 0.0670** (lexical-only CPU baseline) committed to [`dev_set/results_baseline.json`](Road2AI_ApplePie/dev_set/results_baseline.json); no-graph ablation in [`results_no_graph.json`](Road2AI_ApplePie/dev_set/results_no_graph.json) |
 
 ### Generation Module ⏳
 

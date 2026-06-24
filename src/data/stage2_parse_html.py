@@ -28,48 +28,84 @@ except ImportError:
 RE_PHAN = re.compile(r"^\s*(Phần(?:\s+thứ)?\s+[\dIVXLCDM\w]+.*)$", re.MULTILINE | re.IGNORECASE)
 RE_CHUONG = re.compile(r"^\s*(Chương\s+[\dIVXLCDM\w]+.*)$", re.MULTILINE | re.IGNORECASE)
 RE_MUC = re.compile(r"^\s*(Mục\s+[\dIVXLCDM\w]+.*)$", re.MULTILINE | re.IGNORECASE)
+# Match article headers. Vietnamese legal texts use both "Điều" (capital Đ)
+# and "điều" (lowercase đ).  re.IGNORECASE does not reliably case-fold the
+# Latin D-with-stroke (U+0110 ↔ U+0111) on all Python builds, so we match
+# both forms explicitly by normalising the leading character.
+#
+# Recognised formats:
+#   Điều 5. Tiêu đề …
+#   Điều 5a) Nội dung …
+#   Điều  5 : Tiêu đề …
+#   điều 10
+#   Điều 15b - Mô tả …
+_DIEU_LEADER = r"[Đđ]"
 RE_DIEU = re.compile(
-    r"^\s*Điều\s+(\d+)([a-zđ]?)\s*(?:[\.:\-–—)]\s*)?(.*)$",
-    re.MULTILINE | re.IGNORECASE
+    rf"^\s*{_DIEU_LEADER}iều\s+(\d+)([a-zđ]?)\s*(?:[\.:\-–—,\;)]\s*)?(.*)$",
+    re.MULTILINE | re.IGNORECASE,
 )
 RE_KHOAN = re.compile(r"^\s*(\d+)\.\s+(.*)$", re.MULTILINE)
 RE_DIEM = re.compile(r"^\s*([a-zđ])\)\s+(.*)$", re.MULTILINE)
 LAW_LIKE_TITLE_RE = re.compile(r"\b(Luật|Bộ luật|Nghị định)\b", re.IGNORECASE)
 
 
+# Parser preference: lxml is fastest and most lenient with malformed HTML.
+# html.parser is the stdlib fallback (no extra dependencies).
+_HTML_PARSERS = ["lxml", "html.parser"]
+
+
 def clean_html_to_text(html: str) -> str:
     """
     Parse HTML and extract clean text.
-    
+
     Args:
         html: Raw HTML content
-        
+
     Returns:
         Cleaned text with normalized whitespace
+
+    Raises:
+        ValueError: if all available parsers fail to parse the HTML
     """
-    # Parse HTML with built-in html.parser (no external dependencies)
-    soup = BeautifulSoup(html, "html.parser")
-    
-    # Remove script and style tags
-    for tag in soup(["script", "style"]):
+    if not html or not html.strip():
+        raise ValueError("Empty HTML content")
+
+    last_error = None
+
+    for parser in _HTML_PARSERS:
+        try:
+            soup = BeautifulSoup(html, parser)
+            break
+        except Exception as exc:
+            last_error = exc
+            continue
+    else:
+        # All parsers failed
+        raise ValueError(
+            f"All HTML parsers failed. Last error: {last_error}"
+        ) from last_error
+
+    # Remove script, style, noscript, and iframe tags
+    for tag in soup(["script", "style", "noscript", "iframe"]):
         tag.decompose()
-    
+
     # Extract text with newline separators
     text = soup.get_text("\n", strip=True)
-    
+
     # Normalize whitespace
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text)
-    
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
     # Deduplicate consecutive identical lines (nested-tag artifact)
     lines = text.split("\n")
     deduped_lines = []
     prev_line = None
     for line in lines:
-        if line != prev_line:
+        stripped = line.strip()
+        if stripped != prev_line:
             deduped_lines.append(line)
-        prev_line = line
-    
+        prev_line = stripped
+
     return "\n".join(deduped_lines)
 
 
@@ -232,25 +268,47 @@ def build_fallback_article(doc_id, text: str, metadata: Dict) -> Tuple[List[Dict
     return build_article_records(doc_id, [article], metadata), None
 
 
-def parse_document(doc_id, html: str, metadata: Dict) -> Tuple[List[Dict], Optional[Dict]]:
+def parse_document(
+    doc_id, html: str, metadata: Dict
+) -> Tuple[List[Dict], Optional[Dict]]:
     """
     Parse a single legal document HTML into articles.
-    
+
     Args:
         doc_id: Document ID
         html: Raw HTML content
         metadata: Document metadata dict
-        Returns:
-            (list of article dicts, failure record or None)
+
+    Returns:
+        (list of article dicts, failure record or None)
     """
-    # Clean HTML to text
-    text = clean_html_to_text(html)
-    
-    # Locate Điều boundaries
+    # ── Clean HTML to text ──────────────────────────────────────────
+    try:
+        text = clean_html_to_text(html)
+    except ValueError as exc:
+        failure = {
+            "doc_id": doc_id,
+            "title": metadata.get("title", ""),
+            "num_dieu": 0,
+            "reason": "html_parse_error",
+            "error": str(exc),
+            "text_preview": (html or "")[:500],
+        }
+        return [], failure
+
+    # ── Normalise Unicode variations of "Điều" before regex matching ──
+    # Some source documents render the D-with-stroke character using
+    # combining sequences (e.g. D + combining stroke) or use the
+    # lowercase đ throughout.  We canonicalise all forms so that the
+    # regex reliably finds every article boundary.
+    text = _normalise_dieu_forms(text)
+
+    # ── Locate Điều boundaries ─────────────────────────────────────
     boundaries = locate_dieu_boundaries(text)
-    
-    # Documents without formal article markers are out of scope for article-level
-    # retrieval. Drop them instead of emitting a document-level fallback row.
+
+    # Documents without formal article markers are out of scope for
+    # article-level retrieval.  Drop them instead of emitting a
+    # document-level fallback row.
     if len(boundaries) == 0:
         text = text.strip()
         reason = (
@@ -265,11 +323,11 @@ def parse_document(doc_id, html: str, metadata: Dict) -> Tuple[List[Dict], Optio
             "title": metadata.get("title", ""),
             "num_dieu": 0,
             "reason": reason,
-            "text_preview": text[:500]
+            "text_preview": text[:500],
         }
         return [], failure
-    
-    # Assign hierarchy and build article records
+
+    # ── Assign hierarchy and build article records ─────────────────
     articles = assign_hierarchy_context(text, boundaries)
     records = build_article_records(doc_id, articles, metadata)
 
@@ -289,7 +347,7 @@ def parse_document(doc_id, html: str, metadata: Dict) -> Tuple[List[Dict], Optio
                 "title": metadata.get("title", ""),
                 "num_dieu": len(boundaries),
                 "reason": "zero_parsable_dieu_law_like_doc",
-                "text_preview": text[:500]
+                "text_preview": text[:500],
             }
             # Drop records in this case (return no article rows)
             return [], failure
@@ -301,11 +359,46 @@ def parse_document(doc_id, html: str, metadata: Dict) -> Tuple[List[Dict], Optio
             "title": metadata.get("title", ""),
             "num_dieu": 1,
             "reason": "single_dieu_law_like_doc",
-            "text_preview": text[:500]
+            "text_preview": text[:500],
         }
         return records, failure
 
     return records, None
+
+
+def _normalise_dieu_forms(text: str) -> str:
+    """Canonicalise the various Unicode representations of *Điều*.
+
+    Vietnamese legal sources may encode the D-with-stroke character
+    (Đ / đ) in several ways:
+
+    * Precomposed ``Đ`` (U+0110) / ``đ`` (U+0111)
+    * Decomposed ``D`` + combining stroke (U+0044 U+0335) / ``d`` + combining stroke
+    * Plain ASCII ``D`` / ``d`` (rare, typically OCR noise)
+
+    This function collapses all forms to the canonical uppercase ``Điều``
+    at likely article-header positions so the downstream regex works
+    deterministically.
+    """
+    # Normalise Unicode to NFC first so precomposed chars are preferred
+    import unicodedata
+
+    text = unicodedata.normalize("NFC", text)
+
+    # Replace decomposed D/d + combining stroke sequences
+    text = re.sub(r"D\u0335", "Đ", text)
+    text = re.sub(r"d\u0335", "đ", text)
+
+    # At line-start, replace lowercase-đ "điều" with canonical "Điều"
+    # (preserves the rest of the word casing via IGNORECASE in RE_DIEU)
+    text = re.sub(
+        r"(^|\n)(\s*)điều\b",
+        r"\1\2Điều",
+        text,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+
+    return text
 
 
 def main(

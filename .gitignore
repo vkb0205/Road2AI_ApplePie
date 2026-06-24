@@ -10,3 +10,5 @@ data/stage3_chunks.parquet
 data/relationships.jsonl
 data/kg.gpickle
 data/kg_part_*.gpickle
+data/stage6_data
+data/untracked_data
