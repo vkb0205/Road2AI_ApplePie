@@ -8,6 +8,10 @@ plus the post-step ``make_relevant_lists``, so you can see *exactly* what
 flows from one stage to the next when retrieval quality is not what you
 expect.
 
+It also provides :class:`SubQueryTrace` for tracing individual sub-queries
+produced by :class:`retrieval.sub_query_router.SubQueryRouter`, enabling
+per-sub-query debug visibility when decomposition is active.
+
 Design goals
 ------------
 * **No heavy deps.** Pure Python (``time``, ``dataclasses``). Imports &
@@ -43,8 +47,11 @@ from typing import Any, Dict, List, Optional, Sequence
 __all__ = [
     "StageSnapshot",
     "RetrievalTrace",
+    "SubQueryTrace",
+    "RouterDebugLog",
     "snapshot_items",
     "format_trace",
+    "format_sub_query_trace",
 ]
 
 # How many items to keep per stage by default — enough to spot ordering
@@ -287,3 +294,188 @@ class _StageTimer:
     def __exit__(self, exc_type, exc, tb) -> None:
         if self._start is not None:
             self.elapsed_ms = (time.perf_counter() - self._start) * 1000.0
+
+
+# ---------------------------------------------------------------------------
+# Sub-query routing debug structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RouterDebugLog:
+    """Debug record for a single sub-query routing decision.
+
+    This is the debug counterpart to :class:`sub_query_router.RouterFallbackLog`
+    but lives in the debug module (no dependency on the router). It captures
+    the full state of one routing decision so operators can audit why a query
+    was or was not decomposed.
+
+    Attributes
+    ----------
+    original_query:
+        The raw query before cleaning.
+    should_decompose:
+        Whether decomposition was triggered.
+    num_sub_queries:
+        Number of sub-queries after normalisation.
+    sub_queries:
+        Final list of sub-queries (after clean/dedup/truncate).
+    source:
+        ``"llm"`` or ``"rule_fallback"``.
+    raw_llm_output:
+        Raw LLM response (if LLM path was used).
+    fallback_reason:
+        Human-readable reason for fallback (empty string if LLM succeeded).
+    fallback_rule:
+        Which rule triggered in fallback mode (e.g. ``"semicolon_split"``).
+    route_elapsed_ms:
+        Wall-clock time for the routing decision.
+    """
+
+    original_query: str = ""
+    should_decompose: bool = False
+    num_sub_queries: int = 1
+    sub_queries: List[str] = field(default_factory=list)
+    source: str = "rule_fallback"
+    raw_llm_output: Optional[str] = None
+    fallback_reason: str = ""
+    fallback_rule: str = ""
+    route_elapsed_ms: Optional[float] = None
+
+
+@dataclass
+class SubQueryTrace:
+    """Per-sub-query debug trace combining routing info + retrieval stages.
+
+    When sub-query decomposition is active, each sub-query gets its own
+    :class:`SubQueryTrace` so operators can see:
+
+    - What the original query was and which sub-query index this is.
+    - The router decision that produced it.
+    - The retrieval trace for this sub-query (stages 1–7 + output),
+      identical in format to a normal single-query trace.
+
+    Attributes
+    ----------
+    original_query:
+        The original un-decomposed query.
+    sub_query_text:
+        The text of this specific sub-query.
+    sub_query_index:
+        0-based index of this sub-query in the decomposition list.
+    num_sub_queries:
+        Total number of sub-queries produced.
+    route_decision:
+        Snapshot of the routing decision that led here.
+    retrieval_trace:
+        The :class:`RetrievalTrace` for this sub-query (same format as a
+        single-query trace). ``None`` if the retriever hasn't been run yet.
+    final_hits:
+        The final :class:`Hit` list for this sub-query. Empty before retrieval.
+    relevant_docs:
+        ``relevant_docs`` output for this sub-query.
+    relevant_articles:
+        ``relevant_articles`` output for this sub-query.
+    total_elapsed_ms:
+        Total wall-clock time for routing + retrieval for this sub-query.
+    """
+
+    original_query: str = ""
+    sub_query_text: str = ""
+    sub_query_index: int = 0
+    num_sub_queries: int = 1
+    route_decision: Optional[RouterDebugLog] = None
+    retrieval_trace: Optional[RetrievalTrace] = None
+    final_hits: List[Dict[str, Any]] = field(default_factory=list)
+    relevant_docs: List[str] = field(default_factory=list)
+    relevant_articles: List[str] = field(default_factory=list)
+    total_elapsed_ms: Optional[float] = None
+
+
+# ---------------------------------------------------------------------------
+# Sub-query trace formatting
+# ---------------------------------------------------------------------------
+
+
+def format_sub_query_trace(
+    traces: Sequence[SubQueryTrace],
+    *,
+    top_n: int = DEFAULT_TOP_N,
+) -> str:
+    """Render a list of :class:`SubQueryTrace` as a readable, indented string.
+
+    Use this to inspect a full decomposition run: each sub-query gets its own
+    block with the route decision header followed by the familiar per-stage
+    retrieval trace.
+
+    Parameters
+    ----------
+    traces:
+        One :class:`SubQueryTrace` per sub-query (length ≥ 1).
+    top_n:
+        How many top items to show per stage.
+
+    Returns
+    -------
+    str
+        Readable multi-block debug string.
+    """
+    if not traces:
+        return "(empty sub-query trace list)"
+
+    lines: List[str] = []
+    lines.append("=" * 78)
+    lines.append(
+        f"SUB-QUERY DECOMPOSITION TRACE  "
+        f"original_query={traces[0].original_query!r}"
+    )
+    lines.append(f"num_sub_queries={len(traces)}")
+    lines.append("=" * 78)
+
+    for t in traces:
+        lines.append("")
+        lines.append("-" * 78)
+        header = (
+            f"  sub-query [{t.sub_query_index}/{t.num_sub_queries - 1}]  "
+            f"text={t.sub_query_text!r}"
+        )
+        lines.append(header)
+
+        # --- Route decision header ---
+        rd = t.route_decision
+        if rd is not None:
+            lines.append(f"  route_source: {rd.source}")
+            lines.append(f"  should_decompose: {rd.should_decompose}")
+            if rd.fallback_reason:
+                lines.append(f"  fallback_reason: {rd.fallback_reason}")
+            if rd.fallback_rule:
+                lines.append(f"  fallback_rule: {rd.fallback_rule}")
+            if rd.route_elapsed_ms is not None:
+                lines.append(f"  route_elapsed: {rd.route_elapsed_ms:.2f}ms")
+
+        # --- Relevant outputs ---
+        if t.relevant_docs:
+            lines.append(f"  relevant_docs ({len(t.relevant_docs)}):")
+            for d in t.relevant_docs[:top_n]:
+                lines.append(f"    {d}")
+        if t.relevant_articles:
+            lines.append(f"  relevant_articles ({len(t.relevant_articles)}):")
+            for a in t.relevant_articles[:top_n]:
+                lines.append(f"    {a}")
+
+        if t.total_elapsed_ms is not None:
+            lines.append(f"  total: {t.total_elapsed_ms:.2f}ms")
+
+        # --- Nested retrieval trace ---
+        if t.retrieval_trace is not None:
+            # Indent the inner trace by 2 spaces for visual nesting.
+            inner = format_trace(t.retrieval_trace, top_n=top_n)
+            for inner_line in inner.split("\n"):
+                lines.append(f"  {inner_line}")
+        else:
+            lines.append("  (no retrieval trace — retriever not run yet)")
+
+    lines.append("")
+    lines.append("=" * 78)
+    lines.append(f"end sub-query trace  ({len(traces)} sub-queries)")
+    return "\n".join(lines)
