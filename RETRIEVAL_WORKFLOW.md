@@ -201,6 +201,9 @@ the F2 article score stays clean.
 | `rerank_model` | `BAAI/bge-reranker-v2-m3` | cross-encoder model id |
 | `rerank_max_input_chars` | `2000` | per-pair text truncation |
 | `seed` | `42` | deterministic RNG tiebreak in RRF |
+| `debug` | `False` | record a per-stage `RetrievalTrace` on `last_trace` |
+| `debug_top_n` | `8` | items kept per stage in the trace's `top_items` |
+| `debug_print` | `False` | also `print()` the formatted trace at the end of `retrieve()` |
 
 ---
 
@@ -253,7 +256,78 @@ FTS5 BM25 (top 50) → RRF (single-list, no-op fuse) → graph expand (top 50)
 
 ---
 
-## 8. Cross-references
+## 8. Debug / explainability — `RetrievalTrace`
+
+When retrieval quality is not what you expect, you want to see *what each
+stage produced*, not just the final hits. The retriever records an opt-in
+per-stage trace via [`src/retrieval/debug.py`](src/retrieval/debug.py).
+
+### How to turn it on
+
+Two equivalent ways — either is zero-overhead when off:
+
+```python
+# (a) flag on the config — every retrieve() call is traced
+cfg = RetrievalConfig(use_dense=False, use_reranker=False, debug=True, debug_print=True)
+r = HybridRetriever(fts, config=cfg)
+r.retrieve("đăng ký doanh nghiệp", fetch_text=True)
+
+# (b) one-off — force debug on for a single call, then restore the flags
+r.debug_retrieve("đăng ký doanh nghiệp", fetch_text=True, print_trace=True)
+```
+
+The trace lands on `r.last_trace` (a [`RetrievalTrace`](src/retrieval/debug.py)),
+and `r.last_trace_formatted` renders it as a readable string.
+
+### What each stage records
+
+[`retrieve()`](src/retrieval/retriever.py:211) appends one
+[`StageSnapshot`](src/retrieval/debug.py) per stage, in pipeline order:
+
+| Stage `name` | `count` | `top_items` (top-N with legal metadata) | key `diagnostics` |
+|---|---|---|---|
+| `lexical` | FTS hits | `bm25_score` + `law_id\|ten\|dieu` | — |
+| `dense` | dense hits | `dense_score` + meta | — |
+| `rrf` | fused candidates | `rrf_score` + meta | `rankings_in`, `k`, `fused_top` |
+| `graph` | expanded candidates | `score` + `source` + meta | `source_counts` (candidate/doc_expand/concept_expand) |
+| `fetch` | resolved metadata rows | meta + `chunk_id`/`doc_uid` | `requested`, `resolved`, **`missing_rows`**, `text_fetched` |
+| `rerank` | post-rerank order | `rerank_score` + meta | `candidates_in`, `model`, `reranker_unavailable` |
+| `final` | top-K hits | final `Hit` fields | `final_top_k` |
+| `output` | top-K hits | — | `relevant_docs`, `relevant_articles` |
+
+Every stage also carries:
+- **`elapsed_ms`** — wall-clock time (or `None` when skipped before work).
+- **`skip`** — a human-readable reason when a stage is off or degrades
+  (e.g. `"use_dense=False"`, `"no graph_expander"`,
+  `"reranker deps unavailable → kept pre-rerank order"`). This distinguishes
+  *a stage was disabled* from *a stage ran but found nothing* (count=0, skip=None).
+
+The single most useful silent-failure signal is the fetch stage's
+`missing_rows`: any `row_idx` that survives RRF/graph but cannot be resolved
+from the canonical `chunks` table is dropped silently — and that is exactly
+the kind of leak that tanks the F2 article score without any other symptom.
+
+### Design invariants
+
+| Invariant | Enforced by |
+|---|---|
+| **Zero overhead when `debug=False`** — the trace is never constructed, no snapshot dicts allocated on the hot path (PLAN 7.5 acceptance path untouched) | [`retrieve()`](src/retrieval/retriever.py:211) gates all trace code behind `if trace is not None` |
+| Debug-on and debug-off produce **identical hits** | covered by `test_debug_off_and_on_produce_same_hits` |
+| `debug_retrieve()` restores the config flags afterward | covered by `test_debug_retrieve_restores_config_and_prints` |
+| No heavy deps in the debug module | [`debug.py`](src/retrieval/debug.py) imports only `time` + `dataclasses` |
+| Reusable by the advanced notebook's `AdvancedHybridRetriever` | same `RetrievalTrace`/`StageSnapshot`/`format_trace` helpers ([§5b](notebooks/retrieval_colab_advanced.ipynb)) |
+
+### Advanced retriever (notebook) trace
+
+The Colab notebook's multi-query `AdvancedHybridRetriever` layers its own
+stages on top and supports `explain=True`, recording a trace with stages
+`variants → legs → weighted_rrf → graph → fetch → rerank → article_agg →
+final → output` on `advanced_retriever.last_trace`. See the **5b.
+Explainability** section of [`retrieval_colab_advanced.ipynb`](notebooks/retrieval_colab_advanced.ipynb).
+
+---
+
+## 9. Cross-references
 
 - **Spec**: [`G-LRAG_SPECIFICATIONS.md`](G-LRAG_SPECIFICATIONS.md:1) §10
   *Retrieval Specification* (RRF formula §10.3, graph expansion edges §10.4).

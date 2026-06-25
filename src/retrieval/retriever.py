@@ -32,17 +32,26 @@ Design constraints (from PLAN.md §7 + artifacts_guide.md)
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from retrieval.rrf import rrf_fuse
 from retrieval.graph_expand import GraphExpander
+from retrieval.debug import (
+    RetrievalTrace,
+    StageSnapshot,
+    snapshot_items,
+    format_trace as _format_trace,
+)
 
 __all__ = [
     "HybridRetriever",
     "RetrievalConfig",
     "Hit",
     "make_relevant_lists",
+    "RetrievalTrace",
+    "StageSnapshot",
 ]
 
 
@@ -66,6 +75,18 @@ class RetrievalConfig:
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     rerank_max_input_chars: int = 2000
     seed: int = 42
+
+    # ---- Debug / observability (Stage 7 add-on) -------------------------
+    # When True, retrieve() records a per-stage RetrievalTrace on
+    # ``self.last_trace`` and per-stage wall-clock timings. Zero overhead
+    # when False — the trace is never constructed and no snapshot dicts are
+    # allocated on the hot path (PLAN 7.5 acceptance path is untouched).
+    debug: bool = False
+    # How many top items to keep per stage in the trace's ``top_items``.
+    debug_top_n: int = 8
+    # When True and debug is on, also print the formatted trace to stdout at
+    # the end of retrieve() (handy for notebooks / one-off debugging).
+    debug_print: bool = False
 
 
 @dataclass
@@ -180,6 +201,9 @@ class HybridRetriever:
         # (especially the 20-question dev batch in the notebook). See _rerank().
         self._reranker: Any = None
         self._reranker_unavailable: bool = False
+        # Debug trace from the most recent retrieve() call. ``None`` until
+        # a retrieve() runs with config.debug=True (or debug_retrieve()).
+        self.last_trace: Optional[RetrievalTrace] = None
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -194,15 +218,76 @@ class HybridRetriever:
         When ``use_dense`` is False the dense leg is skipped (CPU baseline).
         When ``use_reranker`` is False the cross-encoder step is skipped and
         the post-expansion RRF scores are used directly.
+
+        When ``config.debug`` is True, a :class:`RetrievalTrace` capturing one
+        :class:`StageSnapshot` per stage (counts, top-N items with legal
+        metadata, per-stage timing, skip reasons, fetch-stage missing rows)
+        is stored on ``self.last_trace``. The trace has **zero overhead** when
+        debug is False — it is never constructed on that path.
         """
         cfg = self.config
+        trace: Optional[RetrievalTrace] = None
+        t_start: Optional[float] = None
+        if cfg.debug:
+            trace = RetrievalTrace(
+                query=query,
+                config={
+                    "use_dense": cfg.use_dense,
+                    "use_reranker": cfg.use_reranker,
+                    "graph_expander": self.graph_expander is not None,
+                    "top_bm25": cfg.top_bm25,
+                    "top_dense": cfg.top_dense,
+                    "fused_top": cfg.fused_top,
+                    "expanded_top": cfg.expanded_top,
+                    "final_top_k": cfg.final_top_k,
+                    "rrf_k": cfg.rrf_k,
+                    "seed": cfg.seed,
+                },
+            )
+            t_start = time.perf_counter()
 
         # ---- 1. lexical leg ------------------------------------------------
-        lexical_hits = self._lexical_leg(query, cfg.top_bm25)
+        if trace is not None:
+            t0 = time.perf_counter()
+            lexical_hits = self._lexical_leg(query, cfg.top_bm25)
+            ms = (time.perf_counter() - t0) * 1000.0
+            trace.add(StageSnapshot(
+                name="lexical",
+                count=len(lexical_hits),
+                top_items=snapshot_items(
+                    lexical_hits, cfg.debug_top_n,
+                    score_key="bm25_score",
+                    extra_keys=("law_id", "ten_van_ban", "dieu_so"),
+                ),
+                elapsed_ms=ms,
+                skip=None if lexical_hits else "no lexical hits",
+            ))
+        else:
+            lexical_hits = self._lexical_leg(query, cfg.top_bm25)
 
         # ---- 2. dense leg (optional) --------------------------------------
         dense_hits: List[Dict[str, Any]] = []
-        if cfg.use_dense and self.faiss_index is not None:
+        if trace is not None:
+            t0 = time.perf_counter()
+            if cfg.use_dense and self.faiss_index is not None:
+                dense_hits = self._dense_leg(query, cfg.top_dense)
+            ms = (time.perf_counter() - t0) * 1000.0
+            skip = None
+            if not (cfg.use_dense and self.faiss_index is not None):
+                skip = ("use_dense=False" if not cfg.use_dense
+                        else "no faiss_index")
+            trace.add(StageSnapshot(
+                name="dense",
+                count=len(dense_hits),
+                top_items=snapshot_items(
+                    dense_hits, cfg.debug_top_n,
+                    score_key="dense_score",
+                    extra_keys=("law_id", "ten_van_ban", "dieu_so"),
+                ),
+                elapsed_ms=ms,
+                skip=skip,
+            ))
+        elif cfg.use_dense and self.faiss_index is not None:
             dense_hits = self._dense_leg(query, cfg.top_dense)
 
         # ---- 3. RRF fusion -------------------------------------------------
@@ -211,19 +296,85 @@ class HybridRetriever:
             rankings.append(lexical_hits)
         if dense_hits:
             rankings.append(dense_hits)
-        fused = rrf_fuse(
-            rankings, k=cfg.rrf_k, fused_top=cfg.fused_top, seed=cfg.seed
-        ) if rankings else []
+        if trace is not None:
+            t0 = time.perf_counter()
+            fused = rrf_fuse(
+                rankings, k=cfg.rrf_k, fused_top=cfg.fused_top, seed=cfg.seed
+            ) if rankings else []
+            ms = (time.perf_counter() - t0) * 1000.0
+            # Backfill rrf_score into each fused item for uniform printing.
+            fused_items = [
+                {**f, "score": f["rrf_score"],
+                 **(f.get("payload") or {})}
+                for f in fused
+            ]
+            trace.add(StageSnapshot(
+                name="rrf",
+                count=len(fused),
+                top_items=snapshot_items(
+                    fused_items, cfg.debug_top_n,
+                    score_key="rrf_score",
+                    extra_keys=("law_id", "ten_van_ban", "dieu_so"),
+                ),
+                elapsed_ms=ms,
+                skip="no rankings to fuse" if not rankings else None,
+                diagnostics={"rankings_in": len(rankings),
+                             "k": cfg.rrf_k, "fused_top": cfg.fused_top},
+            ))
+        else:
+            fused = rrf_fuse(
+                rankings, k=cfg.rrf_k, fused_top=cfg.fused_top, seed=cfg.seed
+            ) if rankings else []
 
         # ---- 4. graph expansion (optional) --------------------------------
-        if self.graph_expander is not None and fused:
+        if trace is not None:
+            t0 = time.perf_counter()
+            if self.graph_expander is not None and fused:
+                candidates = [(r["row_idx"], r["rrf_score"]) for r in fused]
+                expanded = self.graph_expander.expand(
+                    candidates, top_n=cfg.expanded_top
+                )
+                expanded_rows = {e["row_idx"]: e for e in expanded}
+            else:
+                expanded = []
+                expanded_rows = {
+                    r["row_idx"]: {
+                        "row_idx": r["row_idx"],
+                        "score": r["rrf_score"],
+                        "source": "fused",
+                    }
+                    for r in fused
+                }
+            ms = (time.perf_counter() - t0) * 1000.0
+            skip = None
+            if self.graph_expander is None:
+                skip = "no graph_expander"
+            elif not fused:
+                skip = "no fused seeds to expand"
+            # Source distribution is the single most useful graph diagnostic.
+            src_counts: Dict[str, int] = {}
+            for e in expanded_rows.values():
+                src_counts[str(e.get("source", "?"))] = \
+                    src_counts.get(str(e.get("source", "?")), 0) + 1
+            trace.add(StageSnapshot(
+                name="graph",
+                count=len(expanded_rows),
+                top_items=snapshot_items(
+                    list(expanded_rows.values()), cfg.debug_top_n,
+                    score_key="score",
+                    extra_keys=("source", "law_id", "ten_van_ban", "dieu_so"),
+                ),
+                elapsed_ms=ms,
+                skip=skip,
+                diagnostics={"expanded_top": cfg.expanded_top,
+                             "source_counts": src_counts},
+            ))
+        elif self.graph_expander is not None and fused:
             candidates = [(r["row_idx"], r["rrf_score"]) for r in fused]
             expanded = self.graph_expander.expand(
                 candidates, top_n=cfg.expanded_top
             )
-            expanded_rows = {
-                e["row_idx"]: e for e in expanded
-            }
+            expanded_rows = {e["row_idx"]: e for e in expanded}
         else:
             expanded_rows = {
                 r["row_idx"]: {
@@ -241,14 +392,87 @@ class HybridRetriever:
 
         # ---- 5. fetch metadata + optional text ----------------------------
         row_idxs = [e["row_idx"] for e in ordered]
-        meta_by_row = self._fetch_meta(row_idxs)
-        text_by_row: Dict[int, str] = {}
-        if fetch_text:
-            text_by_row = self._fetch_text(row_idxs)
+        if trace is not None:
+            t0 = time.perf_counter()
+            meta_by_row = self._fetch_meta(row_idxs)
+            text_by_row: Dict[int, str] = {}
+            if fetch_text:
+                text_by_row = self._fetch_text(row_idxs)
+            ms = (time.perf_counter() - t0) * 1000.0
+            missing = [ri for ri in row_idxs if ri not in meta_by_row]
+            ordered_with_meta = [
+                {**e, **meta_by_row.get(e["row_idx"], {})}
+                for e in ordered
+            ]
+            trace.add(StageSnapshot(
+                name="fetch",
+                count=len(meta_by_row),
+                top_items=snapshot_items(
+                    ordered_with_meta, cfg.debug_top_n,
+                    score_key="score",
+                    extra_keys=("source", "law_id", "ten_van_ban",
+                                "dieu_so", "chunk_id", "doc_uid"),
+                ),
+                elapsed_ms=ms,
+                skip="no candidates to fetch" if not row_idxs else None,
+                diagnostics={
+                    "requested": len(row_idxs),
+                    "resolved": len(meta_by_row),
+                    "missing_rows": missing,
+                    "text_fetched": bool(fetch_text),
+                },
+            ))
+        else:
+            meta_by_row = self._fetch_meta(row_idxs)
+            text_by_row: Dict[int, str] = {}
+            if fetch_text:
+                text_by_row = self._fetch_text(row_idxs)
 
         # ---- 6. rerank (optional) -----------------------------------------
+        pre_rerank_count = len(ordered)
         if cfg.use_reranker and cfg.final_top_k > 0 and ordered:
-            ordered = self._rerank(query, ordered, meta_by_row, text_by_row)
+            if trace is not None:
+                t0 = time.perf_counter()
+                was_unavailable = self._reranker_unavailable
+                ordered = self._rerank(query, ordered, meta_by_row, text_by_row)
+                ms = (time.perf_counter() - t0) * 1000.0
+                skip = None
+                if self._reranker_unavailable:
+                    skip = ("reranker deps unavailable (torch/FlagEmbedding) "
+                            "→ kept pre-rerank order")
+                trace.add(StageSnapshot(
+                    name="rerank",
+                    count=len(ordered),
+                    top_items=snapshot_items(
+                        ordered, cfg.debug_top_n,
+                        score_key="score",
+                        extra_keys=("rerank_score", "source", "law_id",
+                                    "ten_van_ban", "dieu_so"),
+                    ),
+                    elapsed_ms=ms,
+                    skip=skip,
+                    diagnostics={
+                        "candidates_in": pre_rerank_count,
+                        "model": cfg.rerank_model,
+                        "deps_skipped_before": was_unavailable,
+                    },
+                ))
+            else:
+                ordered = self._rerank(query, ordered, meta_by_row, text_by_row)
+        elif trace is not None:
+            trace.add(StageSnapshot(
+                name="rerank",
+                count=pre_rerank_count,
+                top_items=snapshot_items(
+                    ordered, cfg.debug_top_n,
+                    score_key="score",
+                    extra_keys=("source", "law_id", "ten_van_ban", "dieu_so"),
+                ),
+                elapsed_ms=0.0,
+                skip=("use_reranker=False" if not cfg.use_reranker
+                      else "final_top_k<=0" if cfg.final_top_k <= 0
+                      else "no candidates to rerank"),
+            ))
 
         # ---- 7. build final Hit list --------------------------------------
         hits: List[Hit] = []
@@ -268,7 +492,84 @@ class HybridRetriever:
                     chunk_text=text_by_row.get(row_idx, ""),
                 )
             )
+
+        if trace is not None:
+            trace.add(StageSnapshot(
+                name="final",
+                count=len(hits),
+                top_items=[
+                    {
+                        "row_idx": h.row_idx,
+                        "score": h.score,
+                        "source": h.source,
+                        "law_id": h.law_id,
+                        "ten_van_ban": h.ten_van_ban,
+                        "dieu_so": h.dieu_so,
+                        "chunk_id": h.chunk_id,
+                    }
+                    for h in hits[: cfg.debug_top_n]
+                ],
+                elapsed_ms=0.0,
+                diagnostics={"final_top_k": cfg.final_top_k},
+            ))
+            # Post-step: the submission metadata collapse.
+            docs, articles = make_relevant_lists(hits)
+            trace.add(StageSnapshot(
+                name="output",
+                count=len(hits),
+                elapsed_ms=0.0,
+                diagnostics={
+                    "relevant_docs": docs,
+                    "relevant_articles": articles,
+                },
+            ))
+            if t_start is not None:
+                trace.total_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+            self.last_trace = trace
+            if cfg.debug_print:
+                print(_format_trace(trace, top_n=cfg.debug_top_n))
+
         return hits
+
+    @property
+    def last_trace_formatted(self) -> Optional[str]:
+        """Render :attr:`last_trace` as a readable string, or ``None``."""
+        if self.last_trace is None:
+            return None
+        return _format_trace(self.last_trace, top_n=self.config.debug_top_n)
+
+    def debug_retrieve(
+        self,
+        query: str,
+        fetch_text: bool = False,
+        print_trace: bool = True,
+    ) -> List[Hit]:
+        """Run ``retrieve()`` with debug tracing forced on for this one call.
+
+        Temporarily flips ``config.debug`` (and optionally ``debug_print``) on,
+        runs the pipeline, and returns the hits — leaving a populated
+        :attr:`last_trace`. The config flags are restored to their previous
+        values afterwards, so a one-off debug call doesn't permanently change
+        behaviour for subsequent normal ``retrieve()`` calls.
+
+        Parameters
+        ----------
+        query, fetch_text:
+            Forwarded to :meth:`retrieve`.
+        print_trace:
+            If True (default), print the formatted trace to stdout after the
+            run — handy in a notebook. Set False to inspect
+            ``self.last_trace`` / :attr:`last_trace_formatted` quietly.
+        """
+        prev_debug = self.config.debug
+        prev_print = self.config.debug_print
+        self.config.debug = True
+        self.config.debug_print = bool(print_trace)
+        try:
+            return self.retrieve(query, fetch_text=fetch_text)
+        finally:
+            self.config.debug = prev_debug
+            self.config.debug_print = prev_print
 
     # ------------------------------------------------------------------ #
     # Legs

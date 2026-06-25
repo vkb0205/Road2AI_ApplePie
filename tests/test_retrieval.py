@@ -43,7 +43,10 @@ from retrieval.retriever import (  # noqa: E402
     RetrievalConfig,
     Hit,
     make_relevant_lists,
+    RetrievalTrace,
+    StageSnapshot,
 )
+from retrieval.debug import snapshot_items, format_trace  # noqa: E402
 from dev_set.eval import f2_macro, f2_single, f2_from_answers  # noqa: E402
 
 DEV_SET = ROOT / "dev_set"
@@ -343,3 +346,175 @@ class TestFTSIndexRealBundle:
             assert len(rows) == len(idxs)
             assert all("chunk_text" in r for r in rows)
             assert [r["row_idx"] for r in rows] == idxs  # order preserved
+
+
+# ============================ Debug tracing ============================ #
+
+
+class _MockFTS:
+    """Tiny in-memory FTS stand-in for debug-trace unit tests (no DB needed).
+
+    Mimics the FTSIndex.search / fetch_chunks contract the retriever uses:
+    search -> list[dict] with row_idx + metadata; fetch_chunks -> list[dict]
+    with chunk_text. Kept here so the trace tests run on a CPU-only machine
+    without the Stage-6 bundle.
+    """
+
+    def __init__(self, rows):
+        # rows: list[dict] with row_idx + meta + chunk_text
+        self._by_idx = {int(r["row_idx"]): r for r in rows}
+
+    def search(self, query, top_k=50):
+        # Return rows in stored order, capped; ensure row_idx present.
+        out = []
+        for r in list(self._by_idx.values())[:top_k]:
+            d = {k: v for k, v in r.items() if k != "chunk_text"}
+            d["bm25_score"] = float(d.get("bm25_score", -10.0 - len(out)))
+            out.append(d)
+        return out
+
+    def fetch_chunks(self, row_idxs):
+        return [self._by_idx[int(i)] for i in row_idxs if int(i) in self._by_idx]
+
+    @property
+    def n_rows(self):
+        return len(self._by_idx)
+
+
+def _mock_rows():
+    return [
+        {"row_idx": 0, "chunk_id": "c0", "doc_uid": "u0",
+         "law_id": "L1", "ten_van_ban": "T1", "dieu_so": "Điều 5",
+         "chunk_text": "đăng ký doanh nghiệp phải nộp hồ sơ"},
+        {"row_idx": 1, "chunk_id": "c1", "doc_uid": "u1",
+         "law_id": "L2", "ten_van_ban": "T2", "dieu_so": "Điều 9",
+         "chunk_text": "thuế giá trị gia tăng"},
+        {"row_idx": 2, "chunk_id": "c2", "doc_uid": "u2",
+         "law_id": "L1", "ten_van_ban": "T1", "dieu_so": "Điều 7",
+         "chunk_text": "doanh nghiệp nhỏ và vừa được hỗ trợ"},
+    ]
+
+
+class TestDebugHelpers:
+    def test_snapshot_items_normalises_score_and_keeps_meta(self):
+        items = [
+            {"row_idx": 7, "bm25_score": -3.1, "law_id": "L", "ten_van_ban": "T",
+             "dieu_so": "Điều 1"},
+            {"row_idx": 3, "bm25_score": -4.2, "law_id": "L2", "ten_van_ban": "T2",
+             "dieu_so": "Điều 2"},
+        ]
+        snap = snapshot_items(items, top_n=5, score_key="bm25_score",
+                              extra_keys=("law_id", "ten_van_ban", "dieu_so"))
+        assert len(snap) == 2
+        assert snap[0] == {"row_idx": 7, "score": -3.1, "law_id": "L",
+                           "ten_van_ban": "T", "dieu_so": "Điều 1"}
+
+    def test_snapshot_items_skips_no_row_idx(self):
+        items = [{"bm25_score": 1.0}, {"row_idx": 1, "bm25_score": 2.0}]
+        snap = snapshot_items(items, top_n=5, score_key="bm25_score")
+        assert len(snap) == 1 and snap[0]["row_idx"] == 1
+
+    def test_snapshot_items_top_n_truncates(self):
+        items = [{"row_idx": i, "bm25_score": -i} for i in range(20)]
+        assert len(snapshot_items(items, top_n=3, score_key="bm25_score")) == 3
+
+    def test_snapshot_items_falls_back_to_score_key(self):
+        # When the named score key is absent, fall back to generic "score".
+        items = [{"row_idx": 1, "score": 0.5}]
+        snap = snapshot_items(items, top_n=5, score_key="bm25_score")
+        assert snap[0]["score"] == 0.5
+
+    def test_format_trace_empty(self):
+        assert format_trace(RetrievalTrace()) == "(empty retrieval trace)"
+
+    def test_format_trace_renders_skip_and_items(self):
+        trace = RetrievalTrace(query="q", config={"use_dense": False})
+        trace.add(StageSnapshot(name="lexical", count=2,
+                                top_items=[{"row_idx": 0, "score": 1.0,
+                                            "law_id": "L", "ten_van_ban": "T",
+                                            "dieu_so": "Điều 1"}],
+                                elapsed_ms=1.2))
+        trace.add(StageSnapshot(name="dense", count=0, skip="use_dense=False"))
+        trace.total_elapsed_ms = 5.0
+        out = format_trace(trace)
+        assert "query='q'" in out
+        assert "[lexical]" in out and "count=2" in out
+        assert "skipped: use_dense=False" in out
+        assert "Điều 1" in out
+        assert "total:" in out
+
+
+class TestRetrieverDebugTrace:
+    def _retriever(self, debug=True):
+        cfg = RetrievalConfig(use_dense=False, use_reranker=False, top_bm25=50,
+                              debug=debug, debug_print=False, debug_top_n=2)
+        return HybridRetriever(_MockFTS(_mock_rows()), faiss_index=None,
+                               graph_expander=None, config=cfg)
+
+    def test_debug_off_leaves_last_trace_none(self):
+        r = self._retriever(debug=False)
+        hits = r.retrieve("doanh nghiệp", fetch_text=False)
+        assert len(hits) >= 1
+        assert r.last_trace is None  # zero-overhead path: no trace built
+
+    def test_debug_on_populates_last_trace_with_all_stages(self):
+        r = self._retriever(debug=True)
+        r.retrieve("doanh nghiệp", fetch_text=True)
+        assert r.last_trace is not None
+        names = [s.name for s in r.last_trace.stages]
+        # The base retriever records these 8 stages in order.
+        assert names == ["lexical", "dense", "rrf", "graph", "fetch",
+                         "rerank", "final", "output"]
+
+    def test_debug_skips_record_reason(self):
+        r = self._retriever(debug=True)
+        r.retrieve("doanh nghiệp", fetch_text=True)
+        t = r.last_trace
+        assert t.stage("dense").skip == "use_dense=False"
+        assert t.stage("graph").skip == "no graph_expander"
+        assert t.stage("rerank").skip == "use_reranker=False"
+
+    def test_debug_fetch_records_missing_rows_when_present(self):
+        # Build a retriever whose FTS resolves only some rows, then a fetch
+        # stage that can't find others -> missing_rows must be captured.
+        class PartialFTS(_MockFTS):
+            def fetch_chunks(self, row_idxs):
+                # Only resolve row_idx 0; drop the rest.
+                return [self._by_idx[int(i)] for i in row_idxs if int(i) == 0]
+
+        cfg = RetrievalConfig(use_dense=False, use_reranker=False, debug=True,
+                              debug_print=False, debug_top_n=2)
+        r = HybridRetriever(PartialFTS(_mock_rows()), config=cfg)
+        r.retrieve("doanh nghiệp", fetch_text=False)
+        fetch = r.last_trace.stage("fetch")
+        assert fetch.diagnostics["missing_rows"], "expected unresolved rows"
+        assert fetch.diagnostics["resolved"] == 1
+
+    def test_debug_output_stage_carries_relevant_articles(self):
+        r = self._retriever(debug=True)
+        r.retrieve("doanh nghiệp", fetch_text=False)
+        out = r.last_trace.stage("output")
+        articles = out.diagnostics["relevant_articles"]
+        # mock rows have Điều 5/9/7, so at least one article survives.
+        assert any("|Điều " in a for a in articles)
+
+    def test_debug_retrieve_restores_config_and_prints(self, capsys):
+        r = self._retriever(debug=False)
+        assert r.config.debug is False
+        r.debug_retrieve("doanh nghiệp", fetch_text=False, print_trace=True)
+        captured = capsys.readouterr()
+        # print_trace=True must have printed the trace header.
+        assert "RETRIEVAL TRACE" in captured.out
+        # config must be restored after the one-off debug call.
+        assert r.config.debug is False
+        assert r.last_trace is not None  # but the trace was captured
+
+    def test_debug_off_and_on_produce_same_hits(self):
+        r_off = self._retriever(debug=False)
+        r_on = self._retriever(debug=True)
+        h_off = r_off.retrieve("doanh nghiệp", fetch_text=False)
+        h_on = r_on.retrieve("doanh nghiệp", fetch_text=False)
+        # The debug path must not change retrieval results.
+        assert [h.row_idx for h in h_off] == [h.row_idx for h in h_on]
+        assert [h.score for h in h_off] == pytest.approx(
+            [h.score for h in h_on])
