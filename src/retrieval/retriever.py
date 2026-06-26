@@ -675,19 +675,49 @@ class HybridRetriever:
         # risk on a 12 GB Colab instance running the 20-question dev batch).
         # Cached reuse keeps identical outputs (same model, fp16, compute_score).
         #
-        # The load itself can raise OSError/EnvironmentError when the HF cache
-        # is partial/corrupt (e.g. a local dir exists for the model id but is
-        # missing pytorch_model.bin) or the hub is unreachable. Degrade to the
-        # pre-rerank order rather than crashing the whole batch — same contract
-        # as the import-unavailable path above.
+        # The load can raise OSError/EnvironmentError when the HF cache is
+        # partial/corrupt (a local snapshot dir exists but is missing the weight
+        # file — e.g. an interrupted download, or "Not enough free disk space"
+        # mid-download) or the hub is unreachable. Self-heal: clear the partial
+        # cache snapshot, re-download once via snapshot_download, then retry the
+        # load. Only if the retry also fails do we degrade to pre-rerank order —
+        # same contract as the import-unavailable path, but the reranker is NOT
+        # silently dropped on a transient partial-cache.
         if self._reranker is None:
             try:
                 self._reranker = FlagReranker(cfg.rerank_model, use_fp16=True)
             except Exception as e:
-                print(f"[rerank] could not load {cfg.rerank_model}: {e!r}; "
-                      f"skipping rerank (pre-rerank order kept)")
-                self._reranker_unavailable = True
-                return ordered
+                print(f"[rerank] first load of {cfg.rerank_model} failed: {e!r}; "
+                      f"attempting cache repair + retry")
+                try:
+                    import os
+                    import shutil
+                    from huggingface_hub import snapshot_download
+                    # Wipe the partial snapshot so a clean re-download isn't
+                    # blocked by a half-written blob/refs dir.
+                    _snap = os.path.join(
+                        os.environ.get("HUGGINGFACE_HUB_CACHE",
+                                       os.path.join(os.path.expanduser("~"),
+                                                    ".cache", "huggingface",
+                                                    "hub")),
+                        "models--" + cfg.rerank_model.replace("/", "--"))
+                    if os.path.isdir(_snap):
+                        shutil.rmtree(_snap, ignore_errors=True)
+                        print(f"[rerank] cleared partial cache {_snap}")
+                    _rp = snapshot_download(
+                        cfg.rerank_model,
+                        allow_patterns=["*.json", "*.txt", "*.safetensors",
+                                        "pytorch_model.bin", "tokenizer*",
+                                        "*.model"],
+                    )
+                    print(f"[rerank] re-downloaded snapshot -> {_rp}")
+                    self._reranker = FlagReranker(cfg.rerank_model, use_fp16=True)
+                    print(f"[rerank] retry load of {cfg.rerank_model} succeeded")
+                except Exception as e2:
+                    print(f"[rerank] retry also failed: {e2!r}; "
+                          f"skipping rerank (pre-rerank order kept)")
+                    self._reranker_unavailable = True
+                    return ordered
         reranker = self._reranker
 
         pairs: List[Tuple[str, str]] = []
