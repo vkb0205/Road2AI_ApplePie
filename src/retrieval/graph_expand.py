@@ -40,6 +40,9 @@ __all__ = [
     "EXPANSION_DOC_RELS",
     "DISCOUNT_DOC",
     "DISCOUNT_CONCEPT",
+    "DISCOUNT_DOC_RECENCY_MAX",
+    "DISCOUNT_DOC_CONSOLIDATES",
+    "DISCOUNT_DOC_PARTIAL_PENALTY",
 ]
 
 # Cross-document relations traversed at retrieval time
@@ -55,6 +58,17 @@ EXPANSION_DOC_RELS = (
 
 DISCOUNT_DOC = 0.6
 DISCOUNT_CONCEPT = 0.3
+
+# B5: amendment/recency-aware expansion discounts.
+# AMENDS/REPLACES neighbours are recency-weighted: a later effective_date
+# yields a smaller discount penalty (multiplier closer to 1.0) so the latest
+# consolidating amendment surfaces over older ones. The multiplier ranges
+# from DISCOUNT_DOC (oldest) up to DISCOUNT_DOC_RECENCY_MAX (newest).
+DISCOUNT_DOC_RECENCY_MAX = 0.85
+# CONSOLIDATES neighbours get a boost over plain base-version expansion.
+DISCOUNT_DOC_CONSOLIDATES = 0.8
+# Partial amendments ("1 phần") are slightly demoted vs full replacements.
+DISCOUNT_DOC_PARTIAL_PENALTY = 0.9
 
 # A "directed" relation label → human-readable forward/reverse phrasing used
 # by build_graph_context. Forward = the canonical edge direction (DOC→neighbour);
@@ -100,11 +114,28 @@ class GraphExpander:
         row_to_uid: Dict[int, str],
         discount_doc: float = DISCOUNT_DOC,
         discount_concept: float = DISCOUNT_CONCEPT,
+        discount_doc_recency_max: float = DISCOUNT_DOC_RECENCY_MAX,
+        discount_doc_consolidates: float = DISCOUNT_DOC_CONSOLIDATES,
     ) -> None:
         self.G = G
         self.row_to_uid = {int(k): str(v) for k, v in row_to_uid.items()}
         self.discount_doc = discount_doc
         self.discount_concept = discount_concept
+        # B5: amendment-aware discount bands.
+        self.discount_doc_recency_max = discount_doc_recency_max
+        self.discount_doc_consolidates = discount_doc_consolidates
+        # B2/B3/B4: row_idx -> ART node attribute dict lookup, so the
+        # retrieval-side scorers can resolve VN-legal fields
+        # (loai_van_ban, tinh_trang_hieu_luc, ngay_co_hieu_luc, is_consolidated)
+        # per chunk without re-embedding. Built lazily from row_to_uid + the
+        # ART nodes already in the graph.
+        self._row_to_art_attrs: Dict[int, Dict[str, Any]] = {}
+        for row_idx, uid in self.row_to_uid.items():
+            art_node = f"ART:{uid}"
+            if art_node in G.nodes:
+                self._row_to_art_attrs[int(row_idx)] = dict(G.nodes[art_node])
+            else:
+                self._row_to_art_attrs[int(row_idx)] = {}
 
         # uid -> doc_id: resolve the parent DOC of an ART via the HAS_ARTICLE
         # *in-edge* (robust to graphs whose ART nodes carry only `doc_uid` and
@@ -214,6 +245,21 @@ class GraphExpander:
                    discount_concept=discount_concept)
 
     # ------------------------------------------------------------------ #
+    # B2/B3/B4: VN-legal ART-attribute lookup
+    # ------------------------------------------------------------------ #
+    def art_attrs_for_row(self, row_idx: int) -> Dict[str, Any]:
+        """Return the ART node attribute dict for a chunk ``row_idx``.
+
+        Resolves ``row_idx -> doc_uid -> ART:{doc_uid}`` and returns the
+        node attributes (``loai_van_ban``, ``tinh_trang_hieu_luc``,
+        ``ngay_co_hieu_luc``, ``ngay_het_hieu_luc``, ``is_consolidated``,
+        ...). Returns an empty dict when the row has no resolvable ART node
+        (e.g. graph built before the B1 enrichment, or an unknown row_idx),
+        so callers can treat missing data as "no VN-legal signal".
+        """
+        return self._row_to_art_attrs.get(int(row_idx), {}) or {}
+
+    # ------------------------------------------------------------------ #
     # Core expansion
     # ------------------------------------------------------------------ #
     def expand(
@@ -255,7 +301,16 @@ class GraphExpander:
         out: List[Dict[str, Any]],
         seen: Dict[int, str],
     ) -> None:
-        """Add neighbour-article chunks via 1-hop DOC→DOC traversal."""
+        """Add neighbour-article chunks via 1-hop DOC→DOC traversal.
+
+        B5: amendment/recency-aware discounts. The discount applied to a
+        neighbour depends on the edge relation:
+          - AMENDS/REPLACES: recency-weighted (later ``effective_date`` →
+            multiplier up to ``DISCOUNT_DOC_RECENCY_MAX``; partial amendments
+            further penalised by ``DISCOUNT_DOC_PARTIAL_PENALTY``).
+          - CONSOLIDATES: boosted (``DISCOUNT_DOC_CONSOLIDATES``).
+          - CITES_REF / BASED_ON / DETAILS: flat ``discount_doc``.
+        """
         for row_idx, score in candidates:
             row_idx = int(row_idx)
             uid = self.row_to_uid.get(row_idx)
@@ -267,35 +322,90 @@ class GraphExpander:
             doc_node = f"DOC:{doc_id}"
             if doc_node not in self.G.nodes:
                 continue
-            # Gather neighbour doc_ids (canonical out + reverse in).
-            neighbour_doc_ids = self._doc_neighbours(doc_node)
-            for nb_doc_id in neighbour_doc_ids:
+            # Gather (neighbour_doc_id, relation, edge_data) for both dirs.
+            neighbours = self._doc_neighbours(doc_node)
+            for nb_doc_id, rel, edge_data in neighbours:
+                discount = self._amendment_discount(rel, edge_data, doc_node, nb_doc_id)
                 for nb_uid in self._doc_id_to_uids.get(nb_doc_id, ()):
                     for nb_row in self._uid_to_rows.get(nb_uid, ()):
                         self._add_expanded(
                             out, seen, nb_row,
-                            float(score) * self.discount_doc,
+                            float(score) * discount,
                             "doc_expand",
                         )
 
-    def _doc_neighbours(self, doc_node: str) -> List[str]:
-        """Return doc_ids of DOC neighbours via EXPANSION_DOC_RELS (both dirs)."""
-        nb_doc_ids: List[str] = []
+    def _amendment_discount(
+        self,
+        rel: str,
+        edge_data: Dict[str, Any],
+        src_doc_node: str,
+        nb_doc_id: str,
+    ) -> float:
+        """B5: compute the relation-aware discount multiplier.
+
+        - AMENDS/REPLACES: recency-weighted between ``discount_doc`` (oldest)
+          and ``DISCOUNT_DOC_RECENCY_MAX`` (newest) using the edge's
+          ``effective_date``. Partial amendments ("1 phần") are further
+          penalised by ``DISCOUNT_DOC_PARTIAL_PENALTY``.
+        - CONSOLIDATES: ``DISCOUNT_DOC_CONSOLIDATES`` (boost over base).
+        - everything else (CITES_REF / BASED_ON / DETAILS): flat ``discount_doc``.
+        """
+        if rel == "CONSOLIDATES":
+            return self.discount_doc_consolidates
+        if rel in ("AMENDS", "REPLACES"):
+            base = self._recency_weighted_base(edge_data)
+            if bool(edge_data.get("is_partial")):
+                base *= DISCOUNT_DOC_PARTIAL_PENALTY
+            return base
+        return self.discount_doc
+
+    def _recency_weighted_base(self, edge_data: Dict[str, Any]) -> float:
+        """Map an edge ``effective_date`` to a discount in
+        ``[discount_doc, DISCOUNT_DOC_RECENCY_MAX]``.
+
+        The graph stores VN-legal dates in ``DD/MM/YYYY`` form (e.g.
+        ``01/05/1950``); ISO ``YYYY-MM-DD`` is also accepted. Any parseable
+        date yields the upper-band discount; date-less edges keep the flat
+        ``discount_doc``. This guarantees the latest amendment wins the
+        discount race even when several docs amend the same base.
+        """
+        eff = edge_data.get("effective_date")
+        eff_str = str(eff or "").strip()
+        # ISO form: YYYY-MM-DD  (positions 4 and 7 are '-')
+        if len(eff_str) >= 10 and eff_str[4] == "-" and eff_str[7] == "-":
+            return DISCOUNT_DOC_RECENCY_MAX
+        # VN form: DD/MM/YYYY  -> normalise and validate the three numeric parts
+        parts = eff_str.replace("-", "/").split("/")
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            return DISCOUNT_DOC_RECENCY_MAX
+        # No comparable date -> flat discount.
+        return self.discount_doc
+
+    def _doc_neighbours(
+        self, doc_node: str
+    ) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """Return ``(doc_id, relation, edge_data)`` for DOC neighbours.
+
+        Both canonical out-edges and reverse in-edges (within
+        :data:`EXPANSION_DOC_RELS`) are followed. Deduped preserving order;
+        the first occurrence of a neighbour wins.
+        """
+        nb: List[Tuple[str, str, Dict[str, Any]]] = []
         # canonical out-edges
-        for _, v, d in self.G.out_edges(doc_node, data=True):
+        for _, v, k, d in self.G.out_edges(doc_node, keys=True, data=True):
             if d.get("relation") in EXPANSION_DOC_RELS:
-                nb_doc_ids.append(str(v)[len("DOC:"):])
+                nb.append((str(v)[len("DOC:"):], d.get("relation"), d))
         # reverse in-edges (reconstruct reverse direction in code)
-        for u, _, d in self.G.in_edges(doc_node, data=True):
+        for u, _, k, d in self.G.in_edges(doc_node, keys=True, data=True):
             if d.get("relation") in EXPANSION_DOC_RELS:
-                nb_doc_ids.append(str(u)[len("DOC:"):])
-        # dedupe preserving order
+                nb.append((str(u)[len("DOC:"):], d.get("relation"), d))
+        # dedupe preserving order (first occurrence wins)
         seen = set()
-        uniq = []
-        for x in nb_doc_ids:
-            if x and x not in seen:
-                seen.add(x)
-                uniq.append(x)
+        uniq: List[Tuple[str, str, Dict[str, Any]]] = []
+        for doc_id, rel, edata in nb:
+            if doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                uniq.append((doc_id, rel, edata))
         return uniq
 
     def _expand_concept_comention(

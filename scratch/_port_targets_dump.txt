@@ -1,0 +1,3156 @@
+
+##############################################################################
+# K cell[3] header/imports
+##############################################################################
+   0| # =========================================================
+
+   1| # 2. LLM QUERY DECOMPOSITION + COMPLEXITY PLANNING
+
+   2| # =========================================================
+
+   3| QUESTION_TYPES = {
+
+   4|     'procedure', 'condition', 'rights_obligations', 'sanction',
+
+   5|     'support_incentive', 'scenario', 'deadline', 'comparison',
+
+   6|     'definition_listing', 'other'
+
+   7| }
+
+   8| COMPLEXITIES = {'simple', 'medium', 'complex'}
+
+   9| 
+
+
+##############################################################################
+# K anchor_plain/_append_unique/_plain_has_any
+##############################################################################
+  10| def anchor_plain(text):
+
+  11|     import unicodedata
+
+  12|     text = unicodedata.normalize('NFD', normalize_text(text).lower())
+
+  13|     text = ''.join(ch for ch in text if unicodedata.category(ch) != 'Mn')
+
+  14|     return text.replace('\u0111', 'd')
+
+  15| 
+
+  16| def _append_unique(values, value):
+
+  17|     value = normalize_text(value)
+
+  18|     if value and value not in values:
+
+  19|         values.append(value)
+
+  20| 
+
+  21| def _plain_has_any(plain, needles):
+
+  22|     return any(needle in plain for needle in needles)
+
+  23| 
+
+  24| 
+
+
+##############################################################################
+# K build_rule_domain_profile + is_generic_atomic + repair + jaccard + dedupe
+##############################################################################
+  25| def build_rule_domain_profile(question, must_terms=None, raw_anchor_terms=None):
+
+  26|     must_terms = must_terms or []
+
+  27|     raw_anchor_terms = raw_anchor_terms or []
+
+  28|     haystack = ' '.join([question] + list(must_terms) + list(raw_anchor_terms))
+
+  29|     plain = anchor_plain(haystack)
+
+  30|     labels, anchors, preferred_law_ids = [], [], []
+
+  31|     preferred_title_terms, negative_title_terms, soft_negative_law_ids = [], [], []
+
+  32| 
+
+  33|     def add_label(label):
+
+  34|         if label not in labels:
+
+  35|             labels.append(label)
+
+  36| 
+
+  37|     def add_anchor(text):
+
+  38|         _append_unique(anchors, text)
+
+  39| 
+
+  40|     def add_pref_law(law_id):
+
+  41|         if law_id not in preferred_law_ids:
+
+  42|             preferred_law_ids.append(law_id)
+
+  43| 
+
+  44|     def add_pref_title(text):
+
+  45|         _append_unique(preferred_title_terms, text)
+
+  46| 
+
+  47|     def add_negative_title(text):
+
+  48|         _append_unique(negative_title_terms, text)
+
+  49| 
+
+  50|     def add_soft_negative_law(law_id):
+
+  51|         if law_id not in soft_negative_law_ids:
+
+  52|             soft_negative_law_ids.append(law_id)
+
+  53| 
+
+  54|     has_copyright = _plain_has_any(plain, [
+
+  55|         'quyen tac gia', 'quyen lien quan', 'phan mem', 'chuong trinh may tinh', 'sao chep',
+
+  56|         'xam pham quyen tac gia'
+
+  57|     ])
+
+  58|     has_industrial = _plain_has_any(plain, ['so huu cong nghiep', 'nhan hieu', 'sang che', 'kieu dang cong nghiep'])
+
+  59|     if has_copyright:
+
+  60|         add_label('copyright_software')
+
+  61|         for term in [
+
+  62|             'quyền tác giả', 'phần mềm', 'sao chép', 'cho thuê',
+
+  63|             'chương trình máy tính', 'xâm phạm quyền tác giả'
+
+  64|         ]:
+
+  65|             if anchor_plain(term) in plain:
+
+  66|                 add_anchor(term)
+
+  67|         add_pref_law('50/2005/QH11')
+
+  68|         add_pref_law('17/2023/NĐ-CP')
+
+  69|         for term in ['quyền tác giả', 'quyền liên quan', 'sở hữu trí tuệ']:
+
+  70|             add_pref_title(term)
+
+  71|         if not has_industrial:
+
+  72|             add_negative_title('sở hữu công nghiệp')
+
+  73|             add_negative_title('giống cây trồng')
+
+  74|             add_soft_negative_law('65/2023/NĐ-CP')
+
+  75|             add_soft_negative_law('99/2013/NĐ-CP')
+
+  76|             add_soft_negative_law('11/2015/TT-BKHCN')
+
+  77| 
+
+  78|     if _plain_has_any(plain, ['hai quan', 'nhap khau', 'kiem soat']):
+
+  79|         add_label('customs_control')
+
+  80|         add_anchor('hải quan')
+
+  81|         add_anchor('kiểm soát')
+
+  82|         add_anchor('nhập khẩu')
+
+  83|         add_pref_law('13/2015/TT-BTC')
+
+  84|         add_pref_law('50/2005/QH11')
+
+  85|         add_pref_title('hải quan')
+
+  86|         add_pref_title('kiểm soát')
+
+  87| 
+
+  88|     if _plain_has_any(plain, ['giam dinh', 'giam dinh vien']):
+
+  89|         add_label('copyright_assessment')
+
+  90|         add_anchor('giám định')
+
+  91|         add_pref_law('15/2012/TT-BVHTTDL')
+
+  92|         add_pref_law('17/2023/NĐ-CP')
+
+  93|         add_pref_law('105/2006/NĐ-CP')
+
+  94|         add_pref_title('giám định quyền tác giả')
+
+  95|         add_negative_title('chuyển giao công nghệ')
+
+  96|         add_negative_title('thương mại')
+
+  97| 
+
+  98|     if _plain_has_any(plain, ['nguoi tieu dung', 'de bi ton thuong']):
+
+  99|         add_label('consumer_protection')
+
+ 100|         add_anchor('người tiêu dùng')
+
+ 101|         add_anchor('dễ bị tổn thương')
+
+ 102|         add_pref_law('19/2023/QH15')
+
+ 103|         add_pref_title('người tiêu dùng')
+
+ 104| 
+
+ 105|     if _plain_has_any(plain, ['doanh nghiep nho va vua', 'dnnvv']) and _plain_has_any(plain, ['dau thau', 'lua chon nha thau']):
+
+ 106|         add_label('small_business_procurement')
+
+ 107|         add_anchor('doanh nghiệp nhỏ và vừa')
+
+ 108|         add_anchor('đấu thầu')
+
+ 109|         add_pref_law('04/2017/QH14')
+
+ 110|         add_pref_law('22/2023/QH15')
+
+ 111|         add_pref_title('hỗ trợ doanh nghiệp nhỏ và vừa')
+
+ 112|         add_pref_title('đấu thầu')
+
+ 113| 
+
+ 114|     for term in raw_anchor_terms:
+
+ 115|         add_anchor(term)
+
+ 116| 
+
+ 117|     return {
+
+ 118|         'labels': labels,
+
+ 119|         'anchor_terms': anchors[:12],
+
+ 120|         'preferred_law_ids': preferred_law_ids[:12],
+
+ 121|         'preferred_title_terms': preferred_title_terms[:12],
+
+ 122|         'negative_title_terms': negative_title_terms[:12],
+
+ 123|         'soft_negative_law_ids': soft_negative_law_ids[:12],
+
+ 124|     }
+
+ 125| 
+
+ 126| def is_generic_atomic_question(text, domain_profile=None):
+
+ 127|     plain = anchor_plain(text)
+
+ 128|     generic_markers = [
+
+ 129|         'tai lieu', 'chung cu', 'ho so', 'don yeu cau', 'hop dong', 'tranh chap', 'xu ly'
+
+ 130|     ]
+
+ 131|     if not _plain_has_any(plain, generic_markers):
+
+ 132|         return False
+
+ 133|     domain_profile = domain_profile or {}
+
+ 134|     anchors = domain_profile.get('anchor_terms', [])
+
+ 135|     return not any(anchor_plain(anchor) in plain for anchor in anchors)
+
+ 136| 
+
+ 137| def repair_generic_atomic_question(text, domain_profile):
+
+ 138|     text = normalize_text(text)
+
+ 139|     if not is_generic_atomic_question(text, domain_profile):
+
+ 140|         return text
+
+ 141|     anchors = [a for a in domain_profile.get('anchor_terms', []) if normalize_text(a)]
+
+ 142|     if not anchors:
+
+ 143|         return text
+
+ 144|     suffix = ' về ' + ', '.join(anchors[:3])
+
+ 145|     if anchor_plain(suffix) in anchor_plain(text):
+
+ 146|         return text
+
+ 147|     if text.endswith('?'):
+
+ 148|         return text[:-1].rstrip() + suffix + '?'
+
+ 149|     return text + suffix
+
+ 150| 
+
+ 151| def lexical_jaccard(a, b):
+
+ 152|     aa = set(tokenize_lexical(a, keep_stopwords=False))
+
+ 153|     bb = set(tokenize_lexical(b, keep_stopwords=False))
+
+ 154|     if not aa or not bb:
+
+ 155|         return 0.0
+
+ 156|     return len(aa & bb) / max(len(aa | bb), 1)
+
+ 157| 
+
+ 158| def atomic_questions_too_similar(items):
+
+ 159|     if len(items) < 2:
+
+ 160|         return False
+
+ 161|     pairs = []
+
+ 162|     for i in range(len(items)):
+
+ 163|         for j in range(i + 1, len(items)):
+
+ 164|             pairs.append(lexical_jaccard(items[i], items[j]))
+
+ 165|     return bool(pairs) and max(pairs) >= 0.62
+
+ 166| 
+
+ 167| def dedupe_atomic_questions(items, max_items=None):
+
+ 168|     out = []
+
+ 169|     for item in items:
+
+ 170|         item = normalize_text(item)
+
+ 171|         if not item:
+
+ 172|             continue
+
+ 173|         if any(normalize_key(item) == normalize_key(x) or lexical_jaccard(item, x) >= 0.78 for x in out):
+
+ 174|             continue
+
+ 175|         out.append(item)
+
+ 176|         if max_items and len(out) >= max_items:
+
+ 177|             break
+
+ 178|     return out
+
+ 179| 
+
+
+##############################################################################
+# K facet_profile + sanitize + build_rule_facet_profiles + build_rule_legal_facets + merge
+##############################################################################
+ 180| def facet_profile(
+
+ 181|     facet_id,
+
+ 182|     label,
+
+ 183|     query,
+
+ 184|     anchor_terms=None,
+
+ 185|     preferred_law_ids=None,
+
+ 186|     preferred_title_terms=None,
+
+ 187|     target_terms=None,
+
+ 188|     negative_terms=None,
+
+ 189|     priority=1.0,
+
+ 190| ):
+
+ 191|     return {
+
+ 192|         'facet_id': str(facet_id),
+
+ 193|         'label': normalize_text(label),
+
+ 194|         'query': normalize_text(query),
+
+ 195|         'anchor_terms': [normalize_text(x) for x in (anchor_terms or []) if normalize_text(x)],
+
+ 196|         'preferred_law_ids': [str(x).strip() for x in (preferred_law_ids or []) if str(x).strip()],
+
+ 197|         'preferred_title_terms': [normalize_text(x) for x in (preferred_title_terms or []) if normalize_text(x)],
+
+ 198|         'target_terms': [normalize_text(x) for x in (target_terms or []) if normalize_text(x)],
+
+ 199|         'negative_terms': [normalize_text(x) for x in (negative_terms or []) if normalize_text(x)],
+
+ 200|         'priority': float(priority),
+
+ 201|     }
+
+ 202| 
+
+ 203| def sanitize_facet_profiles(values, max_items=None):
+
+ 204|     max_items = max_items or max(6, CFG.get('planner_max_atomic', 4))
+
+ 205|     out, seen = [], set()
+
+ 206|     if not isinstance(values, list):
+
+ 207|         return out
+
+ 208|     for raw in values:
+
+ 209|         if not isinstance(raw, dict):
+
+ 210|             continue
+
+ 211|         facet_id = normalize_key(str(raw.get('facet_id') or raw.get('label') or raw.get('query') or 'facet'))
+
+ 212|         facet_id = re.sub(r'[^a-z0-9_]+', '_', facet_id).strip('_')[:64] or 'facet'
+
+ 213|         query = normalize_text(raw.get('query') or raw.get('text') or raw.get('label') or '')
+
+ 214|         label = normalize_text(raw.get('label') or query or facet_id)
+
+ 215|         key = facet_id + '|' + normalize_key(query or label)
+
+ 216|         if not query or key in seen:
+
+ 217|             continue
+
+ 218|         out.append(facet_profile(
+
+ 219|             facet_id=facet_id,
+
+ 220|             label=label,
+
+ 221|             query=query,
+
+ 222|             anchor_terms=sanitize_list_of_strings(raw.get('anchor_terms', []), max_items=8, max_chars=80),
+
+ 223|             preferred_law_ids=sanitize_list_of_strings(raw.get('preferred_law_ids', []), max_items=8, max_chars=40),
+
+ 224|             preferred_title_terms=sanitize_list_of_strings(raw.get('preferred_title_terms', []), max_items=8, max_chars=80),
+
+ 225|             target_terms=sanitize_list_of_strings(raw.get('target_terms', []), max_items=12, max_chars=80),
+
+ 226|             negative_terms=sanitize_list_of_strings(raw.get('negative_terms', []), max_items=8, max_chars=80),
+
+ 227|             priority=float(raw.get('priority', 1.0) or 1.0),
+
+ 228|         ))
+
+ 229|         seen.add(key)
+
+ 230|         if len(out) >= max_items:
+
+ 231|             break
+
+ 232|     return out
+
+ 233| 
+
+ 234| def build_rule_facet_profiles(question, domain_profile):
+
+ 235|     plain = anchor_plain(question)
+
+ 236|     labels = set(domain_profile.get('labels', []))
+
+ 237|     facets = []
+
+ 238| 
+
+ 239|     def add(facet):
+
+ 240|         key = facet['facet_id']
+
+ 241|         if key not in {x['facet_id'] for x in facets}:
+
+ 242|             facets.append(facet)
+
+ 243| 
+
+ 244|     if 'small_business_procurement' in labels:
+
+ 245|         add(facet_profile(
+
+ 246|             'small_business_support',
+
+ 247|             'Ưu đãi hỗ trợ doanh nghiệp nhỏ và vừa',
+
+ 248|             'Ưu đãi, hỗ trợ dành cho doanh nghiệp nhỏ và vừa theo pháp luật hỗ trợ doanh nghiệp nhỏ và vừa?',
+
+ 249|             anchor_terms=['doanh nghiệp nhỏ và vừa', 'ưu đãi', 'hỗ trợ'],
+
+ 250|             preferred_law_ids=['04/2017/QH14'],
+
+ 251|             preferred_title_terms=['hỗ trợ doanh nghiệp nhỏ và vừa'],
+
+ 252|             target_terms=['doanh nghiệp nhỏ và vừa', 'hỗ trợ', 'ưu đãi', 'chính sách hỗ trợ'],
+
+ 253|             negative_terms=['chuyển giao công nghệ', 'thương mại'],
+
+ 254|             priority=1.15,
+
+ 255|         ))
+
+ 256|         add(facet_profile(
+
+ 257|             'procurement_preference',
+
+ 258|             'Ưu đãi trong đấu thầu',
+
+ 259|             'Ưu đãi đối với doanh nghiệp nhỏ và vừa trong lựa chọn nhà thầu, đấu thầu?',
+
+ 260|             anchor_terms=['doanh nghiệp nhỏ và vừa', 'đấu thầu', 'lựa chọn nhà thầu'],
+
+ 261|             preferred_law_ids=['22/2023/QH15'],
+
+ 262|             preferred_title_terms=['đấu thầu'],
+
+ 263|             target_terms=['ưu đãi', 'đấu thầu', 'nhà thầu', 'lựa chọn nhà thầu', 'doanh nghiệp nhỏ và vừa'],
+
+ 264|             negative_terms=['chuyển giao công nghệ', 'thương mại'],
+
+ 265|             priority=1.14,
+
+ 266|         ))
+
+ 267| 
+
+ 268|     if 'copyright_software' in labels:
+
+ 269|         multi_domain = bool(labels & {'customs_control', 'copyright_assessment', 'consumer_protection'})
+
+ 270|         explicit_software = _plain_has_any(plain, ['phan mem', 'chuong trinh may tinh', 'sao chep', 'cho thue'])
+
+ 271|         if (not multi_domain) or explicit_software:
+
+ 272|             add(facet_profile(
+
+ 273|                 'software_property_rights',
+
+ 274|                 'Quyền tài sản với chương trình máy tính',
+
+ 275|                 'Quyền tác giả và quyền tài sản đối với chương trình máy tính, phần mềm được quy định thế nào?',
+
+ 276|                 anchor_terms=['quyền tác giả', 'phần mềm', 'chương trình máy tính'],
+
+ 277|                 preferred_law_ids=['50/2005/QH11'],
+
+ 278|                 preferred_title_terms=['sở hữu trí tuệ', 'quyền tác giả'],
+
+ 279|                 target_terms=['quyền tài sản', 'chương trình máy tính', 'phần mềm', 'sao chép', 'cho thuê'],
+
+ 280|                 negative_terms=['sở hữu công nghiệp', 'nhãn hiệu', 'sáng chế'],
+
+ 281|                 priority=1.12,
+
+ 282|             ))
+
+ 283|             if _plain_has_any(plain, ['sao chep', 'cho thue', 'xam pham']):
+
+ 284|                 add(facet_profile(
+
+ 285|                     'copyright_infringement',
+
+ 286|                     'Hành vi xâm phạm quyền tác giả phần mềm',
+
+ 287|                     'Hành vi sao chép, cho thuê trái phép phần mềm xâm phạm quyền tác giả như thế nào?',
+
+ 288|                     anchor_terms=['quyền tác giả', 'phần mềm', 'sao chép', 'cho thuê'],
+
+ 289|                     preferred_law_ids=['50/2005/QH11'],
+
+ 290|                     preferred_title_terms=['sở hữu trí tuệ', 'quyền tác giả'],
+
+ 291|                     target_terms=['xâm phạm', 'sao chép', 'cho thuê', 'quyền tác giả', 'chương trình máy tính'],
+
+ 292|                     negative_terms=['sở hữu công nghiệp', 'nhãn hiệu', 'sáng chế'],
+
+ 293|                     priority=1.11,
+
+ 294|                 ))
+
+ 295|         if _plain_has_any(plain, ['ton that', 'mat khach hang', 'co hoi kinh doanh', 'thiet hai', 'boi thuong']):
+
+ 296|             add(facet_profile(
+
+ 297|                 'damage_business_opportunity',
+
+ 298|                 'Thiệt hại và cơ hội kinh doanh',
+
+ 299|                 'Cách xác định thiệt hại và tổn thất cơ hội kinh doanh do xâm phạm quyền tác giả phần mềm?',
+
+ 300|                 anchor_terms=['quyền tác giả', 'phần mềm', 'thiệt hại', 'cơ hội kinh doanh'],
+
+ 301|                 preferred_law_ids=['50/2005/QH11', '17/2023/NĐ-CP'],
+
+ 302|                 preferred_title_terms=['sở hữu trí tuệ', 'quyền tác giả'],
+
+ 303|                 target_terms=['thiệt hại', 'tổn thất', 'cơ hội kinh doanh', 'bồi thường', 'mất khách hàng'],
+
+ 304|                 negative_terms=['sở hữu công nghiệp', 'nhãn hiệu', 'sáng chế'],
+
+ 305|                 priority=1.10,
+
+ 306|             ))
+
+ 307|         if _plain_has_any(plain, ['tu bao ve', 'yeu cau xu ly', 'bien phap bao ve', 'xu ly xam pham']):
+
+ 308|             add(facet_profile(
+
+ 309|                 'self_protection_request',
+
+ 310|                 'Quyền tự bảo vệ và yêu cầu xử lý',
+
+ 311|                 'Quyền tự bảo vệ, yêu cầu xử lý xâm phạm và biện pháp bảo vệ quyền sở hữu trí tuệ được quy định thế nào?',
+
+ 312|                 anchor_terms=['quyền tác giả', 'xâm phạm', 'yêu cầu xử lý'],
+
+ 313|                 preferred_law_ids=['50/2005/QH11'],
+
+ 314|                 preferred_title_terms=['sở hữu trí tuệ'],
+
+ 315|                 target_terms=['quyền tự bảo vệ', 'yêu cầu xử lý', 'biện pháp bảo vệ', 'xâm phạm quyền sở hữu trí tuệ'],
+
+ 316|                 negative_terms=['sở hữu công nghiệp', 'nhãn hiệu', 'sáng chế'],
+
+ 317|                 priority=1.08,
+
+ 318|             ))
+
+ 319|         if _plain_has_any(plain, ['tai lieu', 'chung cu', 'don yeu cau', 'xu ly']):
+
+ 320|             add(facet_profile(
+
+ 321|                 'evidence_request_docs',
+
+ 322|                 'Tài liệu chứng cứ yêu cầu xử lý',
+
+ 323|                 'Tài liệu, chứng cứ cần chuẩn bị khi yêu cầu xử lý hành vi xâm phạm quyền tác giả đối với phần mềm?',
+
+ 324|                 anchor_terms=['quyền tác giả', 'phần mềm', 'tài liệu', 'chứng cứ'],
+
+ 325|                 preferred_law_ids=['17/2023/NĐ-CP', '50/2005/QH11'],
+
+ 326|                 preferred_title_terms=['quyền tác giả', 'sở hữu trí tuệ'],
+
+ 327|                 target_terms=['tài liệu', 'chứng cứ', 'đơn yêu cầu', 'yêu cầu xử lý', 'xâm phạm quyền tác giả'],
+
+ 328|                 negative_terms=['sở hữu công nghiệp', 'nhãn hiệu', 'sáng chế'],
+
+ 329|                 priority=1.06,
+
+ 330|             ))
+
+ 331| 
+
+ 332|     if 'customs_control' in labels:
+
+ 333|         add(facet_profile(
+
+ 334|             'customs_financial_guarantee',
+
+ 335|             'Kiểm soát hải quan và bảo đảm tài chính',
+
+ 336|             'Nghĩa vụ bảo đảm tài chính khi yêu cầu hải quan kiểm soát hàng hóa nghi xâm phạm quyền tác giả?',
+
+ 337|             anchor_terms=['hải quan', 'kiểm soát', 'nhập khẩu', 'bảo đảm tài chính'],
+
+ 338|             preferred_law_ids=['13/2015/TT-BTC', '50/2005/QH11'],
+
+ 339|             preferred_title_terms=['hải quan', 'sở hữu trí tuệ'],
+
+ 340|             target_terms=['hải quan', 'kiểm soát', 'hàng hóa', 'bảo đảm tài chính', 'tạm dừng làm thủ tục'],
+
+ 341|             negative_terms=['chuyển giao công nghệ', 'thương mại'],
+
+ 342|             priority=1.16,
+
+ 343|         ))
+
+ 344|     if 'copyright_assessment' in labels:
+
+ 345|         add(facet_profile(
+
+ 346|             'assessment_contract',
+
+ 347|             'Hợp đồng giám định quyền tác giả',
+
+ 348|             'Hợp đồng giám định quyền tác giả, quyền liên quan cần có những nội dung chính nào?',
+
+ 349|             anchor_terms=['giám định', 'hợp đồng giám định', 'quyền tác giả'],
+
+ 350|             preferred_law_ids=['15/2012/TT-BVHTTDL', '17/2023/NĐ-CP', '105/2006/NĐ-CP'],
+
+ 351|             preferred_title_terms=['giám định quyền tác giả', 'quyền tác giả'],
+
+ 352|             target_terms=['giám định', 'hợp đồng giám định', 'giám định viên', 'nội dung hợp đồng'],
+
+ 353|             negative_terms=['chuyển giao công nghệ', 'thương mại'],
+
+ 354|             priority=1.15,
+
+ 355|         ))
+
+ 356|     if 'consumer_protection' in labels:
+
+ 357|         add(facet_profile(
+
+ 358|             'consumer_dispute',
+
+ 359|             'Tranh chấp với người tiêu dùng dễ bị tổn thương',
+
+ 360|             'Trách nhiệm giải quyết tranh chấp khi đối tượng bị xâm phạm là người tiêu dùng dễ bị tổn thương?',
+
+ 361|             anchor_terms=['người tiêu dùng', 'dễ bị tổn thương', 'tranh chấp'],
+
+ 362|             preferred_law_ids=['19/2023/QH15'],
+
+ 363|             preferred_title_terms=['người tiêu dùng'],
+
+ 364|             target_terms=['người tiêu dùng', 'dễ bị tổn thương', 'tranh chấp', 'trách nhiệm'],
+
+ 365|             negative_terms=['chuyển giao công nghệ', 'thương mại'],
+
+ 366|             priority=1.14,
+
+ 367|         ))
+
+ 368| 
+
+ 369|     limit = max(6, CFG.get('planner_max_atomic', 4))
+
+ 370|     return sanitize_facet_profiles(facets, max_items=limit)
+
+ 371| 
+
+ 372| def build_rule_legal_facets(question, domain_profile):
+
+ 373|     return dedupe_atomic_questions(
+
+ 374|         [f.get('query', '') for f in build_rule_facet_profiles(question, domain_profile)],
+
+ 375|         max_items=max(6, CFG.get('planner_max_atomic', 4)),
+
+ 376|     )
+
+ 377| 
+
+ 378| def merge_facet_profiles(rule_facets, raw_facets):
+
+ 379|     out, seen = [], set()
+
+ 380|     for facet in list(rule_facets or []) + list(raw_facets or []):
+
+ 381|         if not isinstance(facet, dict):
+
+ 382|             continue
+
+ 383|         key = facet.get('facet_id', '') + '|' + normalize_key(facet.get('query', ''))
+
+ 384|         if not key.strip('|') or key in seen:
+
+ 385|             continue
+
+ 386|         out.append(facet)
+
+ 387|         seen.add(key)
+
+ 388|     return out[:max(6, CFG.get('planner_max_atomic', 4))]
+
+ 389| 
+
+
+##############################################################################
+# K enrich_query_plan + fallback_must_terms_inline
+##############################################################################
+ 390| def enrich_query_plan(question, plan):
+
+ 391|     plan = dict(plan or {})
+
+ 392|     must_terms = sanitize_list_of_strings(plan.get('must_have_terms', []), max_items=12, max_chars=80)
+
+ 393|     raw_anchors = sanitize_list_of_strings(plan.get('anchor_terms', []), max_items=12, max_chars=80)
+
+ 394|     raw_facets = sanitize_facet_profiles(plan.get('facet_profiles', []), max_items=max(6, CFG.get('planner_max_atomic', 4)))
+
+ 395|     domain_profile = build_rule_domain_profile(question, must_terms=must_terms, raw_anchor_terms=raw_anchors)
+
+ 396|     complexity = plan.get('complexity', 'medium')
+
+ 397|     rule_facet_profiles = build_rule_facet_profiles(question, domain_profile)
+
+ 398|     facet_profiles = merge_facet_profiles(rule_facet_profiles, raw_facets)
+
+ 399|     rule_facets = dedupe_atomic_questions(
+
+ 400|         [f.get('query', '') for f in facet_profiles] + sanitize_list_of_strings(plan.get('legal_facets', []), max_items=6, max_chars=220),
+
+ 401|         max_items=max(6, CFG.get('planner_max_atomic', 4)),
+
+ 402|     )
+
+ 403| 
+
+ 404|     atomic = sanitize_list_of_strings(plan.get('atomic_questions', []), max_items=CFG['planner_max_atomic'], max_chars=240)
+
+ 405|     if complexity == 'simple':
+
+ 406|         atomic = []
+
+ 407|     else:
+
+ 408|         atomic = [repair_generic_atomic_question(item, domain_profile) for item in atomic]
+
+ 409|         labels = set(domain_profile.get('labels', []))
+
+ 410|         force_rule_first = (
+
+ 411|             complexity == 'complex'
+
+ 412|             or 'small_business_procurement' in labels
+
+ 413|             or atomic_questions_too_similar(atomic)
+
+ 414|             or len(rule_facet_profiles) >= 2
+
+ 415|         )
+
+ 416|         if rule_facets and force_rule_first:
+
+ 417|             atomic = dedupe_atomic_questions(rule_facets + atomic, max_items=CFG['planner_max_atomic'])
+
+ 418|         elif rule_facets and len(atomic) < min(2, CFG['planner_max_atomic']):
+
+ 419|             atomic = dedupe_atomic_questions(atomic + rule_facets, max_items=CFG['planner_max_atomic'])
+
+ 420|         else:
+
+ 421|             atomic = dedupe_atomic_questions(atomic, max_items=CFG['planner_max_atomic'])
+
+ 422|         if not atomic and complexity in {'medium', 'complex'}:
+
+ 423|             atomic = dedupe_atomic_questions(rule_facets or [normalize_text(question)], max_items=CFG['planner_max_atomic'])
+
+ 424| 
+
+ 425|     plan['atomic_questions'] = atomic[:CFG['planner_max_atomic']]
+
+ 426|     plan['must_have_terms'] = must_terms or fallback_must_terms_inline(question)
+
+ 427|     plan['anchor_terms'] = domain_profile.get('anchor_terms', [])
+
+ 428|     plan['legal_facets'] = rule_facets
+
+ 429|     plan['facet_profiles'] = facet_profiles
+
+ 430|     plan['domain_profile'] = domain_profile
+
+ 431|     plan['generic_atomic_questions'] = [a for a in atomic if is_generic_atomic_question(a, domain_profile)]
+
+ 432|     return plan
+
+ 433| 
+
+ 434| def fallback_must_terms_inline(question, max_terms=10):
+
+ 435|     toks = tokenize_lexical(question, keep_stopwords=False)
+
+ 436|     seen = []
+
+ 437|     for tok in toks:
+
+ 438|         if tok not in seen:
+
+ 439|             seen.append(tok)
+
+ 440|     return seen[:max_terms]
+
+ 441| 
+
+ 442| 
+
+ 443| SLIDE_REFERENCE_NOTES = {
+
+ 444|     1577: {
+
+ 445|         'label': 'Dễ',
+
+ 446|         'expected': ['16/2012/QH13|Luật Quảng cáo|Điều 17'],
+
+ 447|         'note': '1 văn bản, 1 điều; không cần phân rã, không multi-hop.',
+
+ 448|     },
+
+ 449|     2: {
+
+ 450|         'label': 'Trung bình',
+
+ 451|         'expected': ['04/2017/QH14|Luật Hỗ trợ DNNVV|Điều 13', '22/2023/QH15|Luật Đấu thầu|Điều 10'],
+
+ 452|         'note': 'Cross-doc 2 văn bản: ưu đãi DNNVV + ưu đãi trong đấu thầu.',
+
+ 453|     },
+
+ 454|     1128: {
+
+ 455|         'label': 'Khó',
+
+ 456|         'expected': ['Luật SHTT Điều 20, 22, 28, 198, 204, 205', 'NĐ 17/2023 Điều 66, 73, 75, 76'],
+
+ 457|         'note': '3 yêu cầu: hành vi xâm phạm, tổn thất/cơ hội kinh doanh, tài liệu/chứng cứ xử lý.',
+
+ 458|     },
+
+ 459|     1720: {
+
+ 460|         'label': 'Tình huống thực tế',
+
+ 461|         'expected': ['SHTT', 'kiểm soát hải quan', 'giám định', 'bảo vệ người tiêu dùng'],
+
+ 462|         'note': '4 vế đan xen nhiều lĩnh vực; 3 văn bản, 4 điều.',
+
+ 463|     },
+
+ 464| }
+
+ 465| 
+
+ 466| SMOKE_EXPECTED_ARTICLES = {
+
+ 467|     1577: [('16/2012/QH13', 'Điều 17')],
+
+ 468|     2: [('04/2017/QH14', 'Điều 13'), ('22/2023/QH15', 'Điều 10')],
+
+ 469|     1128: [
+
+ 470|         ('50/2005/QH11', 'Điều 20'), ('50/2005/QH11', 'Điều 22'), ('50/2005/QH11', 'Điều 28'),
+
+ 471|         ('50/2005/QH11', 'Điều 198'), ('50/2005/QH11', 'Điều 204'), ('50/2005/QH11', 'Điều 205'),
+
+ 472|         ('17/2023/NĐ-CP', 'Điều 66'), ('17/2023/NĐ-CP', 'Điều 73'),
+
+ 473|         ('17/2023/NĐ-CP', 'Điều 75'), ('17/2023/NĐ-CP', 'Điều 76'),
+
+ 474|     ],
+
+ 475| }
+
+ 476| 
+
+ 477| SMOKE_EXPECTED_DOMAINS = {
+
+ 478|     1720: {
+
+ 479|         'shtt': ['50/2005/QH11', '17/2023/NĐ-CP'],
+
+ 480|         'hai_quan': ['13/2015/TT-BTC', 'hải quan', 'kiểm soát'],
+
+ 481|         'giam_dinh': ['15/2012/TT-BVHTTDL', 'giám định'],
+
+ 482|         'nguoi_tieu_dung': ['19/2023/QH15', 'người tiêu dùng'],
+
+ 483|     },
+
+ 484| }
+
+ 485| 
+
+
+##############################################################################
+# K validate_query_plan
+##############################################################################
+ 645| def validate_query_plan(raw_plan, question, raw_text=''):
+
+ 646|     fallback = fallback_query_plan(question)
+
+ 647|     if not isinstance(raw_plan, dict):
+
+ 648|         fallback['raw_plan_text'] = raw_text
+
+ 649|         fallback['planner_error'] = 'planner returned non-dict'
+
+ 650|         return fallback
+
+ 651| 
+
+ 652|     complexity = str(raw_plan.get('complexity', '')).strip().lower()
+
+ 653|     if complexity not in COMPLEXITIES:
+
+ 654|         complexity = fallback['complexity']
+
+ 655| 
+
+ 656|     qtype = str(raw_plan.get('question_type', '')).strip().lower()
+
+ 657|     if qtype not in QUESTION_TYPES:
+
+ 658|         qtype = fallback['question_type']
+
+ 659| 
+
+ 660|     atomic = sanitize_list_of_strings(raw_plan.get('atomic_questions', []), max_items=CFG['planner_max_atomic'])
+
+ 661|     clean_atomic = []
+
+ 662|     for item in atomic:
+
+ 663|         if normalize_key(item) == normalize_key(question):
+
+ 664|             continue
+
+ 665|         if has_forbidden_new_citation(item, question):
+
+ 666|             continue
+
+ 667|         if token_overlap_ratio(item, question) < CFG['planner_min_overlap']:
+
+ 668|             continue
+
+ 669|         clean_atomic.append(item)
+
+ 670| 
+
+ 671|     if not clean_atomic and complexity in {'medium', 'complex'}:
+
+ 672|         clean_atomic = fallback['atomic_questions']
+
+ 673|     clean_atomic = clean_atomic[:CFG['planner_max_atomic']]
+
+ 674| 
+
+ 675|     terms = sanitize_list_of_strings(raw_plan.get('must_have_terms', []), max_items=12, max_chars=60)
+
+ 676|     terms = [t for t in terms if not has_forbidden_new_citation(t, question)]
+
+ 677|     if not terms:
+
+ 678|         terms = fallback['must_have_terms']
+
+ 679| 
+
+ 680|     plan = {
+
+ 681|         'complexity': complexity,
+
+ 682|         'atomic_questions': clean_atomic,
+
+ 683|         'must_have_terms': terms,
+
+ 684|         'anchor_terms': sanitize_list_of_strings(raw_plan.get('anchor_terms', []), max_items=12, max_chars=80),
+
+ 685|         'legal_facets': sanitize_list_of_strings(raw_plan.get('legal_facets', []), max_items=max(6, CFG['planner_max_atomic']), max_chars=220),
+
+ 686|         'facet_profiles': sanitize_facet_profiles(raw_plan.get('facet_profiles', []), max_items=max(6, CFG['planner_max_atomic'])),
+
+ 687|         'domain_profile': raw_plan.get('domain_profile', {}) if isinstance(raw_plan.get('domain_profile', {}), dict) else {},
+
+ 688|         'question_type': qtype,
+
+ 689|         'rationale_short': normalize_text(raw_plan.get('rationale_short', ''))[:260],
+
+ 690|         'planner_fallback': False,
+
+ 691|         'planner_error': '',
+
+ 692|         'raw_plan_text': raw_text,
+
+ 693|     }
+
+ 694|     return enrich_query_plan(question, refine_query_plan_heuristics(question, plan))
+
+ 695| 
+
+
+##############################################################################
+# K LLMQueryPlanner
+##############################################################################
+ 696| class LLMQueryPlanner:
+
+ 697|     def __init__(self, model_name=PLANNER_MODEL):
+
+ 698|         self.enabled = bool(CFG.get('use_llm_planner', True))
+
+ 699|         self.model_name = model_name
+
+ 700|         self.tokenizer = None
+
+ 701|         self.model = None
+
+ 702|         self.disabled_reason = ''
+
+ 703|         if not self.enabled:
+
+ 704|             self.disabled_reason = 'USE_LLM_PLANNER=0'
+
+ 705|             print({'planner': 'disabled', 'fallback': True})
+
+ 706|             return
+
+ 707|         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+ 708|         if device != 'cuda' and not CFG.get('planner_allow_cpu', False):
+
+ 709|             self.enabled = False
+
+ 710|             self.disabled_reason = 'planner_cpu_fallback'
+
+ 711|             print({
+
+ 712|                 'planner': 'cpu_fallback',
+
+ 713|                 'fallback': True,
+
+ 714|                 'reason': 'CUDA is not available; refusing to load planner LLM on CPU. Set PLANNER_ALLOW_CPU=1 to override.',
+
+ 715|                 'planner_model': model_name,
+
+ 716|             })
+
+ 717|             return
+
+ 718|         from transformers import AutoTokenizer, AutoModelForCausalLM
+
+ 719|         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+ 720|         load_kwargs = {'trust_remote_code': True}
+
+ 721|         if device == 'cuda' and CFG.get('planner_load_in_4bit', True):
+
+ 722|             from transformers import BitsAndBytesConfig
+
+ 723|             load_kwargs.update({
+
+ 724|                 'device_map': 'auto',
+
+ 725|                 'torch_dtype': torch.float16,
+
+ 726|                 'quantization_config': BitsAndBytesConfig(
+
+ 727|                     load_in_4bit=True,
+
+ 728|                     bnb_4bit_compute_dtype=torch.float16,
+
+ 729|                     bnb_4bit_quant_type='nf4',
+
+ 730|                     bnb_4bit_use_double_quant=True,
+
+ 731|                 ),
+
+ 732|             })
+
+ 733|         elif device == 'cuda':
+
+ 734|             load_kwargs.update({'torch_dtype': torch.float16, 'device_map': 'auto'})
+
+ 735|         else:
+
+ 736|             load_kwargs.update({'torch_dtype': torch.float32})
+
+ 737|         print({'planner_model': model_name, 'planner_device': device, 'planner_4bit': bool(device == 'cuda' and CFG.get('planner_load_in_4bit', True))})
+
+ 738|         self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+
+ 739|         self.model.eval()
+
+ 740| 
+
+ 741|     def build_prompt(self, question):
+
+ 742|         system = (
+
+ 743|             'Bạn là bộ phân tích truy vấn cho hệ thống truy hồi văn bản pháp luật Việt Nam. '
+
+ 744|             'Chỉ phân rã ý hỏi, không trả lời câu hỏi, không suy đoán số điều, không bịa tên văn bản. '
+
+ 745|             'Luôn trả về đúng một JSON object hợp lệ.'
+
+ 746|         )
+
+ 747|         user = f'''
+
+ 748| Câu hỏi:
+
+ 749| {question}
+
+ 750| 
+
+ 751| Hãy trả về JSON theo schema:
+
+ 752| {{
+
+ 753|   "complexity": "simple|medium|complex",
+
+ 754|   "atomic_questions": ["mệnh đề truy hồi độc lập, tối đa 4"],
+
+ 755|   "must_have_terms": ["thuật ngữ bắt buộc lấy từ hoặc bám rất sát câu hỏi"],
+
+ 756|   "anchor_terms": ["domain anchors that every atomic question must preserve"],
+
+ 757|   "legal_facets": ["separate legal retrieval facets, not paraphrases"],
+
+ 758|   "facet_profiles": [{{"facet_id": "stable_id", "label": "legal facet", "anchor_terms": [], "preferred_law_ids": [], "preferred_title_terms": [], "target_terms": [], "negative_terms": [], "priority": 1.0}}],
+
+ 759|   "domain_profile": {{"labels": ["domain labels if clear"]}},
+
+ 760|   "question_type": "procedure|condition|rights_obligations|sanction|support_incentive|scenario|deadline|comparison|definition_listing|other",
+
+ 761|   "rationale_short": "lý do ngắn, không quá 1 câu"
+
+ 762| }}
+
+ 763| 
+
+ 764| Quy tắc:
+
+ 765| - Every atomic question must preserve specific domain anchors from the original question, such as copyright, software, customs, assessment, vulnerable consumers, small and medium enterprises, or procurement.
+
+ 766| - Do not shorten an atomic question into a generic form like documents/evidence, contract contents, dispute handling, or request processing when the original question contains a specific domain.
+
+ 767| - legal_facets should split legal aspects, not paraphrase the same question multiple times.
+
+ 768| - facet_profiles should name the legal facets that need separate slot coverage; keep law/title preferences only when directly implied by the question.
+
+ 769| - simple: 1 vấn đề, thường 1 văn bản/1 điều.
+
+ 770| - medium: 2 ý hoặc cross-doc nhẹ.
+
+ 771| - complex: nhiều mệnh đề, multi-hop, nhiều lĩnh vực/văn bản.
+
+ 772| - atomic_questions phải giữ đúng ý gốc, không thêm vấn đề mới.
+
+ 773| - Không nêu "Điều X", mã luật, tên văn bản cụ thể nếu câu hỏi không nêu.
+
+ 774| - Không dùng markdown, không giải thích ngoài JSON.
+
+ 775| '''
+
+ 776|         if hasattr(self.tokenizer, 'apply_chat_template'):
+
+ 777|             return self.tokenizer.apply_chat_template([
+
+ 778|                 {'role': 'system', 'content': system},
+
+ 779|                 {'role': 'user', 'content': user},
+
+ 780|             ], tokenize=False, add_generation_prompt=True)
+
+ 781|         return system + '\n\n' + user + '\n\nJSON:'
+
+ 782| 
+
+ 783|     def plan(self, question):
+
+ 784|         question = normalize_text(question)
+
+ 785|         if not self.enabled:
+
+ 786|             return fallback_query_plan(question, reason=self.disabled_reason or 'planner_disabled')
+
+ 787|         try:
+
+ 788|             prompt = self.build_prompt(question)
+
+ 789|             inputs = self.tokenizer(prompt, return_tensors='pt', truncation=True, max_length=2048).to(self.model.device)
+
+ 790|             with torch.no_grad():
+
+ 791|                 out = self.model.generate(
+
+ 792|                     **inputs,
+
+ 793|                     max_new_tokens=CFG['planner_max_new_tokens'],
+
+ 794|                     temperature=0.0,
+
+ 795|                     do_sample=False,
+
+ 796|                     repetition_penalty=1.01,
+
+ 797|                     pad_token_id=self.tokenizer.eos_token_id,
+
+ 798|                     eos_token_id=self.tokenizer.eos_token_id,
+
+ 799|                 )
+
+ 800|             gen_ids = out[0][inputs['input_ids'].shape[1]:]
+
+ 801|             raw_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+ 802|             raw_plan = extract_json_object(raw_text)
+
+ 803|             return validate_query_plan(raw_plan, question, raw_text=raw_text)
+
+ 804|         except Exception as e:
+
+ 805|             plan = fallback_query_plan(question, reason='planner_exception')
+
+ 806|             plan['planner_error'] = repr(e)
+
+ 807|             return plan
+
+ 808| 
+
+ 809| def add_variant(variants, text, kind, weight, dense_only=False, lexical_only=False):
+
+
+##############################################################################
+# K add_variant + must_terms_query + build_query_variants
+##############################################################################
+ 809| def add_variant(variants, text, kind, weight, dense_only=False, lexical_only=False):
+
+ 810|     text = normalize_text(text)
+
+ 811|     if not text:
+
+ 812|         return
+
+ 813|     key = normalize_key(text)
+
+ 814|     if key in {v['key'] for v in variants}:
+
+ 815|         return
+
+ 816|     variants.append({
+
+ 817|         'text': text,
+
+ 818|         'kind': kind,
+
+ 819|         'weight': float(weight),
+
+ 820|         'dense_only': bool(dense_only),
+
+ 821|         'lexical_only': bool(lexical_only),
+
+ 822|         'key': key,
+
+ 823|     })
+
+ 824| 
+
+ 825| def must_terms_query(query_plan):
+
+ 826|     terms = [normalize_text(t) for t in query_plan.get('must_have_terms', []) if normalize_text(t)]
+
+ 827|     return ' '.join(terms[:16])
+
+ 828| 
+
+ 829| def build_query_variants(question, query_plan=None):
+
+ 830|     query_plan = query_plan or fallback_query_plan(question)
+
+ 831|     complexity = query_plan.get('complexity', 'medium')
+
+ 832|     variants = []
+
+ 833|     add_variant(variants, question, 'original', 1.00)
+
+ 834| 
+
+ 835|     if complexity == 'simple':
+
+ 836|         atomic_weights = [0.86]
+
+ 837|         facet_weight = 0.00
+
+ 838|         must_weight = 0.58
+
+ 839|     elif complexity == 'complex':
+
+ 840|         atomic_weights = [0.96, 0.93, 0.90, 0.87]
+
+ 841|         facet_weight = 0.88
+
+ 842|         must_weight = 0.68
+
+ 843|     else:
+
+ 844|         atomic_weights = [0.94, 0.90, 0.86]
+
+ 845|         facet_weight = 0.91
+
+ 846|         must_weight = 0.64
+
+ 847| 
+
+ 848|     for idx, atomic in enumerate(query_plan.get('atomic_questions', [])[:CFG['planner_max_atomic']]):
+
+ 849|         weight = atomic_weights[min(idx, len(atomic_weights) - 1)]
+
+ 850|         add_variant(variants, atomic, f'atomic_{idx + 1}', weight)
+
+ 851| 
+
+ 852|     if complexity != 'simple':
+
+ 853|         for idx, facet in enumerate(query_plan.get('facet_profiles', [])[:max(6, CFG.get('planner_max_atomic', 4))]):
+
+ 854|             text = facet.get('query') or facet.get('label') or ''
+
+ 855|             facet_id = re.sub(r'[^a-z0-9_]+', '_', normalize_key(facet.get('facet_id', f'facet_{idx + 1}'))).strip('_') or f'facet_{idx + 1}'
+
+ 856|             priority = float(facet.get('priority', 1.0) or 1.0)
+
+ 857|             weight = min(0.97, facet_weight + 0.02 * max(priority - 1.0, 0.0))
+
+ 858|             add_variant(variants, text, f'facet_{idx + 1}_{facet_id}', weight)
+
+ 859| 
+
+ 860|     if CFG.get('use_must_terms_variant', True):
+
+ 861|         term_query = must_terms_query(query_plan)
+
+ 862|         if term_query and normalize_key(term_query) != normalize_key(question):
+
+ 863|             add_variant(variants, term_query, 'must_terms', must_weight, lexical_only=True)
+
+ 864| 
+
+ 865|     return variants
+
+ 866| 
+
+
+##############################################################################
+# K article_key..score_candidate_facets
+##############################################################################
+ 211| def weighted_rrf_fuse(weighted_rankings, k=60, topk=96):
+
+ 212|     scores = defaultdict(float)
+
+ 213|     payload = {}
+
+ 214|     sources = defaultdict(list)
+
+ 215|     for ranking, weight, label in weighted_rankings:
+
+ 216|         for rank, item in enumerate(ranking, start=1):
+
+ 217|             row_idx = int(item['row_idx'])
+
+ 218|             scores[row_idx] += float(weight) / (k + rank)
+
+ 219|             payload.setdefault(row_idx, item)
+
+ 220|             sources[row_idx].append({'source': label, 'rank': rank, 'weight': float(weight)})
+
+ 221|     fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:topk]
+
+ 222|     out = []
+
+ 223|     for row_idx, score in fused:
+
+ 224|         item = dict(payload[row_idx])
+
+ 225|         item['rrf_score'] = float(score)
+
+ 226|         item['source_hits'] = sources[row_idx][:12]
+
+ 227|         out.append(item)
+
+ 228|     return out
+
+ 229| 
+
+ 230| def article_key(c):
+
+ 231|     law_id = str(c.get('law_id', '')).strip()
+
+ 232|     ten = str(c.get('ten_van_ban', '')).strip()
+
+ 233|     dieu = str(c.get('dieu_so', '')).strip()
+
+ 234|     if law_id and ten and dieu:
+
+ 235|         return f'{law_id}|{ten}|{dieu}'
+
+ 236|     return ''
+
+ 237| 
+
+ 238| def source_kind(source_label):
+
+ 239|     label = str(source_label)
+
+ 240|     if ':' in label:
+
+ 241|         return label.split(':', 1)[1]
+
+ 242|     return label
+
+ 243| 
+
+ 244| def canonical_article_key(c):
+
+ 245|     law_id = str(c.get('law_id', '')).strip()
+
+ 246|     dieu = str(c.get('dieu_so', '')).strip()
+
+ 247|     if law_id and dieu:
+
+ 248|         return f'{law_id}|{dieu}'
+
+ 249|     return article_key(c)
+
+ 250| 
+
+ 251| 
+
+ 252| def score_candidate_domain(candidate, query_plan=None):
+
+ 253|     query_plan = query_plan or {}
+
+ 254|     profile = query_plan.get('domain_profile', {}) or {}
+
+ 255|     law_id = str(candidate.get('law_id', '')).strip()
+
+ 256|     title = str(candidate.get('ten_van_ban', ''))
+
+ 257|     hay = anchor_plain(' '.join([law_id, title, str(candidate.get('dieu_so', ''))]))
+
+ 258|     score = 0.0
+
+ 259|     reasons = []
+
+ 260| 
+
+ 261|     preferred_law_ids = set(profile.get('preferred_law_ids', []))
+
+ 262|     soft_negative_law_ids = set(profile.get('soft_negative_law_ids', []))
+
+ 263|     if law_id in preferred_law_ids:
+
+ 264|         score += 0.75
+
+ 265|         reasons.append('preferred_law_id')
+
+ 266|     if law_id in soft_negative_law_ids:
+
+ 267|         score -= 0.70
+
+ 268|         reasons.append('soft_negative_law_id')
+
+ 269| 
+
+ 270|     for term in profile.get('preferred_title_terms', []):
+
+ 271|         if anchor_plain(term) in hay:
+
+ 272|             score += 0.25
+
+ 273|             reasons.append('preferred_title:' + term)
+
+ 274|             break
+
+ 275| 
+
+ 276|     for term in profile.get('negative_title_terms', []):
+
+ 277|         if anchor_plain(term) in hay and law_id not in preferred_law_ids:
+
+ 278|             score -= 0.80
+
+ 279|             reasons.append('negative_title:' + term)
+
+ 280|             break
+
+ 281| 
+
+ 282|     labels = set(profile.get('labels', []))
+
+ 283|     if 'copyright_assessment' in labels and ('chuyen giao cong nghe' in hay or 'thuong mai' in hay) and law_id not in preferred_law_ids:
+
+ 284|         score -= 0.55
+
+ 285|         reasons.append('assessment_domain_drift')
+
+ 286|     if 'copyright_software' in labels and 'so huu cong nghiep' in hay and law_id not in preferred_law_ids:
+
+ 287|         score -= 0.80
+
+ 288|         reasons.append('industrial_property_drift')
+
+ 289|     if not reasons:
+
+ 290|         reasons.append('neutral')
+
+ 291|     return float(score), reasons[:6]
+
+ 292| 
+
+ 293| def is_generic_variant_text(text, query_plan=None):
+
+ 294|     profile = (query_plan or {}).get('domain_profile', {})
+
+ 295|     try:
+
+ 296|         return is_generic_atomic_question(text, profile)
+
+ 297|     except Exception:
+
+ 298|         plain = anchor_plain(text)
+
+ 299|         return _plain_has_any(plain, ['tai lieu', 'chung cu', 'ho so', 'don yeu cau', 'hop dong', 'tranh chap'])
+
+ 300| 
+
+ 301| def candidate_facet_haystack(candidate):
+
+ 302|     pieces = [
+
+ 303|         str(candidate.get('law_id', '')),
+
+ 304|         str(candidate.get('ten_van_ban', '')),
+
+ 305|         str(candidate.get('dieu_so', '')),
+
+ 306|         str(candidate.get('article_key', '')),
+
+ 307|         str(candidate.get('chunk_text', ''))[:2400],
+
+ 308|     ]
+
+ 309|     return anchor_plain(' '.join(pieces))
+
+ 310| 
+
+ 311| def score_one_facet(candidate, facet, support_variants=None):
+
+ 312|     support_variants = support_variants or []
+
+ 313|     law_id = str(candidate.get('law_id', '')).strip()
+
+ 314|     hay = candidate_facet_haystack(candidate)
+
+ 315|     facet_id = str(facet.get('facet_id', '')).strip()
+
+ 316|     rank_score = 0.0
+
+ 317|     evidence_score = 0.0
+
+ 318|     reasons = []
+
+ 319|     preferred_law_ids = set(str(x).strip() for x in facet.get('preferred_law_ids', []) if str(x).strip())
+
+ 320|     if law_id and law_id in preferred_law_ids:
+
+ 321|         rank_score += 1.10
+
+ 322|         reasons.append('preferred_law_id:' + law_id)
+
+ 323|     for term in facet.get('preferred_title_terms', []):
+
+ 324|         if anchor_plain(term) in hay:
+
+ 325|             rank_score += 0.20
+
+ 326|             reasons.append('preferred_title:' + term)
+
+ 327|             break
+
+ 328|     anchor_hits = []
+
+ 329|     for term in facet.get('anchor_terms', []):
+
+ 330|         if anchor_plain(term) in hay:
+
+ 331|             anchor_hits.append(term)
+
+ 332|     if anchor_hits:
+
+ 333|         rank_score += min(0.30, 0.08 * len(set(anchor_plain(x) for x in anchor_hits)))
+
+ 334|         evidence_score += min(0.22, 0.06 * len(set(anchor_plain(x) for x in anchor_hits)))
+
+ 335|         reasons.append('anchor_terms:' + ','.join(anchor_hits[:4]))
+
+ 336|     target_hits = []
+
+ 337|     for term in facet.get('target_terms', []):
+
+ 338|         if anchor_plain(term) in hay:
+
+ 339|             target_hits.append(term)
+
+ 340|     if target_hits:
+
+ 341|         rank_score += min(0.90, 0.18 * len(set(anchor_plain(x) for x in target_hits)))
+
+ 342|         evidence_score += min(1.25, 0.30 * len(set(anchor_plain(x) for x in target_hits)))
+
+ 343|         reasons.append('target_terms:' + ','.join(target_hits[:4]))
+
+ 344|     if facet_id and any(facet_id in str(v) for v in support_variants):
+
+ 345|         rank_score += 0.45
+
+ 346|         evidence_score += 0.55
+
+ 347|         reasons.append('facet_variant_support')
+
+ 348|     for term in facet.get('negative_terms', []):
+
+ 349|         if anchor_plain(term) in hay and law_id not in preferred_law_ids:
+
+ 350|             rank_score -= 0.45
+
+ 351|             evidence_score -= 0.25
+
+ 352|             reasons.append('negative_term:' + term)
+
+ 353|             break
+
+ 354|     return float(rank_score), float(evidence_score), reasons[:6]
+
+ 355| 
+
+ 356| def score_candidate_facets(candidate, query_plan=None, support_variants=None):
+
+ 357|     query_plan = query_plan or {}
+
+ 358|     support_variants = support_variants or []
+
+ 359|     facets = query_plan.get('facet_profiles', []) or []
+
+ 360|     if not facets:
+
+ 361|         return 0.0, [], [], {}, {}
+
+ 362|     matched = []
+
+ 363|     reasons = []
+
+ 364|     score_map = {}
+
+ 365|     evidence_map = {}
+
+ 366|     best = 0.0
+
+ 367|     for facet in facets:
+
+ 368|         facet_id = str(facet.get('facet_id', '')).strip()
+
+ 369|         score, evidence_score, facet_reasons = score_one_facet(candidate, facet, support_variants=support_variants)
+
+ 370|         score_map[facet_id] = float(score)
+
+ 371|         evidence_map[facet_id] = float(evidence_score)
+
+ 372|         best = max(best, float(score))
+
+ 373|         threshold = 0.45 if facet.get('preferred_law_ids') else 0.55
+
+ 374|         if evidence_score >= threshold:
+
+ 375|             matched.append(facet_id)
+
+ 376|             reasons.append({'facet_id': facet_id, 'score': float(score), 'evidence_score': float(evidence_score), 'reasons': facet_reasons})
+
+ 377|     return float(best), matched, reasons[:8], score_map, evidence_map
+
+ 378| 
+
+
+##############################################################################
+# K article_bounds..select_facet_coverage
+##############################################################################
+ 487| def article_bounds_for_complexity(complexity):
+
+ 488|     if complexity == 'simple':
+
+ 489|         return {'min_k': 1, 'target_k': 1, 'max_k': min(CFG['submit_article_max_simple'], CFG['submit_article_max'])}
+
+ 490|     if complexity == 'complex':
+
+ 491|         return {'min_k': 4, 'target_k': 10, 'max_k': min(CFG['submit_article_max_complex'], CFG['submit_article_max'])}
+
+ 492|     return {'min_k': 2, 'target_k': 4, 'max_k': min(CFG['submit_article_max_medium'], CFG['submit_article_max'])}
+
+ 493| 
+
+ 494| def article_law_family(cand):
+
+ 495|     return str(cand.get('law_id', '')).strip()
+
+ 496| 
+
+ 497| def add_selected_article(selected, seen, cand, reason, family_counts=None, max_per_family=None):
+
+ 498|     key = cand.get('canonical_article_key') or canonical_article_key(cand)
+
+ 499|     if not key or key in seen:
+
+ 500|         return False
+
+ 501|     family = article_law_family(cand)
+
+ 502|     count_before = family_counts.get(family, 0) if family_counts is not None else 0
+
+ 503|     if family_counts is not None and max_per_family is not None and count_before >= max_per_family:
+
+ 504|         return False
+
+ 505|     item = dict(cand)
+
+ 506|     item.setdefault('selection_reasons', [])
+
+ 507|     item['selection_reasons'] = list(item.get('selection_reasons', [])) + [reason]
+
+ 508|     item['law_family_count_before_select'] = int(count_before)
+
+ 509|     selected.append(item)
+
+ 510|     seen.add(key)
+
+ 511|     if family_counts is not None:
+
+ 512|         family_counts[family] = count_before + 1
+
+ 513|     return True
+
+ 514| 
+
+ 515| def candidates_for_variant(article_candidates, kind):
+
+ 516|     out = [c for c in article_candidates if kind in c.get('per_variant', {})]
+
+ 517|     out.sort(key=lambda c: (
+
+ 518|         c.get('per_variant', {}).get(kind, {}).get('best_rank', 10**9),
+
+ 519|         -float(c.get('best_facet_score', 0.0)),
+
+ 520|         -float(c.get('domain_score', 0.0)),
+
+ 521|         -float(c.get('per_variant', {}).get(kind, {}).get('best_rerank_score', -1e9)),
+
+ 522|     ))
+
+ 523|     return out
+
+ 524| 
+
+ 525| def facet_profiles_for_selection(query_plan):
+
+ 526|     facets = list((query_plan or {}).get('facet_profiles', []) or [])
+
+ 527|     facets.sort(key=lambda f: -float(f.get('priority', 1.0) or 1.0))
+
+ 528|     return facets
+
+ 529| 
+
+ 530| def candidate_allowed_for_selection(cand, complexity, selected_len, min_k, require_facet=False):
+
+ 531|     domain_score = float(cand.get('domain_score', 0.0))
+
+ 532|     facet_score = float(cand.get('best_facet_score', cand.get('facet_score', 0.0)))
+
+ 533|     if complexity == 'simple':
+
+ 534|         return True
+
+ 535|     if require_facet and facet_score < 0.85:
+
+ 536|         return False
+
+ 537|     if domain_score <= -0.75 and not cand.get('original_support', False) and facet_score < 1.10 and selected_len >= min_k:
+
+ 538|         return False
+
+ 539|     if complexity == 'medium':
+
+ 540|         return domain_score > -1.00 or cand.get('original_support', False) or facet_score >= 0.85 or selected_len < min_k
+
+ 541|     return True
+
+ 542| 
+
+ 543| def facet_score_for_candidate(cand, facet):
+
+ 544|     facet_id = str(facet.get('facet_id', '')).strip()
+
+ 545|     return float((cand.get('facet_scores') or {}).get(facet_id, 0.0))
+
+ 546| 
+
+ 547| def facet_evidence_score_for_candidate(cand, facet):
+
+ 548|     facet_id = str(facet.get('facet_id', '')).strip()
+
+ 549|     return float((cand.get('facet_evidence_scores') or {}).get(facet_id, 0.0))
+
+ 550| 
+
+ 551| def candidate_law_preferred_for_facet(cand, facet):
+
+ 552|     return str(cand.get('law_id', '')).strip() in set(str(x).strip() for x in facet.get('preferred_law_ids', []) if str(x).strip())
+
+ 553| 
+
+ 554| def candidate_matches_facet(cand, facet):
+
+ 555|     evidence = facet_evidence_score_for_candidate(cand, facet)
+
+ 556|     threshold = 0.45 if facet.get('preferred_law_ids') else 0.55
+
+ 557|     return evidence >= threshold
+
+ 558| 
+
+ 559| def candidates_for_facet(article_candidates, facet):
+
+ 560|     facet_id = str(facet.get('facet_id', '')).strip()
+
+ 561|     out = []
+
+ 562|     for cand in article_candidates:
+
+ 563|         evidence = facet_evidence_score_for_candidate(cand, facet)
+
+ 564|         if candidate_matches_facet(cand, facet) or (candidate_law_preferred_for_facet(cand, facet) and evidence >= 0.30):
+
+ 565|             out.append(cand)
+
+ 566|     out.sort(key=lambda c: (
+
+ 567|         -float(candidate_law_preferred_for_facet(c, facet)),
+
+ 568|         -facet_evidence_score_for_candidate(c, facet),
+
+ 569|         -facet_score_for_candidate(c, facet),
+
+ 570|         int(c.get('best_variant_rank', 10**9)),
+
+ 571|         -float(c.get('article_score', 0.0)),
+
+ 572|     ))
+
+ 573|     return out
+
+ 574| 
+
+ 575| def preferred_doc_rescue_candidates(article_candidates, query_plan):
+
+ 576|     profile = query_plan.get('domain_profile', {}) if query_plan else {}
+
+ 577|     preferred = set(profile.get('preferred_law_ids', []))
+
+ 578|     if not preferred:
+
+ 579|         return []
+
+ 580|     out = [c for c in article_candidates if str(c.get('law_id', '')).strip() in preferred]
+
+ 581|     out.sort(key=lambda c: (
+
+ 582|         -float(c.get('best_facet_score', 0.0)),
+
+ 583|         -float(c.get('domain_score', 0.0)),
+
+ 584|         -float(c.get('article_score', 0.0)),
+
+ 585|         int(c.get('best_variant_rank', 10**9)),
+
+ 586|     ))
+
+ 587|     return out
+
+ 588| 
+
+ 589| def preferred_facet_candidate_exists(article_candidates, facet):
+
+ 590|     preferred = set(str(x).strip() for x in facet.get('preferred_law_ids', []) if str(x).strip())
+
+ 591|     if not preferred:
+
+ 592|         return False
+
+ 593|     return any(candidate_law_preferred_for_facet(cand, facet) and candidate_matches_facet(cand, facet) for cand in article_candidates)
+
+ 594| 
+
+ 595| def selected_covers_facet(selected, facet, article_candidates=None):
+
+ 596|     preferred = set(str(x).strip() for x in facet.get('preferred_law_ids', []) if str(x).strip())
+
+ 597|     require_preferred = bool(preferred) and preferred_facet_candidate_exists(article_candidates or [], facet)
+
+ 598|     for cand in selected:
+
+ 599|         if require_preferred and not candidate_law_preferred_for_facet(cand, facet):
+
+ 600|             continue
+
+ 601|         if candidate_matches_facet(cand, facet):
+
+ 602|             return True
+
+ 603|     return False
+
+ 604| 
+
+ 605| def selected_covered_facets(selected, query_plan=None, article_candidates=None):
+
+ 606|     if query_plan:
+
+ 607|         covered = set()
+
+ 608|         for facet in facet_profiles_for_selection(query_plan):
+
+ 609|             if selected_covers_facet(selected, facet, article_candidates=article_candidates):
+
+ 610|                 covered.add(str(facet.get('facet_id', '')))
+
+ 611|         return covered
+
+ 612|     covered = set()
+
+ 613|     for cand in selected:
+
+ 614|         for facet_id in cand.get('matched_facets', []):
+
+ 615|             covered.add(facet_id)
+
+ 616|     return covered
+
+ 617| 
+
+ 618| def low_value_duplicate_facet(cand, covered_facets):
+
+ 619|     matched = set(cand.get('matched_facets', []))
+
+ 620|     if not matched:
+
+ 621|         return False
+
+ 622|     if not matched.issubset(covered_facets):
+
+ 623|         return False
+
+ 624|     return float(cand.get('best_facet_score', 0.0)) < 1.20 and not cand.get('original_support', False)
+
+ 625| 
+
+ 626| def select_facet_coverage(article_candidates, query_plan, complexity, selected, seen, family_counts, max_k, min_k, coverage_debug):
+
+ 627|     facets = facet_profiles_for_selection(query_plan)
+
+ 628|     for facet in facets:
+
+ 629|         if len(selected) >= max_k:
+
+ 630|             coverage_debug.append({'facet_id': facet.get('facet_id', ''), 'status': 'skipped', 'reason': 'max_k'})
+
+ 631|             break
+
+ 632|         facet_id = facet.get('facet_id', '')
+
+ 633|         if selected_covers_facet(selected, facet, article_candidates=article_candidates):
+
+ 634|             coverage_debug.append({'facet_id': facet_id, 'status': 'covered_before', 'reason': 'already_covered'})
+
+ 635|             continue
+
+ 636|         added = False
+
+ 637|         skip_reasons = []
+
+ 638|         facet_candidates = candidates_for_facet(article_candidates, facet)
+
+ 639|         for allow_over_cap in ([False, True] if complexity == 'complex' else [True]):
+
+ 640|             for cand in facet_candidates:
+
+ 641|                 key = cand.get('canonical_article_key') or canonical_article_key(cand)
+
+ 642|                 if key in seen:
+
+ 643|                     skip_reasons.append('seen')
+
+ 644|                     continue
+
+ 645|                 if not candidate_matches_facet(cand, facet):
+
+ 646|                     skip_reasons.append('low_facet_evidence')
+
+ 647|                     continue
+
+ 648|                 if not candidate_allowed_for_selection(cand, complexity, len(selected), min_k, require_facet=True):
+
+ 649|                     skip_reasons.append('domain_or_low_facet')
+
+ 650|                     continue
+
+ 651|                 max_per_family = 2 if (complexity == 'complex' and not allow_over_cap) else None
+
+ 652|                 if add_selected_article(selected, seen, cand, f'facet_coverage:{facet_id}', family_counts=family_counts, max_per_family=max_per_family):
+
+ 653|                     coverage_debug.append({
+
+ 654|                         'facet_id': facet_id,
+
+ 655|                         'status': 'selected',
+
+ 656|                         'article_key': cand.get('article_key', ''),
+
+ 657|                         'law_id': cand.get('law_id', ''),
+
+ 658|                         'dieu_so': cand.get('dieu_so', ''),
+
+ 659|                         'facet_score': facet_score_for_candidate(cand, facet),
+
+ 660|                         'facet_evidence_score': facet_evidence_score_for_candidate(cand, facet),
+
+ 661|                         'over_family_cap': bool(allow_over_cap),
+
+ 662|                     })
+
+ 663|                     added = True
+
+ 664|                     break
+
+ 665|                 skip_reasons.append('family_cap')
+
+ 666|             if added:
+
+ 667|                 break
+
+ 668|         if not added:
+
+ 669|             coverage_debug.append({
+
+ 670|                 'facet_id': facet_id,
+
+ 671|                 'status': 'missed',
+
+ 672|                 'candidate_count': len(facet_candidates),
+
+ 673|                 'skip_reasons': sorted(set(skip_reasons))[:6],
+
+ 674|             })
+
+ 675| 
+
+
+##############################################################################
+# K build_gen_contexts + make_relevant_lists (dict-based)
+##############################################################################
+ 795| def build_gen_contexts(article_contexts):
+
+ 796|     gen_contexts = []
+
+ 797|     for c in article_contexts:
+
+ 798|         item = dict(c)
+
+ 799|         item['chunk_text'] = str(item.get('chunk_text', ''))[:CFG['gen_chunk_char_limit']]
+
+ 800|         gen_contexts.append(item)
+
+ 801|         if len(gen_contexts) >= CFG['gen_context_topk']:
+
+ 802|             break
+
+ 803|     return gen_contexts
+
+ 804| 
+
+ 805| def make_relevant_lists(article_contexts):
+
+ 806|     docs, articles = [], []
+
+ 807|     seen_docs, seen_articles = set(), set()
+
+ 808|     for c in article_contexts:
+
+ 809|         law_id = str(c.get('law_id', '')).strip()
+
+ 810|         ten = str(c.get('ten_van_ban', '')).strip()
+
+ 811|         dieu = str(c.get('dieu_so', '')).strip()
+
+ 812|         if law_id and ten:
+
+ 813|             d = f'{law_id}|{ten}'
+
+ 814|             if d not in seen_docs:
+
+ 815|                 seen_docs.add(d)
+
+ 816|                 docs.append(d)
+
+ 817|         if law_id and ten and dieu:
+
+ 818|             a = f'{law_id}|{ten}|{dieu}'
+
+ 819|             if a not in seen_articles:
+
+ 820|                 seen_articles.add(a)
+
+ 821|                 articles.append(a)
+
+ 822|     return docs, articles
+
+ 823| 
+
+
+##############################################################################
+# C cell[22] header/imports
+##############################################################################
+   0| # --- text normalisation + lexical tokeniser (ported from hybridrag-decomp) ---
+
+   1| # Required by the query-complexity planning machinery below.
+
+   2| _word_re = re.compile(r'\w+', re.UNICODE)
+
+   3| STOPWORDS = {
+
+   4|     'và', 'hoặc', 'của', 'các', 'những', 'một', 'này', 'đó', 'thì', 'là', 'có', 'bị', 'được',
+
+   5|     'phải', 'cho', 'về', 'trong', 'ngoài', 'theo', 'nếu', 'khi', 'như', 'để', 'với', 'từ', 'ra',
+
+   6|     'sao', 'gì', 'nào', 'bao', 'nhiêu', 'trường', 'hợp', 'cần', 'muốn', 'hỏi', 'tôi', 'công', 'ty'
+
+   7| }
+
+   8| 
+
+   9| def normalize_text(text):
+
+  10|     text = str(text).replace('\u200b', ' ').replace('\ufeff', ' ')
+
+  11|     return re.sub(r'\s+', ' ', text).strip()
+
+  12| 
+
+  13| def normalize_key(text):
+
+  14|     return normalize_text(text).lower()
+
+  15| 
+
+  16| def tokenize_lexical(text, keep_stopwords=False):
+
+  17|     toks = _word_re.findall(normalize_text(text).lower())
+
+  18|     toks = [t for t in toks if len(t) >= 2]
+
+  19|     if not keep_stopwords:
+
+  20|         toks = [t for t in toks if t not in STOPWORDS]
+
+  21|     return toks
+
+  22| 
+
+  23| # --- LLM query decomposition + complexity planning -----------------------
+
+  24| # Ported from hybridrag-decomp.ipynb §2. Produces a query_plan whose
+
+  25| # 'complexity' (simple/medium/complex) drives the per-tier article quota via
+
+  26| # article_bounds_for_complexity(). LLM planning is optional; when disabled or
+
+  27| # on-CPU-without-override it falls back to the rule-based planner.
+
+  28| QUESTION_TYPES = {
+
+  29|     'procedure', 'condition', 'rights_obligations', 'sanction',
+
+  30|     'support_incentive', 'scenario', 'deadline', 'comparison',
+
+  31|     'definition_listing', 'other'
+
+  32| }
+
+  33| COMPLEXITIES = {'simple', 'medium', 'complex'}
+
+  34| 
+
+  35| 
+
+
+##############################################################################
+# C validate_query_plan + LLMQueryPlanner
+##############################################################################
+ 206| def validate_query_plan(raw_plan, question, raw_text=''):
+
+ 207|     fallback = fallback_query_plan(question)
+
+ 208|     if not isinstance(raw_plan, dict):
+
+ 209|         fallback['raw_plan_text'] = raw_text
+
+ 210|         fallback['planner_error'] = 'planner returned non-dict'
+
+ 211|         return fallback
+
+ 212| 
+
+ 213|     complexity = str(raw_plan.get('complexity', '')).strip().lower()
+
+ 214|     if complexity not in COMPLEXITIES:
+
+ 215|         complexity = fallback['complexity']
+
+ 216| 
+
+ 217|     qtype = str(raw_plan.get('question_type', '')).strip().lower()
+
+ 218|     if qtype not in QUESTION_TYPES:
+
+ 219|         qtype = fallback['question_type']
+
+ 220| 
+
+ 221|     atomic = sanitize_list_of_strings(raw_plan.get('atomic_questions', []), max_items=PLANNER_MAX_ATOMIC)
+
+ 222|     clean_atomic = []
+
+ 223|     for item in atomic:
+
+ 224|         if normalize_key(item) == normalize_key(question):
+
+ 225|             continue
+
+ 226|         if has_forbidden_new_citation(item, question):
+
+ 227|             continue
+
+ 228|         if token_overlap_ratio(item, question) < PLANNER_MIN_OVERLAP:
+
+ 229|             continue
+
+ 230|         clean_atomic.append(item)
+
+ 231| 
+
+ 232|     if not clean_atomic and complexity in {'medium', 'complex'}:
+
+ 233|         clean_atomic = fallback['atomic_questions']
+
+ 234|     clean_atomic = clean_atomic[:PLANNER_MAX_ATOMIC]
+
+ 235| 
+
+ 236|     terms = sanitize_list_of_strings(raw_plan.get('must_have_terms', []), max_items=12, max_chars=60)
+
+ 237|     terms = [t for t in terms if not has_forbidden_new_citation(t, question)]
+
+ 238|     if not terms:
+
+ 239|         terms = fallback['must_have_terms']
+
+ 240| 
+
+ 241|     plan = {
+
+ 242|         'complexity': complexity,
+
+ 243|         'atomic_questions': clean_atomic,
+
+ 244|         'must_have_terms': terms,
+
+ 245|         'question_type': qtype,
+
+ 246|         'rationale_short': normalize_text(raw_plan.get('rationale_short', ''))[:260],
+
+ 247|         'planner_fallback': False,
+
+ 248|         'planner_error': '',
+
+ 249|         'raw_plan_text': raw_text,
+
+ 250|     }
+
+ 251|     return refine_query_plan_heuristics(question, plan)
+
+ 252| 
+
+ 253| 
+
+ 254| class LLMQueryPlanner:
+
+ 255|     def __init__(self, model_name=PLANNER_MODEL):
+
+ 256|         self.enabled = bool(USE_LLM_PLANNER)
+
+ 257|         self.model_name = model_name
+
+ 258|         self.tokenizer = None
+
+ 259|         self.model = None
+
+ 260|         self.disabled_reason = ''
+
+ 261|         if not self.enabled:
+
+ 262|             self.disabled_reason = 'USE_LLM_PLANNER=0'
+
+ 263|             print({'planner': 'disabled', 'fallback': True})
+
+ 264|             return
+
+ 265|         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+ 266|         if device != 'cuda' and not PLANNER_ALLOW_CPU:
+
+ 267|             self.enabled = False
+
+ 268|             self.disabled_reason = 'planner_cpu_fallback'
+
+ 269|             print({
+
+ 270|                 'planner': 'cpu_fallback',
+
+ 271|                 'fallback': True,
+
+ 272|                 'reason': 'CUDA is not available; refusing to load planner LLM on CPU. Set PLANNER_ALLOW_CPU=1 to override.',
+
+ 273|                 'planner_model': model_name,
+
+ 274|             })
+
+ 275|             return
+
+ 276|         from transformers import AutoTokenizer, AutoModelForCausalLM
+
+ 277|         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+ 278|         load_kwargs = {'trust_remote_code': True}
+
+ 279|         if device == 'cuda' and PLANNER_LOAD_IN_4BIT:
+
+ 280|             from transformers import BitsAndBytesConfig
+
+ 281|             load_kwargs.update({
+
+ 282|                 'device_map': 'auto',
+
+ 283|                 'torch_dtype': torch.float16,
+
+ 284|                 'quantization_config': BitsAndBytesConfig(
+
+ 285|                     load_in_4bit=True,
+
+ 286|                     bnb_4bit_compute_dtype=torch.float16,
+
+ 287|                     bnb_4bit_quant_type='nf4',
+
+ 288|                     bnb_4bit_use_double_quant=True,
+
+ 289|                 ),
+
+ 290|             })
+
+ 291|         elif device == 'cuda':
+
+ 292|             load_kwargs.update({'torch_dtype': torch.float16, 'device_map': 'auto'})
+
+ 293|         else:
+
+ 294|             load_kwargs.update({'torch_dtype': torch.float32})
+
+ 295|         print({'planner_model': model_name, 'planner_device': device, 'planner_4bit': bool(device == 'cuda' and PLANNER_LOAD_IN_4BIT)})
+
+ 296|         self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+
+ 297|         self.model.eval()
+
+ 298| 
+
+ 299|     def build_prompt(self, question):
+
+ 300|         system = (
+
+ 301|             'Bạn là bộ phân tích truy vấn cho hệ thống truy hồi văn bản pháp luật Việt Nam. '
+
+ 302|             'Chỉ phân rã ý hỏi, không trả lời câu hỏi, không suy đoán số điều, không bịa tên văn bản. '
+
+ 303|             'Luôn trả về đúng một JSON object hợp lệ.'
+
+ 304|         )
+
+ 305|         user = f'''
+
+ 306| Câu hỏi:
+
+ 307| {question}
+
+ 308| 
+
+ 309| Hãy trả về JSON theo schema:
+
+ 310| {{
+
+ 311|   "complexity": "simple|medium|complex",
+
+ 312|   "atomic_questions": ["mệnh đề truy hồi độc lập, tối đa 4"],
+
+ 313|   "must_have_terms": ["thuật ngữ bắt buộc lấy từ hoặc bám rất sát câu hỏi"],
+
+ 314|   "question_type": "procedure|condition|rights_obligations|sanction|support_incentive|scenario|deadline|comparison|definition_listing|other",
+
+ 315|   "rationale_short": "lý do ngắn, không quá 1 câu"
+
+ 316| }}
+
+ 317| 
+
+ 318| Quy tắc:
+
+ 319| - simple: 1 vấn đề, thường 1 văn bản/1 điều.
+
+ 320| - medium: 2 ý hoặc cross-doc nhẹ.
+
+ 321| - complex: nhiều mệnh đề, multi-hop, nhiều lĩnh vực/văn bản.
+
+ 322| - atomic_questions phải giữ đúng ý gốc, không thêm vấn đề mới.
+
+ 323| - Không nêu "Điều X", mã luật, tên văn bản cụ thể nếu câu hỏi không nêu.
+
+ 324| - Không dùng markdown, không giải thích ngoài JSON.
+
+ 325| '''
+
+ 326|         if hasattr(self.tokenizer, 'apply_chat_template'):
+
+ 327|             return self.tokenizer.apply_chat_template([
+
+ 328|                 {'role': 'system', 'content': system},
+
+ 329|                 {'role': 'user', 'content': user},
+
+ 330|             ], tokenize=False, add_generation_prompt=True)
+
+ 331|         return system + '\n\n' + user + '\n\nJSON:'
+
+ 332| 
+
+ 333|     def plan(self, question):
+
+ 334|         question = normalize_text(question)
+
+ 335|         if not self.enabled:
+
+ 336|             return fallback_query_plan(question, reason=self.disabled_reason or 'planner_disabled')
+
+ 337|         try:
+
+ 338|             prompt = self.build_prompt(question)
+
+ 339|             inputs = self.tokenizer(prompt, return_tensors='pt', truncation=True, max_length=2048).to(self.model.device)
+
+ 340|             with torch.no_grad():
+
+ 341|                 out = self.model.generate(
+
+ 342|                     **inputs,
+
+ 343|                     max_new_tokens=PLANNER_MAX_NEW_TOKENS,
+
+ 344|                     temperature=0.0,
+
+ 345|                     do_sample=False,
+
+ 346|                     repetition_penalty=1.01,
+
+ 347|                     pad_token_id=self.tokenizer.eos_token_id,
+
+ 348|                     eos_token_id=self.tokenizer.eos_token_id,
+
+ 349|                 )
+
+ 350|             gen_ids = out[0][inputs['input_ids'].shape[1]:]
+
+ 351|             raw_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+ 352|             raw_plan = extract_json_object(raw_text)
+
+ 353|             return validate_query_plan(raw_plan, question, raw_text=raw_text)
+
+ 354|         except Exception as e:
+
+ 355|             plan = fallback_query_plan(question, reason='planner_exception')
+
+ 356|             plan['planner_error'] = repr(e)
+
+ 357|             return plan
+
+ 358| 
+
+ 359| 
+
+
+##############################################################################
+# C article_bounds_for_complexity
+##############################################################################
+ 360| def article_bounds_for_complexity(complexity):
+
+ 361|     """Per-tier article quota: {min_k, target_k, max_k}.
+
+ 362| 
+
+ 363|     simple  -> 1 article,   complex -> up to 12,  medium -> up to 4.
+
+ 364|     Each max_k is capped by SUBMIT_ARTICLE_MAX (the hard ceiling).
+
+ 365|     """
+
+ 366|     if complexity == 'simple':
+
+ 367|         return {'min_k': 1, 'target_k': 1, 'max_k': min(SUBMIT_ARTICLE_MAX_SIMPLE, SUBMIT_ARTICLE_MAX)}
+
+ 368|     if complexity == 'complex':
+
+ 369|         return {'min_k': 4, 'target_k': 10, 'max_k': min(SUBMIT_ARTICLE_MAX_COMPLEX, SUBMIT_ARTICLE_MAX)}
+
+ 370|     return {'min_k': 2, 'target_k': 4, 'max_k': min(SUBMIT_ARTICLE_MAX_MEDIUM, SUBMIT_ARTICLE_MAX)}
+
+ 371| 
+
+ 372| 
+
+ 373| # --- IRAC answer generator (ported from hybridrag-decomp.ipynb) -----------
+
+ 374| # Builds an IRAC-structured prompt from the retrieved Hit contexts + the
+
+ 375| # allowed citation list, generates with the Qwen causal LM, and strips any
+
+ 376| # prompt echo. Honours GEN_LOAD_IN_4BIT for memory-constrained GPUs.
+
+ 377| 
+
+
+##############################################################################
+# C cell[22] tail (QwenIRACGenerator head + rest)
+##############################################################################
+ 378| class QwenIRACGenerator:
+
+ 379|     def __init__(self, model_name=GEN_MODEL):
+
+ 380|         import torch
+
+ 381|         from transformers import AutoTokenizer, AutoModelForCausalLM
+
+ 382|         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+ 383|         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+ 384|         load_kwargs = {"trust_remote_code": True}
+
+ 385|         if device == "cuda" and GEN_LOAD_IN_4BIT:
+
+ 386|             from transformers import BitsAndBytesConfig
+
+ 387|             load_kwargs.update({
+
+ 388|                 "device_map": "auto",
+
+ 389|                 "torch_dtype": torch.float16,
+
+ 390|                 "quantization_config": BitsAndBytesConfig(
+
+ 391|                     load_in_4bit=True,
+
+ 392|                     bnb_4bit_compute_dtype=torch.float16,
+
+ 393|                     bnb_4bit_quant_type="nf4",
+
+ 394|                     bnb_4bit_use_double_quant=True,
+
+ 395|                 ),
+
+ 396|             })
+
+ 397|         elif device == "cuda":
+
+ 398|             load_kwargs.update({"torch_dtype": torch.float16, "device_map": "auto"})
+
+ 399|         else:
+
+ 400|             load_kwargs.update({"torch_dtype": torch.float32})
+
+ 401|         print({"generator_device": device,
+
+ 402|                "load_in_4bit": bool(device == "cuda" and GEN_LOAD_IN_4BIT),
+
+ 403|                "gen_context_topk": GEN_CONTEXT_TOPK,
+
+ 404|                "gen_chunk_char_limit": GEN_CHUNK_CHAR_LIMIT,
+
+ 405|                "gen_max_input_tokens": GEN_MAX_INPUT_TOKENS})
+
+ 406|         self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+
+ 407|         self.model.eval()
+
+ 408|         self.device = device
+
+ 409| 
+
+ 410|     def build_prompt(self, question, contexts, relevant_articles):
+
+ 411|         ctx_blocks = []
+
+ 412|         for i, c in enumerate(contexts, start=1):
+
+ 413|             meta = " | ".join(str(c.get(k, "")) for k in ["law_id", "ten_van_ban", "dieu_so"])
+
+ 414|             text = str(c.get("chunk_text", ""))[:GEN_CHUNK_CHAR_LIMIT]
+
+ 415|             ctx_blocks.append(f"[{i}] {meta}\n{text}")
+
+ 416|         allowed = "\n".join("- " + str(a) for a in relevant_articles[:ARTICLE_CONTEXT_TOPK])
+
+ 417|         system = (
+
+ 418|             "Bạn là trợ lý pháp lý AI cho doanh nghiệp SME tại Việt Nam. "
+
+ 419|             "Chỉ trả lời dựa trên ngữ cảnh và danh sách căn cứ được cung cấp. "
+
+ 420|             "Không bịa văn bản, điều luật, khoản hoặc nguồn tham chiếu. "
+
+ 421|             "Nếu thiếu căn cứ, nói rõ là chưa đủ căn cứ."
+
+ 422|         )
+
+ 423|         user = (
+
+ 424|             f"Câu hỏi: {question}\n\n"
+
+ 425|             "Danh sách điều luật được phép viện dẫn:\n"
+
+ 426|             f"{allowed}\n\n"
+
+ 427|             "Ngữ cảnh pháp lý:\n"
+
+ 428|             f"{chr(10).join(ctx_blocks)}\n\n"
+
+ 429|             "Yêu cầu trả lời:\n"
+
+ 430|             "- Trả lời bằng tiếng Việt, ngắn gọn nhưng đủ ý.\n"
+
+ 431|             "- Dùng cấu trúc IRAC ngắn: Vấn đề, Quy định, Áp dụng, Kết luận.\n"
+
+ 432|             "- Luôn nêu Điều X khi có căn cứ trong danh sách được phép viện dẫn.\n"
+
+ 433|             "- Không nhắc lại toàn bộ ngữ cảnh, không trích dẫn điều ngoài danh sách.\n"
+
+ 434|         )
+
+ 435|         if hasattr(self.tokenizer, "apply_chat_template"):
+
+ 436|             return self.tokenizer.apply_chat_template([
+
+ 437|                 {"role": "system", "content": system},
+
+ 438|                 {"role": "user", "content": user},
+
+ 439|             ], tokenize=False, add_generation_prompt=True)
+
+ 440|         return system + "\n\n" + user + "\n\nTrả lời:"
+
+ 441| 
+
+ 442|     def generate(self, question, contexts, relevant_articles):
+
+ 443|         import torch
+
+ 444|         prompt = self.build_prompt(question, contexts, relevant_articles)
+
+ 445|         inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True,
+
+ 446|                                 max_length=GEN_MAX_INPUT_TOKENS).to(self.model.device)
+
+ 447|         with torch.no_grad():
+
+ 448|             out = self.model.generate(
+
+ 449|                 **inputs,
+
+ 450|                 max_new_tokens=GEN_MAX_NEW_TOKENS,
+
+ 451|                 temperature=GEN_TEMPERATURE,
+
+ 452|                 top_p=GEN_TOP_P,
+
+ 453|                 do_sample=GEN_TEMPERATURE > 0,
+
+ 454|                 repetition_penalty=1.02,
+
+ 455|                 use_cache=GEN_USE_CACHE,
+
+ 456|                 pad_token_id=self.tokenizer.eos_token_id,
+
+ 457|                 eos_token_id=self.tokenizer.eos_token_id,
+
+ 458|             )
+
+ 459|         gen_ids = out[0][inputs["input_ids"].shape[1]:]
+
+ 460|         raw_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+ 461|         return strip_leading_prompt_echo(raw_text)
+
+ 462| 
+
+ 463| print("[generator] QwenIRACGenerator class ready (instantiated lazily below)")
+
+
+##############################################################################
+# C cell[23] build_gen_contexts + batch loop
+##############################################################################
+   0| # --- build generation contexts from the retrieved Hit list ---------------
+
+   1| # Hit carries exactly the fields the generator consumes.
+
+   2| def build_gen_contexts(hits, top_k=None):
+
+   3|     top_k = top_k or GEN_CONTEXT_TOPK
+
+   4|     out = []
+
+   5|     for h in hits[:top_k]:
+
+   6|         out.append({
+
+   7|             "law_id": getattr(h, "law_id", "") or "",
+
+   8|             "ten_van_ban": getattr(h, "ten_van_ban", "") or "",
+
+   9|             "dieu_so": getattr(h, "dieu_so", "") or "",
+
+  10|             "chunk_text": getattr(h, "chunk_text", "") or "",
+
+  11|         })
+
+  12|     return out
+
+  13| 
+
+  14| 
+
+  15| # --- resolve input / output paths ----------------------------------------
+
+  16| # Falls back to dev_set/questions.json when INPUT_QUERIES_PATH is blank, so
+
+  17| # this cell is runnable out of the box (same behaviour as the original §8).
+
+  18| _INPUT_Q = Path(INPUT_QUERIES_PATH) if str(INPUT_QUERIES_PATH).strip() else None
+
+  19| if _INPUT_Q is None or not _INPUT_Q.exists():
+
+  20|     _DEV_LOCAL = Path(REPO_DIR) / "dev_set"
+
+  21|     _cand = ((DEV / "questions.json") if (DEV / "questions.json").exists()
+
+  22|              else (_DEV_LOCAL / "questions.json"))
+
+  23|     _INPUT_Q = _cand
+
+  24|     print(f"[batch] INPUT_QUERIES_PATH not set / missing -> using {_INPUT_Q}")
+
+  25| else:
+
+  26|     print(f"[batch] input  : {_INPUT_Q}")
+
+  27| print(f"[batch] results: {RESULTS_PATH}")
+
+  28| print(f"[batch] zip    : {SUBMISSION_ZIP_PATH}")
+
+  29| 
+
+  30| assert _INPUT_Q.exists(), f"input query file not found: {_INPUT_Q}"
+
+  31| Path(RESULTS_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+  32| 
+
+  33| 
+
+  34| # --- instantiate the generator (only when enabled) -----------------------
+
+  35| import torch
+
+  36| generator = None
+
+  37| if USE_GENERATOR:
+
+  38|     gc.collect()
+
+  39|     if torch.cuda.is_available():
+
+  40|         torch.cuda.empty_cache()
+
+  41|     generator = QwenIRACGenerator()
+
+  42| else:
+
+  43|     print("[batch] USE_GENERATOR=False -> answer field left empty (retrieval-only).")
+
+  44| 
+
+  45| # --- instantiate the query planner (complexity assessment) ------------
+
+  46| # Always built; when USE_LLM_PLANNER=0 (or CPU w/o override) it self-
+
+  47| # disables and falls back to the rule-based planner, so plan() is safe.
+
+  48| planner = LLMQueryPlanner()
+
+  49| 
+
+  50| 
+
+  51| # --- progress bar for the batch loop -------------------------------------
+
+  52| # Wraps the query list with a tqdm bar when tqdm is available (it ships with
+
+  53| # Colab); falls back to a plain iterator otherwise so the cell runs unchanged.
+
+  54| try:
+
+  55|     from tqdm.auto import tqdm as _tqdm
+
+  56| except Exception:
+
+  57|     _tqdm = None
+
+  58| 
+
+  59| 
+
+  60| def _progress(iterable, total=None, desc="batch"):
+
+  61|     """Yield from *iterable* with a tqdm progress bar, or as-is if tqdm absent."""
+
+  62|     if _tqdm is None:
+
+  63|         return iterable
+
+  64|     return _tqdm(iterable, total=total, desc=desc, unit="q",
+
+  65|                  dynamic_ncols=True, leave=True)
+
+  66| 
+
+  67| 
+
+  68| # --- batch run: decompose -> retrieve -> generate -> postprocess ---------
+
+  69| records_in = _json.loads(_INPUT_Q.read_text(encoding="utf-8"))
+
+  70| print(f"[batch] loaded {len(records_in)} queries")
+
+  71| 
+
+  72| records_out, t0 = [], time.time()
+
+  73| _batch_pbar = _progress(records_in, total=len(records_in), desc="batch")
+
+  74| for rec in _batch_pbar:
+
+  75|     qid   = rec.get("id")
+
+  76|     query = rec.get("question") or rec.get("query") or ""
+
+  77|     if not query:
+
+  78|         print(f"  [skip] id={qid} has no question text")
+
+  79|         continue
+
+  80| 
+
+  81|     hits = decomp_retriever.retrieve(query, fetch_text=True)
+
+  82|     query_plan = planner.plan(str(query))
+
+  83|     complexity = query_plan.get('complexity', 'medium')
+
+  84|     docs, articles = make_relevant_lists(hits)
+
+  85|     # Apply the per-complexity-tier article quota.
+
+  86|     bounds = article_bounds_for_complexity(complexity)
+
+  87|     _max_articles = bounds['max_k']
+
+  88|     articles = articles[:_max_articles]
+
+  89|     # Trim docs to those whose law_id+ten_van_ban match a kept article. Each
+
+  90|     # kept article is "law_id|ten_van_ban|dieu_so"; its parent doc key is the
+
+  91|     # "law_id|ten_van_ban" prefix (strip the trailing dieu_so segment).
+
+  92|     _keep_doc_keys = {a.rsplit('|', 1)[0] for a in articles if '|' in a}
+
+  93|     docs = [d for d in docs if d in _keep_doc_keys]
+
+  94|     contexts = build_gen_contexts(hits)
+
+  95| 
+
+  96|     if generator is not None:
+
+  97|         try:
+
+  98|             answer = generator.generate(str(query), contexts, articles)
+
+  99|         except torch.cuda.OutOfMemoryError:
+
+ 100|             print(f"  [oom] id={qid}; retrying with shorter contexts")
+
+ 101|             if torch.cuda.is_available():
+
+ 102|                 torch.cuda.empty_cache()
+
+ 103|             short_ctx = []
+
+ 104|             for c in contexts[:2]:
+
+ 105|                 c2 = dict(c)
+
+ 106|                 c2["chunk_text"] = str(c2["chunk_text"])[:600]
+
+ 107|                 short_ctx.append(c2)
+
+ 108|             answer = generator.generate(str(query), short_ctx, articles[:8])
+
+ 109|         answer = postprocess_answer_citations(answer, articles)
+
+ 110|     else:
+
+ 111|         answer = ""
+
+ 112| 
+
+ 113|     out = dict(rec)                       # preserve any extra input fields
+
+ 114|     out["id"]                = qid
+
+ 115|     out["question"]          = query
+
+ 116|     out["answer"]            = answer
+
+ 117|     out["relevant_docs"]     = docs
+
+ 118|     out["relevant_articles"] = articles
+
+ 119|     records_out.append(out)
+
+ 120|     print(f"  [done] id={qid}  c={complexity}  hits={len(hits)}  "
+
+ 121|           f"docs={len(docs)}  articles={len(articles)}  ans_len={len(answer)}")
+
+ 122| 
+
+ 123| Path(RESULTS_PATH).write_text(_json.dumps(records_out, ensure_ascii=False, indent=2),
+
+ 124|                               encoding="utf-8")
+
+ 125| print(f"\n[batch] wrote {len(records_out)} records to {RESULTS_PATH} in {time.time()-t0:.1f}s")
+
+ 126| 
+
+ 127| 
+
+ 128| # --- (optional) F2 score if a ground-truth file is available -------------
+
+ 129| try:
+
+ 130|     _DEV_LOCAL = Path(REPO_DIR) / "dev_set"
+
+ 131|     _GTPATH = ((DEV / "ground_truth.json") if (DEV / "ground_truth.json").exists()
+
+ 132|                else (_DEV_LOCAL / "ground_truth.json"))
+
+ 133|     if _GTPATH.exists():
+
+ 134|         import sys as _sys
+
+ 135|         if str(_DEV_LOCAL.parent) not in _sys.path:
+
+ 136|             _sys.path.insert(0, str(_DEV_LOCAL.parent))
+
+ 137|         from dev_set.eval import f2_macro
+
+ 138|         _gt = _json.loads(_GTPATH.read_text(encoding="utf-8"))
+
+ 139|         print(f"\nF2 macro (decomposition + IRAC generation, batch) = "
+
+ 140|               f"{f2_macro(records_out, _gt):.4f}  [gt={_GTPATH}]")
+
+ 141|     else:
+
+ 142|         print("\n(ground_truth.json not found - skipping F2 score)")
+
+ 143| except Exception as _e:
+
+ 144|     print(f"\n(F2 scoring skipped: {_e})")
+
+ 145| 
+
+ 146| 
+
+ 147| # release the query planner (frees its GPU model if loaded)
+
+ 148| try:
+
+ 149|     del planner
+
+ 150| except NameError:
+
+ 151|     pass
+
+ 152| # release the generator before §9 validation / §10 cleanup
+
+ 153| del generator
+
+ 154| gc.collect()
+
+ 155| if torch.cuda.is_available():
+
+ 156|     torch.cuda.empty_cache()
+

@@ -685,20 +685,37 @@ def load_stage1_docs(path: Path) -> pd.DataFrame:
     return df
 
 
+def _is_consolidated(tinh_trang: Any, ten: Any) -> bool:
+    """Derive the ``is_consolidated`` flag (B1).
+
+    True when the effect-status text contains "hợp nhất" or the document title
+    contains "hợp nhất" / "ht" (the common marker for consolidated versions).
+    """
+    tt = str(tinh_trang or "").lower()
+    title = str(ten or "").lower()
+    return ("hợp nhất" in tt) or ("hợp nhất" in title) or ("ht" == title.strip())
+
+
 def build_doc_attrs(row: pd.Series) -> Dict[str, Any]:
     """Build the attribute dict for one DOC node per ``KG.md`` §3.1."""
+    loai = _normalize_value(row.get("loai_van_ban"))
+    ten = _normalize_value(row.get("ten_van_ban"))
+    tinh_trang = _normalize_value(row.get("tinh_trang_hieu_luc"))
     return {
         "type": "Document",
         "doc_id": str(row["id"]),
         "law_id": _normalize_value(row.get("law_id")),
-        "ten": _normalize_value(row.get("ten_van_ban")),
-        "loai": _normalize_value(row.get("loai_van_ban")),
+        "ten": ten,
+        "loai": loai,
+        "loai_van_ban": loai,
         "nganh": _normalize_value(row.get("nganh")),
         "linh_vuc": _normalize_value(row.get("linh_vuc")),
         "ngay_ban_hanh": _normalize_value(row.get("ngay_ban_hanh")),
-        "tinh_trang_hieu_luc": _normalize_value(row.get("tinh_trang_hieu_luc")),
+        "tinh_trang_hieu_luc": tinh_trang,
         "ngay_co_hieu_luc": _normalize_value(row.get("ngay_co_hieu_luc")),
         "ngay_het_hieu_luc": _normalize_value(row.get("ngay_het_hieu_luc")),
+        # B1: derived consolidated-version flag for retrieval-side preference.
+        "is_consolidated": _is_consolidated(tinh_trang, ten),
     }
 
 
@@ -763,12 +780,14 @@ def _print_attribute_coverage(G: "nx.MultiDiGraph") -> None:
         "law_id",
         "ten",
         "loai",
+        "loai_van_ban",
         "nganh",
         "linh_vuc",
         "ngay_ban_hanh",
         "tinh_trang_hieu_luc",
         "ngay_co_hieu_luc",
         "ngay_het_hieu_luc",
+        "is_consolidated",
     ]
     print("  DOC attribute coverage:")
     for field in fields:
@@ -819,20 +838,32 @@ def build_art_attrs(row: pd.Series) -> Dict[str, Any]:
 
     The locked attribute set excludes ``noi_dung`` (full article body) to keep
     ``kg.gpickle`` lean. Empty strings are normalized to ``None``.
+
+    B1: VN-legal effect-status attributes (``tinh_trang_hieu_luc``,
+    ``ngay_co_hieu_luc``, ``ngay_het_hieu_luc``, ``is_consolidated``) are
+    projected onto ART nodes so the retrieval-side scorer / filter (B2/B3/B4)
+    can resolve them per ``row_idx -> doc_uid -> ART`` without re-embedding.
     """
+    loai = _normalize_value(row.get("loai_van_ban"))
+    ten = _normalize_value(row.get("ten_van_ban"))
+    tinh_trang = _normalize_value(row.get("tinh_trang_hieu_luc"))
     return {
         "type": "Article",
         "doc_uid": str(row["doc_uid"]),
         "doc_id": str(row["doc_id"]),
         "law_id": _normalize_value(row.get("law_id")),
-        "ten_van_ban": _normalize_value(row.get("ten_van_ban")),
+        "ten_van_ban": ten,
         "dieu_so": _normalize_value(row.get("dieu_so")),
         "dieu_ten": _normalize_value(row.get("dieu_ten")),
         "phan": _normalize_value(row.get("phan")),
         "chuong": _normalize_value(row.get("chuong")),
         "muc": _normalize_value(row.get("muc")),
-        "loai_van_ban": _normalize_value(row.get("loai_van_ban")),
+        "loai_van_ban": loai,
         "ngay_ban_hanh": _normalize_value(row.get("ngay_ban_hanh")),
+        "tinh_trang_hieu_luc": tinh_trang,
+        "ngay_co_hieu_luc": _normalize_value(row.get("ngay_co_hieu_luc")),
+        "ngay_het_hieu_luc": _normalize_value(row.get("ngay_het_hieu_luc")),
+        "is_consolidated": _is_consolidated(tinh_trang, ten),
         "start_char": _normalize_value(row.get("start_char")),
         "end_char": _normalize_value(row.get("end_char")),
     }
@@ -873,6 +904,21 @@ def add_article_nodes(
         doc_key = f"DOC:{doc_id}"
 
         attrs = build_art_attrs(row_series)
+        # B1 backfill: the Stage-2 articles parquet does not propagate the
+        # doc-level effect-status columns (tinh_trang_hieu_luc, ngay_co_hieu_luc,
+        # ngay_het_hieu_luc). Since the parent DOC node (built in Stage 5.2)
+        # already carries them, inherit them onto the ART node so the
+        # retrieval-side scorer / filter (B2/B3/B4) can resolve per row_idx
+        # -> doc_uid -> ART without re-embedding. is_consolidated is recomputed
+        # from the inherited values when the ART row itself lacks them.
+        doc_attrs = G.nodes.get(doc_key, {}) or {}
+        for _f in ("tinh_trang_hieu_luc", "ngay_co_hieu_luc", "ngay_het_hieu_luc"):
+            if not attrs.get(_f) and doc_attrs.get(_f):
+                attrs[_f] = doc_attrs.get(_f)
+        if not attrs.get("is_consolidated"):
+            attrs["is_consolidated"] = bool(doc_attrs.get("is_consolidated")) or _is_consolidated(
+                attrs.get("tinh_trang_hieu_luc"), attrs.get("ten_van_ban")
+            )
         if art_key in G.nodes:
             G.nodes[art_key].update(attrs)
         else:
@@ -959,6 +1005,10 @@ def _print_article_attribute_coverage(G: "nx.MultiDiGraph") -> None:
         "muc",
         "loai_van_ban",
         "ngay_ban_hanh",
+        "tinh_trang_hieu_luc",
+        "ngay_co_hieu_luc",
+        "ngay_het_hieu_luc",
+        "is_consolidated",
         "start_char",
         "end_char",
     ]
@@ -1507,7 +1557,21 @@ def add_doc_doc_edges(
         # Use the canonical enum as the multi-edge key so the same
         # (u, v, rel_enum) triple is idempotent across re-runs.
         if not G.has_edge(u, v, key=rel_enum):
-            G.add_edge(u, v, key=rel_enum, relation=rel_enum)
+            # B1: enrich AMENDS/REPLACES/CONSOLIDATES/CORRECTS edges with
+            # VN-legal attributes so the graph expander (B5) can apply
+            # recency-weighted / amendment-aware discounts. These are derived
+            # from the SOURCE doc node (the amending / consolidating doc) and
+            # the raw relationship label, with safe fallbacks.
+            edge_attrs: Dict[str, Any] = {"relation": rel_enum}
+            if rel_enum in {"AMENDS", "REPLACES", "CONSOLIDATES", "CORRECTS"}:
+                src_attrs = G.nodes.get(u, {}) or {}
+                edge_attrs["effective_date"] = src_attrs.get("ngay_co_hieu_luc")
+                edge_attrs["amendment_type"] = rel_enum
+                raw_label_lower = str(label or "").lower()
+                edge_attrs["is_partial"] = ("1 phần" in raw_label_lower) or (
+                    "một phần" in raw_label_lower
+                )
+            G.add_edge(u, v, key=rel_enum, **edge_attrs)
             edges_added += 1
 
     return edges_added, kept_counts, dropped_records

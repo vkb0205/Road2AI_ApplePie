@@ -91,7 +91,19 @@ class RetrievalConfig:
 
 @dataclass
 class Hit:
-    """A single final retrieval hit, carrying the metadata needed for output."""
+    """A single final retrieval hit, carrying the metadata needed for output.
+
+    ``origin_subquery`` / ``aspect_id`` are populated by the decomposition
+    layer (:class:`DecomposingHybridRetriever` in the colab/kaggle notebooks)
+    when a query is split into per-aspect sub-queries. They let the downstream
+    article-selection stage reason about aspect coverage directly from the
+    fused Hit list, instead of re-deriving it from per-sub-query traces.
+
+    - ``origin_subquery``: 0-based index of the sub-query that surfaced this
+      Hit (``-1`` / unset when the hit did not come from a decomposed leg).
+    - ``aspect_id``: the facet id this Hit was tagged with by the fusion layer
+      (empty when no facet mapping is available).
+    """
 
     row_idx: int
     score: float
@@ -102,6 +114,8 @@ class Hit:
     chunk_id: str = ""
     doc_uid: str = ""
     chunk_text: str = ""
+    origin_subquery: int = -1
+    aspect_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -113,6 +127,8 @@ class Hit:
             "dieu_so": self.dieu_so,
             "chunk_id": self.chunk_id,
             "doc_uid": self.doc_uid,
+            "origin_subquery": self.origin_subquery,
+            "aspect_id": self.aspect_id,
         }
 
 
