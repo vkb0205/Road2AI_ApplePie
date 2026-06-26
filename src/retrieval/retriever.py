@@ -674,8 +674,20 @@ class HybridRetriever:
         # per query re-downloads/reloads the weights and spikes host RAM (OOM
         # risk on a 12 GB Colab instance running the 20-question dev batch).
         # Cached reuse keeps identical outputs (same model, fp16, compute_score).
+        #
+        # The load itself can raise OSError/EnvironmentError when the HF cache
+        # is partial/corrupt (e.g. a local dir exists for the model id but is
+        # missing pytorch_model.bin) or the hub is unreachable. Degrade to the
+        # pre-rerank order rather than crashing the whole batch — same contract
+        # as the import-unavailable path above.
         if self._reranker is None:
-            self._reranker = FlagReranker(cfg.rerank_model, use_fp16=True)
+            try:
+                self._reranker = FlagReranker(cfg.rerank_model, use_fp16=True)
+            except Exception as e:
+                print(f"[rerank] could not load {cfg.rerank_model}: {e!r}; "
+                      f"skipping rerank (pre-rerank order kept)")
+                self._reranker_unavailable = True
+                return ordered
         reranker = self._reranker
 
         pairs: List[Tuple[str, str]] = []
