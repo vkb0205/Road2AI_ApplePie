@@ -309,3 +309,129 @@ def dump_json(obj: Any, path: str) -> None:
     Path(path).write_text(
         json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Unified pipeline factory (retrieve + optional decompose + select + generate)
+# --------------------------------------------------------------------------- #
+def make_fts_text_provider(fts) -> "callable":
+    """Build a ``(law_id, ten_van_ban, dieu_so) -> str`` text provider over FTS.
+
+    Looks up the best (longest) ``chunk_text`` for a given ``law_id`` +
+    ``dieu_so`` from the Stage-6 ``chunks`` table, so the generator gets real
+    article text as grounding context. Returns "" on any miss so generation
+    degrades gracefully (the answer still cites via the allowed list).
+    """
+
+    def _provider(law_id: str, ten_van_ban: str, dieu_so: str) -> str:
+        conn = getattr(fts, "_conn", None)
+        if conn is None:
+            return ""
+        try:
+            rows = conn.execute(
+                "SELECT chunk_text FROM chunks WHERE law_id = ? AND dieu_so = ? "
+                "ORDER BY length(chunk_text) DESC LIMIT 1",
+                (str(law_id), str(dieu_so)),
+            ).fetchall()
+        except Exception:
+            return ""
+        if rows:
+            r = rows[0]
+            try:
+                return str(r["chunk_text"] or "")
+            except Exception:
+                return str(r[0] or "")
+        return ""
+
+    return _provider
+
+
+def build_unified_pipeline(
+    stage6_root: str,
+    use_dense: bool = True,
+    use_rerank: bool = True,
+    use_decomposition: bool = False,
+    use_generator: bool = True,
+    fts_mode: str = "bm25_ranked",
+    gpu_id: int = 0,
+    anchor_cfg: Optional[DocAnchorConfig] = None,
+    select_cfg: Optional[SelectConfig] = None,
+    gen_model: str = "Qwen/Qwen2.5-7B-Instruct",
+    gen_load_in_4bit: bool = True,
+    max_sub_queries: int = 4,
+    gen_context_topk: int = 6,
+):
+    """Construct the full unified pipeline from a Stage-6 bundle directory.
+
+    Wires the document-anchored retriever (FTS + FAISS + cross-encoder), the
+    optional rule-based decomposition router, the F2 selector, and the optional
+    IRAC generator (one 4-bit Qwen) plus an FTS-backed text provider. No
+    hardcoded law-id / domain tables anywhere.
+
+    Returns ``(pipe, fts)`` — ``pipe`` is a
+    :class:`retrieval.unified_pipeline.UnifiedPipeline`; ``fts`` is kept so the
+    caller can ``fts.close()`` / reopen for lifecycle management.
+    """
+    from retrieval.bm25_index import FTSIndex
+    from retrieval.unified_pipeline import UnifiedConfig, UnifiedPipeline
+
+    paths = BundlePaths(stage6_root)
+    fts = FTSIndex(paths.sqlite, mode=fts_mode).open()
+    lexical = make_lexical_search(fts)
+
+    dense = None
+    if use_dense:
+        from retrieval.faiss_index import FAISSIndex, BGEQueryEncoder
+
+        faiss_index = FAISSIndex(
+            paths.faiss, paths.meta, paths.model_meta, gpu_id=gpu_id
+        ).load_index()
+        encoder = BGEQueryEncoder(device=f"cuda:{gpu_id}")
+        dense = make_dense_search(faiss_index, encoder)
+
+    fetch_text = make_fetch_text(fts) if use_rerank else None
+    rerank = make_reranker(device=f"cuda:{gpu_id}") if use_rerank else None
+
+    retriever = DocAnchoredRetriever(
+        lexical_search=lexical,
+        dense_search=dense,
+        fetch_text=fetch_text,
+        rerank=rerank,
+        cfg=anchor_cfg or DocAnchorConfig(),
+    )
+
+    router = None
+    if use_decomposition:
+        from retrieval.sub_query_router import SubQueryRouter, SubQueryRouterConfig
+
+        router = SubQueryRouter(
+            llm_call=None,
+            config=SubQueryRouterConfig(
+                use_llm=False, max_sub_queries=max_sub_queries
+            ),
+        )
+
+    generator = None
+    if use_generator:
+        from generation.generator import IRACGenerator, build_hf_llm_call
+
+        llm_call = build_hf_llm_call(
+            model_name=gen_model,
+            device=f"cuda:{gpu_id}",
+            load_in_4bit=gen_load_in_4bit,
+        )
+        generator = IRACGenerator(llm_call=llm_call)
+
+    pipe = UnifiedPipeline(
+        retriever=retriever,
+        select_cfg=select_cfg or SelectConfig(),
+        router=router,
+        generator=generator,
+        text_provider=make_fts_text_provider(fts),
+        cfg=UnifiedConfig(
+            use_decomposition=use_decomposition,
+            max_sub_queries=max_sub_queries,
+            gen_context_topk=gen_context_topk,
+        ),
+    )
+    return pipe, fts
