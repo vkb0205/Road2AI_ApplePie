@@ -238,7 +238,19 @@ class FTSIndex:
         Each hit dict contains ``row_idx``, ``chunk_id``, ``doc_uid``,
         ``law_id``, ``ten_van_ban``, ``dieu_so`` and (in ``bm25_ranked``
         mode) ``bm25_score``. The returned list is already truncated to
-        ``top_k`` and preserves the FTS5 ranking order.
+        ``top_k`` and preserves the FTS5 ranking order (best first).
+
+        Score sign convention (important): SQLite FTS5's ``bm25()`` returns
+        values where **more-negative = more-relevant**, so a SQL
+        ``ORDER BY bm25_score`` correctly returns best-first. Every downstream
+        stage of the pipeline (RRF, doc-anchoring, article aggregation, K
+        selection) sorts with ``reverse=True`` ("higher = better"), the same
+        convention as the dense (cosine, ∈ [0,1]) and reranker (sigmoid,
+        ∈ [0,1]) legs. To keep a single uniform "higher = better" contract
+        across all legs, the score is **negated once at the source** here, so
+        the most relevant chunk gets the *largest* ``bm25_score``. Without this
+        the lexical leg's ranking is silently inverted relative to dense/rerank,
+        which puts the wrong article at the top and collapses F2 to ~0.
         """
         if self._conn is None:
             raise RuntimeError("FTSIndex not opened; call .open() or use 'with'")
@@ -271,7 +283,11 @@ class FTSIndex:
             out = []
             for r in rows:
                 d = {c: r[c] for c in _META_COLS}
-                d["bm25_score"] = float(r["bm25_score"])
+                # Negate so "higher = better" holds downstream (see docstring).
+                # FTS5's bm25() is more-negative-for-better; the SQL ORDER BY
+                # above already returns best-first, so we only fix the sign of
+                # the exposed score, not the row order.
+                d["bm25_score"] = -float(r["bm25_score"])
                 out.append(d)
             return out
 

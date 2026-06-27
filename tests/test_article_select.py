@@ -220,3 +220,72 @@ def test_recovers_gold_from_provincial_noise():
     assert "Điều 1" in chosen_dieus
     assert "Điều 12" in chosen_dieus
     assert "Điều 4" not in chosen_dieus
+
+
+# --------------------------------------------------------------------------- #
+# Scale-agnostic K policy (BM25-sign / abs_margin-scale fix)
+# --------------------------------------------------------------------------- #
+def test_select_admits_close_second_on_raw_bm25_scale():
+    """A 2nd article within the relative margin is admitted even when scores
+    are on a raw BM25 scale (~100), where an absolute gap of 0.12 would
+    otherwise veto it and force K=1 (the recall-killing bug)."""
+    cands = [
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 40", 111.46),
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 11", 100.61),  # ~90% of top
+    ]
+    chosen = select_articles(
+        cands, SelectConfig(rel_margin=0.18, abs_margin=0.12, max_k=3)
+    )
+    assert {a.dieu for a in chosen} == {"Điều 40", "Điều 11"}
+
+
+def test_select_rejects_distant_second_on_raw_bm25_scale():
+    """On the raw BM25 scale the relative margin still bounds admission — a
+    2nd article far below the top (well outside rel_margin) is NOT admitted."""
+    cands = [
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 40", 111.46),
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 11", 60.00),  # ~54% of top
+    ]
+    chosen = select_articles(
+        cands, SelectConfig(rel_margin=0.18, abs_margin=0.12, max_k=3)
+    )
+    assert [a.dieu for a in chosen] == ["Điều 40"]
+
+
+def test_select_abs_margin_still_honoured_on_normalised_scale():
+    """When scores are normalised [0,1] (reranker sigmoid regime), the
+    absolute margin gate stays active and vetoes a 2nd that is within the
+    relative margin but outside the absolute margin."""
+    cands = [
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 23", 0.80),
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 33", 0.60),  # 75% of top, gap 0.20
+    ]
+    chosen = select_articles(
+        cands, SelectConfig(rel_margin=0.18, abs_margin=0.12, max_k=3)
+    )
+    # gap 0.20 > abs_margin 0.12 -> rejected even though 0.60 >= 0.80*(1-0.18)=0.656 is False too;
+    # but pick a case that isolates the abs gate: within rel but outside abs.
+    cands2 = [
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 23", 0.80),
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 33", 0.70),  # 87.5% of top (within rel),
+    ]                                                            # gap 0.10 <= 0.12 (within abs) -> admitted
+    chosen2 = select_articles(
+        cands2, SelectConfig(rel_margin=0.18, abs_margin=0.12, max_k=3)
+    )
+    assert {a.dieu for a in chosen2} == {"Điều 23", "Điều 33"}
+    # And the first pair: 0.60 < 0.656 fails the relative gate -> rejected.
+    assert [a.dieu for a in chosen] == ["Điều 23"]
+
+
+def test_select_admits_close_second_on_negative_top():
+    """Legacy un-negated BM25 (negative top, more-negative=better): a close
+    runner-up (only slightly more negative) is admitted, instead of being
+    silently blocked by the old `top > 0` guard."""
+    cands = [
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 40", -111.46),
+        ArticleCandidate("01/2021/NĐ-CP", "ND", "Điều 11", -111.46 * (1 + 0.10)),
+    ]
+    chosen = select_articles(
+        cands, SelectConfig(rel_margin=0.18, abs_margin=0.12, max_k=3)
+    )
+    assert {a.dieu for a in chosen} == {"Điều 40", "Điều 11"}

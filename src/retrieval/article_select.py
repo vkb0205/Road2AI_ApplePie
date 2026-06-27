@@ -179,9 +179,17 @@ class SelectConfig:
     max_k: int = 3                        # never return more than this
     min_k: int = 1                        # always return at least this
     # Add the n-th candidate (n>=2) only if its score is within `rel_margin`
-    # (fraction of the top score) AND `abs_margin` of the top score.
+    # (fraction of the top score) AND, when scores are on a normalized [0,1]
+    # scale, within `abs_margin` of the top score. The relative criterion is
+    # scale-invariant and is what actually governs admission for raw BM25
+    # scores (which live on a ~100 scale, where an absolute gap of 0.12 would
+    # otherwise veto every 2nd article and force K=1 — collapsing recall).
     rel_margin: float = 0.18
     abs_margin: float = 0.12
+    # Scores whose top value exceeds this are treated as "unnormalised" (raw
+    # BM25 / large-magnitude) and the absolute-margin gate is skipped, leaving
+    # admission to the scale-invariant relative margin alone.
+    normalized_score_ceiling: float = 1.0
     # Small bonus when several authoritative docs independently agree on a
     # number — multi-document agreement is weak evidence of correctness.
     agreement_bonus: float = 0.02
@@ -246,6 +254,13 @@ def select_articles(
     score is close to the top (a confident second/third article), capped at
     ``max_k``. This matches the dev-set gold cardinality (16×1, 4×2) while
     protecting recall.
+
+    Admission criterion (scale-agnostic): a candidate is admitted iff its
+    ``final_score`` is within ``rel_margin`` (a *fraction* of the top score) of
+    the top. The ``abs_margin`` gate is applied **only** when the top score is
+    on a normalised [0,1] scale (reranker sigmoid / dense cosine); for raw BM25
+    scores (magnitude ~100) an absolute gap of 0.12 is meaningless and would
+    veto every second article, forcing K=1 and zero recall.
     """
     cfg = cfg or SelectConfig()
     ranked = aggregate_articles(candidates, cfg)
@@ -254,11 +269,28 @@ def select_articles(
 
     top = ranked[0].final_score
     chosen = [ranked[0]]
+    # The absolute-margin gate is meaningful only for normalised scores.
+    use_abs_gate = 0.0 <= top <= cfg.normalized_score_ceiling
     for art in ranked[1:]:
         if len(chosen) >= cfg.max_k:
             break
-        within_rel = art.final_score >= top * (1.0 - cfg.rel_margin) if top > 0 else False
-        within_abs = (top - art.final_score) <= cfg.abs_margin
+        # Relative margin is scale-invariant; guard the sign so a negative top
+        # (legacy un-negated BM25) still admits close runners-up rather than
+        # silently blocking everything.
+        if top > 0:
+            within_rel = art.final_score >= top * (1.0 - cfg.rel_margin)
+        elif top < 0:
+            # ``ranked`` is sorted descending, so for a negative top the
+            # runner-up is always *more negative* (lower). "Within margin"
+            # means the runner-up is not too far below top, i.e. it sits
+            # between ``top`` and ``top*(1+margin)`` (a more-negative floor).
+            # The check is therefore ``art >= floor`` (>=, not <=): a ``<=``
+            # would demand the runner-up be *even more* negative than the
+            # floor, which is the opposite of "close to top".
+            within_rel = art.final_score >= top * (1.0 + cfg.rel_margin)
+        else:
+            within_rel = True
+        within_abs = (top - art.final_score) <= cfg.abs_margin if use_abs_gate else True
         if within_rel and within_abs:
             chosen.append(art)
         else:

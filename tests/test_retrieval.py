@@ -387,6 +387,39 @@ class TestFTSIndexRealBundle:
             assert all("chunk_text" in r for r in rows)
             assert [r["row_idx"] for r in rows] == idxs  # order preserved
 
+    def test_bm25_ranked_exposes_positive_decreasing_scores(self):
+        """Fix #1: bm25_score must be negated so "higher = better" downstream.
+
+        SQLite FTS5's ``bm25()`` returns values where more-negative = more
+        relevant. The pipeline (RRF, doc-anchoring, article aggregation, K
+        selection) all sort with ``reverse=True`` ("higher = better"), the same
+        convention as the dense/rerank legs. If the negation is dropped the
+        lexical ranking is silently inverted, the wrong article wins top-1, and
+        F2 collapses to ~0. This test guards against a regression of that sign
+        fix by asserting the exposed score is positive and best-first.
+        """
+        from retrieval.bm25_index import FTSIndex
+
+        with FTSIndex(str(STAGE6 / "chunk_store.sqlite"), mode="bm25_ranked") as fts:
+            hits = fts.search("đăng ký doanh nghiệp", top_k=10)
+            assert len(hits) >= 2, "need >=2 hits to compare score ordering"
+            scores = [h["bm25_score"] for h in hits]
+            # All scores must be positive (negation of a negative FTS5 bm25()).
+            assert all(s > 0 for s in scores), (
+                f"bm25_score must be positive after negation, got {scores}"
+            )
+            # Best-first / higher-is-better: scores must be non-increasing.
+            for i in range(len(scores) - 1):
+                assert scores[i] >= scores[i + 1], (
+                    f"bm25_score not best-first at i={i}: {scores[i]} < {scores[i + 1]} "
+                    f"(full order {scores})"
+                )
+            # Sanity: the top hit should be strictly better than the last
+            # (otherwise the query returned a near-identical block).
+            assert scores[0] > scores[-1], (
+                f"top and bottom bm25_score tied: {scores}"
+            )
+
 
 # ============================ Debug tracing ============================ #
 
