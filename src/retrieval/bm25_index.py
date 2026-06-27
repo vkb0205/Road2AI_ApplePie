@@ -33,6 +33,7 @@ __all__ = [
     "FTSIndex",
     "PureBM25",
     "tokenize_query",
+    "filter_query_terms",
     "build_fts_match_expr",
 ]
 
@@ -46,6 +47,25 @@ _META_COLS = ("row_idx", "chunk_id", "doc_uid", "law_id", "ten_van_ban", "dieu_s
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
+# High-frequency Vietnamese function words. OR-ing these into an FTS5 MATCH is
+# what makes ``bm25_ranked`` pathological: each appears in a large fraction of
+# the 636k-chunk corpus, so the match set explodes and ``ORDER BY bm25()`` ends
+# up scoring + sorting almost the whole table before LIMIT throws it away
+# (measured: a single dev query spent ~319 s in this one stage). Dropping them
+# from the OR list keeps only discriminative content terms and brings the
+# lexical leg back to milliseconds, with no loss of ranking quality (the whole
+# query is still kept as a quoted phrase, which carries the precision signal).
+_VI_STOPWORDS = frozenset(
+    {
+        "và", "là", "của", "có", "được", "cho", "các", "những", "này", "đó",
+        "khi", "nào", "gì", "bao", "gồm", "theo", "với", "để", "trong", "ra",
+        "vào", "lên", "xuống", "từ", "đến", "tại", "về", "bị", "bởi", "thì",
+        "mà", "hay", "hoặc", "nếu", "nên", "sẽ", "đã", "đang", "như", "thế",
+        "ai", "đâu", "sao", "bằng", "cũng", "rất", "quá", "lại", "còn", "chỉ",
+        "một", "hai", "ba", "không", "phải", "đây", "kia", "ấy", "sự", "việc",
+    }
+)
+
 
 def tokenize_query(query: str) -> List[str]:
     """Split a Vietnamese query into whitespace/punctuation-delimited tokens.
@@ -56,6 +76,18 @@ def tokenize_query(query: str) -> List[str]:
     if not query:
         return []
     return _WORD_RE.findall(query)
+
+
+def filter_query_terms(tokens: Sequence[str]) -> List[str]:
+    """Drop high-frequency stopwords (and 1-char tokens) from an OR token list.
+
+    Pure + unit-testable. These terms add enormous OR fanout to an FTS5 MATCH
+    but almost no discriminative signal. Falls back to the original token list
+    if filtering would empty it, so a query made entirely of stopwords still
+    returns something rather than degrading to an empty MATCH.
+    """
+    kept = [t for t in tokens if len(t) > 1 and t.lower() not in _VI_STOPWORDS]
+    return kept if kept else list(tokens)
 
 
 def build_fts_match_expr(phrases: Sequence[str]) -> str:
@@ -184,11 +216,14 @@ class FTSIndex:
             return []
 
         # Build the MATCH expression: phrase = the whole query, plus each
-        # individual token OR'd in, so both multi-word and single-term hits
+        # discriminative token OR'd in, so both multi-word and single-term hits
         # surface. The whole-query phrase is quoted first (highest weight via
-        # FTS5 phrase matching) followed by token alternatives.
+        # FTS5 phrase matching) followed by token alternatives. Stopwords are
+        # stripped from the OR list: leaving them in made ``bm25_ranked`` match
+        # a large fraction of the corpus and globally sort it (~319 s/query),
+        # while the quoted full-query phrase still carries the precision signal.
         phrases = [query.strip()]
-        phrases.extend(tokens)
+        phrases.extend(filter_query_terms(tokens))
         match_expr = build_fts_match_expr(phrases)
         if not match_expr:
             return []

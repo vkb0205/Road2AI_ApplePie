@@ -35,6 +35,7 @@ from retrieval.rrf import rrf_fuse, rrf_score_only  # noqa: E402
 from retrieval.bm25_index import (  # noqa: E402
     PureBM25,
     build_fts_match_expr,
+    filter_query_terms,
     tokenize_query,
 )
 from retrieval.graph_expand import GraphExpander, EXPANSION_DOC_RELS  # noqa: E402
@@ -158,6 +159,27 @@ class TestFTSQueryBuilders:
 
     def test_build_match_expr_empty(self):
         assert build_fts_match_expr([]) == ""
+
+    def test_filter_query_terms_drops_stopwords(self):
+        # The pathological dev query: stopwords (bao/gồm/những/nào) must be
+        # dropped so bm25_ranked does not match a large slice of the corpus.
+        toks = tokenize_query(
+            "Thủ tục đăng ký doanh nghiệp lần đầu bao gồm những bước nào"
+        )
+        kept = filter_query_terms(toks)
+        for content in ("Thủ", "tục", "đăng", "ký", "doanh", "nghiệp", "bước"):
+            assert content in kept
+        for stop in ("bao", "gồm", "những", "nào"):
+            assert stop not in kept
+
+    def test_filter_query_terms_drops_single_char(self):
+        assert filter_query_terms(["a", "doanh", "x"]) == ["doanh"]
+
+    def test_filter_query_terms_stopword_only_fallback(self):
+        # A query made entirely of stopwords must not collapse to empty, or the
+        # MATCH would be empty and return nothing.
+        toks = tokenize_query("có những gì nào")
+        assert filter_query_terms(toks) == toks
 
 
 # ============================ Graph expansion ============================ #
