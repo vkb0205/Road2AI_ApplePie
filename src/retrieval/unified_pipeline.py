@@ -446,17 +446,39 @@ def summarize_timings(timings: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 # Batch driver + submission helpers
 # --------------------------------------------------------------------------- #
 def run_dev_set(
-    pipe: UnifiedPipeline, questions_path: str
+    pipe: UnifiedPipeline,
+    questions_path: str,
+    output_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Run the pipeline over a ``[{id, question}, ...]`` JSON file."""
+    """Run the pipeline over a ``[{id, question}, ...]`` JSON file.
+
+    When ``output_path`` is provided, the partial result list is flushed to disk
+    immediately after every processed question. This makes long Kaggle runs
+    crash-inspectable instead of losing all completed records if the kernel dies
+    before the full batch finishes.
+    """
     import json
 
     records = json.loads(Path(questions_path).read_text(encoding="utf-8"))
     out: List[Dict[str, Any]] = []
+    out_path = Path(output_path) if output_path else None
+
+    def _flush() -> None:
+        if out_path is None:
+            return
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        tmp_path.write_text(
+            json.dumps(out, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(out_path)
+
     for rec in records:
         qid = rec.get("id")
         question = rec.get("question") or rec.get("query") or ""
         out.append(pipe.answer_record(qid, question))
+        _flush()
     return out
 
 
