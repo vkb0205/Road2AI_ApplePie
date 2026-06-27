@@ -270,14 +270,25 @@ class FTSIndex:
 
         cols = ", ".join(_META_COLS)
         if self.mode == "bm25_ranked":
+            # Two-phase query for speed: let FTS5's internal merge-sort find the
+            # top-k *rowids+scores* over the FTS5 index alone (SQLite optimises
+            # ``ORDER BY bm25() LIMIT k`` with an FTS5 b-tree merge — it does NOT
+            # score the whole posting list when k is small), then JOIN only those
+            # k rows to the ``chunks`` table for metadata. The naive single-query
+            # form (JOIN chunks *before* ORDER BY ... LIMIT k) JOINs every MATCH
+            # hit (often 10k-50k for Vietnamese legal text) before truncating,
+            # which dominated latency (~6.6 s/q on the Stage-6 bundle). This form
+            # returns identical results but cuts the expensive JOIN from N → k.
             sql = (
                 "SELECT c.row_idx, c.chunk_id, c.doc_uid, c.law_id, "
-                "c.ten_van_ban, c.dieu_so, bm25(chunks_fts) AS bm25_score "
-                "FROM chunks_fts "
-                "JOIN chunks c ON c.row_idx = chunks_fts.rowid "
-                "WHERE chunks_fts MATCH ? "
-                "ORDER BY bm25_score "
-                "LIMIT ?"
+                "c.ten_van_ban, c.dieu_so, t.bm25_score "
+                "FROM (SELECT rowid, bm25(chunks_fts) AS bm25_score "
+                "      FROM chunks_fts "
+                "      WHERE chunks_fts MATCH ? "
+                "      ORDER BY bm25_score "
+                "      LIMIT ?) AS t "
+                "JOIN chunks c ON c.row_idx = t.rowid "
+                "ORDER BY t.bm25_score"
             )
             rows = self._conn.execute(sql, (match_expr, int(top_k))).fetchall()
             out = []
