@@ -105,15 +105,27 @@ def test_harvest_only_anchored_docs():
 
 
 def test_harvest_best_chunk_per_dieu():
+    # Multi-chunk harvesting (default chunks_per_article=4): both chunks of the
+    # same Điều are kept, sorted best-first, so the reranker can score each and
+    # the article inherits the MAX (see retrieve_pool aggregation).
     lex = [
         _hit(1, "01/2021/NĐ-CP", "Điều 1", bm25_score=2.0),
         _hit(2, "01/2021/NĐ-CP", "Điều 1", bm25_score=9.0),  # better chunk
     ]
     anchored = [AnchoredDoc("01/2021/NĐ-CP", "01/2021/NĐ-CP", "VB", 1.0, 1.0, 0.0)]
     harvested = harvest_articles(lex, [], anchored, DocAnchorConfig())
-    assert len(harvested) == 1
-    assert harvested[0].base_score == 9.0
+    assert len(harvested) == 2  # both chunks kept for multi-chunk reranking
+    assert harvested[0].base_score == 9.0  # best chunk first
     assert harvested[0].row_idx == 2
+    assert harvested[1].base_score == 2.0
+
+    # Legacy single-chunk mode (chunks_per_article=1) keeps only the best chunk.
+    harvested1 = harvest_articles(
+        lex, [], anchored, DocAnchorConfig(chunks_per_article=1)
+    )
+    assert len(harvested1) == 1
+    assert harvested1[0].base_score == 9.0
+    assert harvested1[0].row_idx == 2
 
 
 def test_harvest_caps_per_document():

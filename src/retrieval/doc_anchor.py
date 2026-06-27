@@ -67,6 +67,14 @@ class DocAnchorConfig:
     doc_authority_weight: float = 1.0  # scale on authority prior at doc stage
     per_doc_articles: int = 6    # max distinct articles harvested per doc
     rerank_pool: int = 40        # max article candidates sent to the reranker
+    # How many chunks to keep per (doc, Điều) for multi-chunk reranking. The
+    # reranker scores EACH chunk and the article inherits the MAX score, so the
+    # article is judged by its best-matching passage rather than a single chunk
+    # picked by pre-rerank BM25/dense score (which often is NOT the passage most
+    # relevant to the query). 1 = legacy single-chunk behaviour. ~3-4 recovers
+    # gold articles that are otherwise buried below rerank-rank 5 (measured:
+    # single-chunk → F2=0.08 @ K=5; multi-chunk lifts the gold chunk's score).
+    chunks_per_article: int = 4
     authority: AuthorityConfig = field(default_factory=AuthorityConfig)
 
 
@@ -177,14 +185,18 @@ def harvest_articles(
     anchored: Sequence[AnchoredDoc],
     cfg: DocAnchorConfig,
 ) -> List[HarvestedChunk]:
-    """Keep chunks belonging to anchored docs; best chunk per (doc, Điều X).
+    """Keep chunks belonging to anchored docs; up to N chunks per (doc, Điều X).
 
-    Returns at most ``per_doc_articles`` articles per document, ordered by score
-    within each document, then flattened.
+    Keeps up to ``cfg.chunks_per_article`` chunks per (doc, Điều) — the top-N by
+    pre-rerank score — so the reranker can score each chunk and the article can
+    inherit the MAX (see ``_score``). With N=1 this is the legacy single-chunk
+    behaviour. Returns at most ``per_doc_articles`` articles per document,
+    ordered by best-chunk score within each document, then flattened.
     """
     anchored_keys = {d.doc_uid for d in anchored}
-    # (doc_key, dieu) -> best HarvestedChunk
-    best: Dict[Tuple[str, str], HarvestedChunk] = {}
+    n_per = max(1, int(getattr(cfg, "chunks_per_article", 1)))
+    # (doc_key, dieu) -> list of top-N HarvestedChunk (sorted desc by base_score)
+    best: Dict[Tuple[str, str], List[HarvestedChunk]] = {}
     for hit in list(dense_hits) + list(lexical_hits):
         key = _doc_key(hit)
         if key not in anchored_keys:
@@ -194,24 +206,31 @@ def harvest_articles(
             continue
         score = _hit_score(hit)
         bkey = (key, dieu)
-        cur = best.get(bkey)
-        if cur is None or score > cur.base_score:
-            best[bkey] = HarvestedChunk(
-                row_idx=int(hit.get("row_idx", -1)),
-                law_id=str(hit.get("law_id", "")),
-                ten_van_ban=str(hit.get("ten_van_ban", "")),
-                dieu_so=dieu,
-                base_score=score,
-            )
+        hc = HarvestedChunk(
+            row_idx=int(hit.get("row_idx", -1)),
+            law_id=str(hit.get("law_id", "")),
+            ten_van_ban=str(hit.get("ten_van_ban", "")),
+            dieu_so=dieu,
+            base_score=score,
+        )
+        lst = best.setdefault(bkey, [])
+        # keep the top-N by base_score (insertion sort: N is tiny)
+        lst.append(hc)
+        lst.sort(key=lambda h: h.base_score, reverse=True)
+        if len(lst) > n_per:
+            lst.pop()
 
-    # Cap articles per document.
-    by_doc: Dict[str, List[HarvestedChunk]] = {}
-    for (key, _dieu), hc in best.items():
-        by_doc.setdefault(key, []).append(hc)
+    # Cap articles per document (by each article's best chunk score), keeping
+    # all of each surviving article's chunks (up to n_per).
+    by_doc: Dict[str, List[Tuple[float, List[HarvestedChunk]]]] = {}
+    for (key, _dieu), chunks in best.items():
+        by_doc.setdefault(key, []).append((chunks[0].base_score, chunks))
     harvested: List[HarvestedChunk] = []
-    for key, items in by_doc.items():
-        items.sort(key=lambda h: h.base_score, reverse=True)
-        harvested.extend(items[: cfg.per_doc_articles])
+    for key, art_list in by_doc.items():
+        # sort articles within a doc by their best chunk's base_score
+        art_list.sort(key=lambda t: t[0], reverse=True)
+        for _best_score, chunks in art_list[: cfg.per_doc_articles]:
+            harvested.extend(chunks)  # chunks already sorted desc & capped to n_per
     return harvested
 
 
@@ -259,20 +278,30 @@ class DocAnchoredRetriever:
         if not harvested:
             return []
 
-        # Limit how many candidates we rerank (cost control).
+        # Limit how many candidates we rerank (cost control). With multi-chunk
+        # harvesting (chunks_per_article>1) the pool is larger, so the cap is
+        # applied to *chunks* before aggregation.
         harvested.sort(key=lambda h: h.base_score, reverse=True)
         harvested = harvested[: cfg.rerank_pool]
 
         scores = self._score(query, harvested)
-        return [
-            ArticleCandidate(
-                law_id=h.law_id,
-                ten_van_ban=h.ten_van_ban,
-                dieu_so=h.dieu_so,
-                score=s,
-            )
-            for h, s in zip(harvested, scores)
-        ]
+        # Aggregate per-article: an article may have several harvested chunks
+        # (chunks_per_article>1); the article inherits the MAX reranker score so
+        # it is judged by its best-matching passage. Keep the chunk that won.
+        best_per_article: Dict[Tuple[str, str, str], ArticleCandidate] = {}
+        for h, s in zip(harvested, scores):
+            akey = (h.law_id, h.ten_van_ban, h.dieu_so)
+            cur = best_per_article.get(akey)
+            if cur is None or s > cur.score:
+                best_per_article[akey] = ArticleCandidate(
+                    law_id=h.law_id,
+                    ten_van_ban=h.ten_van_ban,
+                    dieu_so=h.dieu_so,
+                    score=s,
+                )
+        out = list(best_per_article.values())
+        out.sort(key=lambda a: a.score, reverse=True)
+        return out
 
     def _score(self, query: str, harvested: List[HarvestedChunk]) -> List[float]:
         """Rerank passages if a reranker + text fetch are available."""
