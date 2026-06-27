@@ -35,6 +35,7 @@ from retrieval.rrf import rrf_fuse, rrf_score_only  # noqa: E402
 from retrieval.bm25_index import (  # noqa: E402
     PureBM25,
     build_fts_match_expr,
+    build_query_phrases,
     filter_query_terms,
     tokenize_query,
 )
@@ -180,6 +181,23 @@ class TestFTSQueryBuilders:
         # MATCH would be empty and return nothing.
         toks = tokenize_query("có những gì nào")
         assert filter_query_terms(toks) == toks
+
+    def test_ranked_query_phrases_avoid_unigram_fanout(self):
+        q = "Thủ tục đăng ký doanh nghiệp lần đầu bao gồm những bước nào"
+        phrases = build_query_phrases(q, tokenize_query(q), ranked=True)
+        assert q in phrases
+        assert "đăng ký doanh" in phrases
+        assert "ký doanh nghiệp" in phrases
+        assert "doanh nghiệp" in phrases
+        # Ranked mode must not OR broad single terms; they make bm25 sort huge.
+        assert "doanh" not in phrases
+        assert "nghiệp" not in phrases
+        assert "nào" not in phrases
+
+    def test_fast_query_phrases_keep_unigrams(self):
+        q = "đăng ký doanh nghiệp"
+        phrases = build_query_phrases(q, tokenize_query(q), ranked=False)
+        assert phrases == [q, "đăng", "ký", "doanh", "nghiệp"]
 
 
 # ============================ Graph expansion ============================ #

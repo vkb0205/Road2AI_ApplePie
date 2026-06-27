@@ -34,6 +34,7 @@ __all__ = [
     "PureBM25",
     "tokenize_query",
     "filter_query_terms",
+    "build_query_phrases",
     "build_fts_match_expr",
 ]
 
@@ -88,6 +89,37 @@ def filter_query_terms(tokens: Sequence[str]) -> List[str]:
     """
     kept = [t for t in tokens if len(t) > 1 and t.lower() not in _VI_STOPWORDS]
     return kept if kept else list(tokens)
+
+
+def build_query_phrases(query: str, tokens: Sequence[str], *, ranked: bool) -> List[str]:
+    """Build FTS phrases without exploding ranked BM25 candidate sets.
+
+    ``fts_fast`` can tolerate wider unigram OR terms because it does not run a
+    global bm25 sort. ``bm25_ranked`` cannot: even filtered unigrams like
+    "doanh" or "nghiệp" can match huge parts of the corpus. For ranked mode,
+    prefer the full query plus adjacent 2-3 token content phrases, which keeps
+    recall for legal terms such as "đăng ký doanh nghiệp" while avoiding the
+    pathological full-corpus unigram fanout.
+    """
+    full = (query or "").strip()
+    content = filter_query_terms(tokens)
+    phrases: List[str] = [full] if full else []
+    if not ranked:
+        phrases.extend(content)
+        return phrases
+
+    seen = set(phrases)
+    for n in (3, 2):
+        if len(content) < n:
+            continue
+        for i in range(0, len(content) - n + 1):
+            phrase = " ".join(content[i : i + n])
+            if phrase and phrase not in seen:
+                seen.add(phrase)
+                phrases.append(phrase)
+    if len(phrases) == (1 if full else 0):
+        phrases.extend(content[:3])
+    return phrases
 
 
 def build_fts_match_expr(phrases: Sequence[str]) -> str:
@@ -215,15 +247,11 @@ class FTSIndex:
         if not tokens:
             return []
 
-        # Build the MATCH expression: phrase = the whole query, plus each
-        # discriminative token OR'd in, so both multi-word and single-term hits
-        # surface. The whole-query phrase is quoted first (highest weight via
-        # FTS5 phrase matching) followed by token alternatives. Stopwords are
-        # stripped from the OR list: leaving them in made ``bm25_ranked`` match
-        # a large fraction of the corpus and globally sort it (~319 s/query),
-        # while the quoted full-query phrase still carries the precision signal.
-        phrases = [query.strip()]
-        phrases.extend(filter_query_terms(tokens))
+        # Build the MATCH expression. ``fts_fast`` may use wider unigram ORs
+        # because it does not globally sort. ``bm25_ranked`` must stay narrow:
+        # OR-ing common unigrams like "doanh"/"nghiệp" still leaves a huge
+        # candidate set, so ranked mode uses phrase n-grams instead.
+        phrases = build_query_phrases(query, tokens, ranked=(self.mode == "bm25_ranked"))
         match_expr = build_fts_match_expr(phrases)
         if not match_expr:
             return []
