@@ -351,6 +351,7 @@ def build_unified_pipeline(
     use_dense: bool = True,
     use_rerank: bool = True,
     use_decomposition: bool = False,
+    use_llm_decomposition: bool = False,
     use_generator: bool = True,
     fts_mode: str = "bm25_ranked",
     gpu_id: int = 0,
@@ -364,9 +365,16 @@ def build_unified_pipeline(
     """Construct the full unified pipeline from a Stage-6 bundle directory.
 
     Wires the document-anchored retriever (FTS + FAISS + cross-encoder), the
-    optional rule-based decomposition router, the F2 selector, and the optional
-    IRAC generator (one 4-bit Qwen) plus an FTS-backed text provider. No
-    hardcoded law-id / domain tables anywhere.
+    optional decomposition router, the F2 selector, and the optional IRAC
+    generator plus an FTS-backed text provider. No hardcoded law-id / domain
+    tables anywhere.
+
+    Decomposition has two modes. With ``use_decomposition=True`` and
+    ``use_llm_decomposition=False`` the router uses the deterministic
+    rule-based split. With ``use_llm_decomposition=True`` it additionally drives
+    decomposition with the LLM (reusing the *same* 4-bit Qwen as the generator,
+    so no second model load), and the rule-based split remains the fallback when
+    the LLM call or JSON parse fails.
 
     Returns ``(pipe, fts)`` — ``pipe`` is a
     :class:`retrieval.unified_pipeline.UnifiedPipeline`; ``fts`` is kept so the
@@ -400,26 +408,44 @@ def build_unified_pipeline(
         cfg=anchor_cfg or DocAnchorConfig(),
     )
 
-    router = None
-    if use_decomposition:
-        from retrieval.sub_query_router import SubQueryRouter, SubQueryRouterConfig
-
-        router = SubQueryRouter(
-            llm_call=None,
-            config=SubQueryRouterConfig(
-                use_llm=False, max_sub_queries=max_sub_queries
-            ),
-        )
-
-    generator = None
-    if use_generator:
-        from generation.generator import IRACGenerator, build_hf_llm_call
+    # Build the (4-bit) Qwen llm_call exactly once and share it between the
+    # generator and the optional LLM-driven decomposition router. This avoids a
+    # second 7B model load when both features are enabled.
+    llm_call = None
+    if use_generator or (use_decomposition and use_llm_decomposition):
+        from generation.generator import build_hf_llm_call
 
         llm_call = build_hf_llm_call(
             model_name=gen_model,
             device=f"cuda:{gpu_id}",
             load_in_4bit=gen_load_in_4bit,
         )
+
+    router = None
+    if use_decomposition:
+        from retrieval.sub_query_router import SubQueryRouter, SubQueryRouterConfig
+
+        router_llm = None
+        if use_llm_decomposition and llm_call is not None:
+            # The router expects ``(prompt: str) -> str``; the generator's
+            # llm_call takes a chat ``messages`` list. Adapt by wrapping the
+            # prompt as a single user turn. On any LLM/parse failure the router
+            # falls back to its deterministic rule-based split internally.
+            def router_llm(prompt: str) -> str:
+                return llm_call([{"role": "user", "content": prompt}])
+
+        router = SubQueryRouter(
+            llm_call=router_llm,
+            config=SubQueryRouterConfig(
+                use_llm=use_llm_decomposition and router_llm is not None,
+                max_sub_queries=max_sub_queries,
+            ),
+        )
+
+    generator = None
+    if use_generator and llm_call is not None:
+        from generation.generator import IRACGenerator
+
         generator = IRACGenerator(llm_call=llm_call)
 
     pipe = UnifiedPipeline(

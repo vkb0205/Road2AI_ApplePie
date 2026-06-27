@@ -182,6 +182,49 @@ def test_pipeline_decomposition_switch_fuses_sub_queries():
     validate_submission([rec])
 
 
+def test_pipeline_llm_decomposition_via_prompt_adapter():
+    """The factory wires an LLM router as ``(prompt: str) -> str`` (a single chat
+    turn over the shared Qwen). Drive that exact shape with a fake LLM and assert
+    decomposition splits + fuses, with the rule-based path as the safety net."""
+    hits = [_hit(1, "L1", "Điều 5", bm25_score=5.0),
+            _hit(2, "L2", "Điều 7", bm25_score=4.0)]
+
+    def fake_llm_call(prompt: str) -> str:
+        # Mirrors build_unified_pipeline's router_llm: prompt-in, JSON-out.
+        assert isinstance(prompt, str)
+        return ('{"should_decompose": true, "sub_queries": '
+                '["xác định trách nhiệm bồi thường thiệt hại", '
+                '"xác định quyền sở hữu và nghĩa vụ của các bên"]}')
+
+    router = SubQueryRouter(llm_call=fake_llm_call,
+                            config=SubQueryRouterConfig(use_llm=True, max_sub_queries=4))
+    pipe = UnifiedPipeline(_make_retriever(hits), select_cfg=SelectConfig(max_k=3),
+                           router=router, cfg=UnifiedConfig(use_decomposition=True))
+    subs = pipe._sub_queries("một câu hỏi pháp lý phức hợp")
+    assert len(subs) == 2
+    cands = pipe.retrieve_candidates("một câu hỏi pháp lý phức hợp")
+    assert cands
+    validate_submission([pipe.answer_record(1, "một câu hỏi pháp lý phức hợp")])
+
+
+def test_pipeline_llm_decomposition_falls_back_on_bad_json():
+    """A garbage LLM response must not break routing: the router falls back to
+    the deterministic rule-based split internally."""
+    hits = [_hit(1, "L1", "Điều 5", bm25_score=5.0)]
+
+    def bad_llm_call(prompt: str) -> str:
+        return "not json at all"
+
+    router = SubQueryRouter(llm_call=bad_llm_call,
+                            config=SubQueryRouterConfig(use_llm=True))
+    pipe = UnifiedPipeline(_make_retriever(hits), select_cfg=SelectConfig(max_k=3),
+                           router=router, cfg=UnifiedConfig(use_decomposition=True))
+    # Must still return a usable (>=1) sub-query list and a valid record.
+    subs = pipe._sub_queries("xác định trách nhiệm bồi thường theo Điều 15")
+    assert len(subs) >= 1
+    validate_submission([pipe.answer_record(1, "xác định trách nhiệm bồi thường")])
+
+
 def test_text_provider_feeds_generation_context():
     hits = [_hit(1, "01/2021/NĐ-CP", "Điều 12", bm25_score=5.0)]
     seen = {}
