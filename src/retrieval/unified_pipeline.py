@@ -39,6 +39,7 @@ __all__ = [
     "UnifiedConfig",
     "UnifiedPipeline",
     "fuse_candidate_pools",
+    "summarize_timings",
     "build_record",
     "run_dev_set",
     "validate_submission",
@@ -188,6 +189,97 @@ class UnifiedPipeline:
             "relevant_docs": seen,
             "relevant_articles": relevant_articles,
         }
+
+    def answer_record_timed(
+        self, qid: Any, question: str
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Like :meth:`answer_record`, but also returns per-stage wall-clock.
+
+        The timing dict separates the three cost centres so the decomposition
+        overhead is measurable:
+
+        ``decompose``  seconds in the (optional) router decision.
+        ``retrieve``   seconds in retrieval+rerank across *all* sub-queries
+                       (this is the stage that scales with ``n_sub``).
+        ``select``     seconds in F2 article selection (cheap, CPU).
+        ``generate``   seconds in the single IRAC generation pass (fixed; does
+                       not scale with ``n_sub``).
+        ``n_sub``      number of sub-queries actually retrieved for.
+        ``decomposed`` True when the router split into >1 sub-query.
+        ``total``      sum of the above stage times.
+        """
+        import time
+
+        t0 = time.perf_counter()
+        subs = self._sub_queries(question)
+        t_decompose = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        if len(subs) == 1:
+            candidates = list(self.retriever.retrieve_pool(subs[0]))
+        else:
+            pools = [self.retriever.retrieve_pool(sq) for sq in subs]
+            candidates = fuse_candidate_pools(pools)
+        t_retrieve = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        chosen = select_articles(candidates, self.select_cfg)
+        t_select = time.perf_counter() - t0
+
+        relevant_articles = [a.to_relevant_string() for a in chosen]
+        seen: List[str] = []
+        for a in chosen:
+            doc = f"{a.law_id}|{a.ten_van_ban}"
+            if doc not in seen:
+                seen.append(doc)
+
+        answer = ""
+        t_generate = 0.0
+        if self.generator is not None:
+            contexts = self._gen_contexts(chosen)
+            t0 = time.perf_counter()
+            answer = self.generator.generate(question, contexts, relevant_articles)
+            t_generate = time.perf_counter() - t0
+
+        record = {
+            "id": qid,
+            "question": question,
+            "answer": answer,
+            "relevant_docs": seen,
+            "relevant_articles": relevant_articles,
+        }
+        timing = {
+            "decompose": t_decompose,
+            "retrieve": t_retrieve,
+            "select": t_select,
+            "generate": t_generate,
+            "n_sub": len(subs),
+            "decomposed": len(subs) > 1,
+            "total": t_decompose + t_retrieve + t_select + t_generate,
+        }
+        return record, timing
+
+
+def summarize_timings(timings: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate a list of per-query timing dicts into a report.
+
+    Returns mean/total seconds per stage, the decomposition rate, and the mean
+    sub-query count, so the retrieval multiplier from decomposition is visible.
+    """
+    n = len(timings)
+    if n == 0:
+        return {"n": 0}
+    stages = ("decompose", "retrieve", "select", "generate", "total")
+    out: Dict[str, Any] = {"n": n}
+    for s in stages:
+        vals = [float(t.get(s, 0.0)) for t in timings]
+        out[f"{s}_mean"] = sum(vals) / n
+        out[f"{s}_total"] = sum(vals)
+    n_decomposed = sum(1 for t in timings if t.get("decomposed"))
+    out["decomposed_count"] = n_decomposed
+    out["decomposed_rate"] = n_decomposed / n
+    out["mean_n_sub"] = sum(float(t.get("n_sub", 1)) for t in timings) / n
+    return out
 
 
 # --------------------------------------------------------------------------- #

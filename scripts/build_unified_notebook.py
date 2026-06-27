@@ -147,7 +147,7 @@ md(
 
 code(
     'from retrieval.kaggle_pipeline import build_unified_pipeline, dump_json\n'
-    'from retrieval.unified_pipeline import run_dev_set, validate_submission\n'
+    'from retrieval.unified_pipeline import run_dev_set, validate_submission, summarize_timings\n'
     'from retrieval.doc_anchor import DocAnchorConfig\n'
     'from retrieval.article_select import SelectConfig\n'
     '\n'
@@ -184,6 +184,48 @@ code(
     'print("relevant_articles:", _demo["relevant_articles"])\n'
     'print("relevant_docs    :", _demo["relevant_docs"])\n'
     'print("\\nanswer:\\n", _demo["answer"][:1200])\n'
+)
+
+md(
+    "## 4b. Latency benchmark — per-stage timing\n"
+    "\n"
+    "Measures where wall-clock goes (router / retrieve+rerank / select / generate)\n"
+    "on a few questions, plus the **decomposition rate** and **mean sub-query\n"
+    "count**. Retrieval scales with the number of sub-queries; generation does\n"
+    "not. Use this to decide whether `USE_LLM_DECOMPOSITION` / `MAX_SUB_QUERIES`\n"
+    "fit your time budget before the full run."
+)
+
+code(
+    'import json\n'
+    '\n'
+    'N_BENCH = 5   # questions to time (keep small; this hits the GPU)\n'
+    '_bq = Path(INPUT_QUERIES) if str(INPUT_QUERIES).strip() else Path(f"{DEV_DIR}/questions.json")\n'
+    '_bench_qs = json.loads(_bq.read_text(encoding="utf-8"))[:N_BENCH]\n'
+    '\n'
+    '_timings = []\n'
+    'for _r in _bench_qs:\n'
+    '    _qid = _r.get("id")\n'
+    '    _q = _r.get("question") or _r.get("query") or ""\n'
+    '    _rec, _t = pipe.answer_record_timed(_qid, _q)\n'
+    '    _timings.append(_t)\n'
+    '    print("id=%s n_sub=%d decomposed=%s | decompose=%.2fs retrieve=%.2fs '
+    'select=%.2fs generate=%.2fs total=%.2fs"\n'
+    '          % (_qid, _t["n_sub"], _t["decomposed"], _t["decompose"],\n'
+    '             _t["retrieve"], _t["select"], _t["generate"], _t["total"]))\n'
+    '\n'
+    '_summary = summarize_timings(_timings)\n'
+    'print("\\n[timing summary over %d queries]" % _summary["n"])\n'
+    'print("  decomposed rate : %.0f%% (%d/%d)  mean sub-queries: %.2f"\n'
+    '      % (100 * _summary["decomposed_rate"], _summary["decomposed_count"],\n'
+    '         _summary["n"], _summary["mean_n_sub"]))\n'
+    'print("  mean/query      : decompose=%.2fs retrieve=%.2fs select=%.2fs '
+    'generate=%.2fs total=%.2fs"\n'
+    '      % (_summary["decompose_mean"], _summary["retrieve_mean"],\n'
+    '         _summary["select_mean"], _summary["generate_mean"],\n'
+    '         _summary["total_mean"]))\n'
+    'print("  projected: %.1f s/query  ->  100 queries = %.1f min"\n'
+    '      % (_summary["total_mean"], _summary["total_mean"] * 100 / 60.0))\n'
 )
 
 md(

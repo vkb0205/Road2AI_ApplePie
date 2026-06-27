@@ -31,6 +31,7 @@ from retrieval.article_select import ArticleCandidate, SelectConfig  # noqa: E40
 from retrieval.doc_anchor import DocAnchoredRetriever, DocAnchorConfig  # noqa: E402
 from retrieval.sub_query_router import SubQueryRouter, SubQueryRouterConfig  # noqa: E402
 from retrieval.unified_pipeline import (  # noqa: E402
+    summarize_timings,
     UnifiedConfig,
     UnifiedPipeline,
     build_record,
@@ -205,6 +206,55 @@ def test_pipeline_llm_decomposition_via_prompt_adapter():
     cands = pipe.retrieve_candidates("một câu hỏi pháp lý phức hợp")
     assert cands
     validate_submission([pipe.answer_record(1, "một câu hỏi pháp lý phức hợp")])
+
+
+def test_answer_record_timed_reports_stages_and_matches_record():
+    hits = [_hit(1, "01/2021/NĐ-CP", "Điều 12", bm25_score=5.0)]
+    gen = IRACGenerator(llm_call=lambda m: "Theo Điều 12, hồ sơ gồm...")
+    pipe = UnifiedPipeline(_make_retriever(hits), select_cfg=SelectConfig(max_k=1),
+                           generator=gen)
+    rec, t = pipe.answer_record_timed(7, "câu hỏi")
+    # Record is schema-identical to answer_record's output.
+    assert rec["id"] == 7 and rec["answer"]
+    validate_submission([rec])
+    # Timing has all stages; total is their sum; no decomposition here.
+    for k in ("decompose", "retrieve", "select", "generate", "total", "n_sub", "decomposed"):
+        assert k in t
+    assert t["n_sub"] == 1 and t["decomposed"] is False
+    assert t["generate"] > 0.0  # the fake LLM call was timed
+    assert abs(t["total"] - (t["decompose"] + t["retrieve"] + t["select"] + t["generate"])) < 1e-6
+
+
+def test_answer_record_timed_counts_sub_queries_when_decomposed():
+    hits = [_hit(1, "L1", "Điều 5", bm25_score=5.0)]
+    router = SubQueryRouter(llm_call=None, config=SubQueryRouterConfig(use_llm=False))
+    pipe = UnifiedPipeline(_make_retriever(hits), select_cfg=SelectConfig(max_k=2),
+                           router=router, cfg=UnifiedConfig(use_decomposition=True))
+    q = ("xác định trách nhiệm bồi thường theo Điều 15; "
+         "xác định thiệt hại theo Điều 20")
+    _rec, t = pipe.answer_record_timed(1, q)
+    assert t["decomposed"] is True
+    assert t["n_sub"] >= 2
+
+
+def test_summarize_timings_aggregates():
+    timings = [
+        {"decompose": 1.0, "retrieve": 2.0, "select": 0.5, "generate": 4.0,
+         "total": 7.5, "n_sub": 1, "decomposed": False},
+        {"decompose": 1.0, "retrieve": 6.0, "select": 0.5, "generate": 4.0,
+         "total": 11.5, "n_sub": 3, "decomposed": True},
+    ]
+    s = summarize_timings(timings)
+    assert s["n"] == 2
+    assert s["retrieve_mean"] == 4.0
+    assert s["retrieve_total"] == 8.0
+    assert s["decomposed_count"] == 1
+    assert s["decomposed_rate"] == 0.5
+    assert s["mean_n_sub"] == 2.0
+
+
+def test_summarize_timings_empty():
+    assert summarize_timings([]) == {"n": 0}
 
 
 def test_pipeline_llm_decomposition_falls_back_on_bad_json():
