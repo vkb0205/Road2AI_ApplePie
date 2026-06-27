@@ -108,6 +108,25 @@ def diagnose(pipe, dev_path: str, ids: Sequence[int]) -> None:
               % (len(lex), len(den),
                  "<<< DENSE LEG IS DEAD" if len(den) == 0 else ""))
 
+        # Pre-harvest probe: does the gold NUMBER appear anywhere in the RAW
+        # legs, and from which document(s)/rank(s)? This separates a pure
+        # retrieval miss (number absent from both legs) from a harvest drop
+        # (number present in a leg but cut by per_doc_articles / top_docs).
+        def leg_gold(hits, label):
+            found = []
+            for rank, h in enumerate(hits):
+                if num(h.get("dieu_so", "")) in gold:
+                    found.append((rank, str(h.get("law_id", "")), num(h.get("dieu_so", ""))))
+            if not found:
+                print("[raw-%s] gold NUMBER absent from this leg entirely" % label)
+            else:
+                print("[raw-%s] gold NUMBER present in %d hit(s): %s"
+                      % (label, len(found),
+                         ", ".join("rank%d %s %s" % (r, lid, d) for r, lid, d in found[:6])))
+            return found
+        leg_gold(lex, "lex")
+        leg_gold(den, "den")
+
         attach_rank_scores(lex, cfg.rrf_k)
         attach_rank_scores(den, cfg.rrf_k)
         anchored = anchor_documents(lex, den, cfg)
@@ -115,6 +134,17 @@ def diagnose(pipe, dev_path: str, ids: Sequence[int]) -> None:
         print("[harvest] %d chunks (rerank_pool=%d, truncation %s)"
               % (len(harv), cfg.rerank_pool,
                  "BINDING" if len(harv) > cfg.rerank_pool else "not binding"))
+
+        # Was the RIGHT doc (the one carrying the gold in ground truth) anchored?
+        gold_docs = set()
+        for a in rec.get("relevant_articles", []):
+            parts = str(a).split("|")
+            if parts and parts[0].strip():
+                gold_docs.add(parts[0].strip())
+        anchored_ids = {d.law_id for d in anchored}
+        print("[anchor] gold_doc(s)=%s  anchored=%s"
+              % (sorted(gold_docs),
+                 {g: (g in anchored_ids) for g in sorted(gold_docs)}))
 
         # Did gold get harvested at all, and from which doc?
         harv_gold = [h for h in harv if num(h.dieu_so) in gold]
