@@ -34,26 +34,21 @@ produced the 0/20 pool.
 
 from __future__ import annotations
 
-import argparse
+import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
-
-import json
+from typing import Dict, Optional, Sequence
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from retrieval.kaggle_pipeline import build_pipeline  # noqa: E402
 from retrieval.doc_anchor import (  # noqa: E402
-    DocAnchorConfig,
     attach_rank_scores,
     anchor_documents,
     harvest_articles,
 )
-from retrieval.article_select import SelectConfig, canonical_dieu  # noqa: E402
 
 _DIEU_RE = re.compile(r"Điều\s*(\d+[a-zA-Z]*)", re.UNICODE)
 
@@ -78,39 +73,22 @@ def snippet(t: Optional[str], n: int = 160) -> str:
     return repr(t[:n])
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Live rerank diagnostic")
-    p.add_argument("--data", required=True, help="Stage-6 bundle dir (DATA_DIR)")
-    p.add_argument("--dev", required=True, help="ground_truth.json")
-    p.add_argument("--ids", default="17,8,10", help="comma-separated question ids")
-    p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--top-bm25", type=int, default=300)
-    p.add_argument("--top-dense", type=int, default=150)
-    p.add_argument("--top-docs", type=int, default=40)
-    p.add_argument("--per-doc-articles", type=int, default=12)
-    p.add_argument("--rerank-pool", type=int, default=120)
-    p.add_argument("--chunks-per-article", type=int, default=4)
-    args = p.parse_args(argv)
+def diagnose(pipe, dev_path: str, ids: Sequence[int]) -> None:
+    """Diagnose the bury-gold root cause REUSING an already-built pipeline.
 
-    want = {int(x) for x in args.ids.split(",") if x.strip()}
-    gts = json.loads(Path(args.dev).read_text(encoding="utf-8"))
-    gt_by_id = {int(r["id"]): r for r in gts}
+    Call this from the notebook kernel with the ``pipe`` you already built so no
+    second copy of the GPU models is loaded (building a second pipeline is what
+    OOMs Kaggle — FAISS + BGE-m3 + reranker is ~7 GB and the kernel already
+    holds one). Example::
 
-    cfg = DocAnchorConfig(
-        top_bm25=args.top_bm25,
-        top_dense=args.top_dense,
-        top_docs=args.top_docs,
-        per_doc_articles=args.per_doc_articles,
-        rerank_pool=args.rerank_pool,
-        chunks_per_article=args.chunks_per_article,
-    )
-    print("[build] loading pipeline (dense + rerank, this loads the GPU models)...")
-    pipe = build_pipeline(
-        args.data, use_dense=True, use_rerank=True,
-        fts_mode="bm25_ranked", gpu_id=args.gpu,
-        anchor_cfg=cfg, select_cfg=SelectConfig(),
-    )
+        from dev_set.diagnose_live import diagnose
+        diagnose(pipe, f"{DEV_DIR}/ground_truth.json", [17, 8, 10])
+    """
     r = pipe.retriever
+    cfg = r.cfg
+    want = {int(x) for x in ids}
+    gts = json.loads(Path(dev_path).read_text(encoding="utf-8"))
+    gt_by_id = {int(rec["id"]): rec for rec in gts}
 
     for qid in sorted(want):
         rec = gt_by_id.get(qid)
@@ -187,9 +165,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("      passage: %s" % snippet(pa, 300))
                 break
 
-    pipe.close()
-    return 0
+    # NOTE: do NOT close the pipeline here — the caller owns its lifecycle and
+    # typically keeps using it after the diagnostic.
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    print(
+        "diagnose_live is an in-kernel helper to avoid a second GPU model load.\n"
+        "Run it from the notebook that already built `pipe`:\n\n"
+        "    from dev_set.diagnose_live import diagnose\n"
+        "    diagnose(pipe, f'{DEV_DIR}/ground_truth.json', [17, 8, 10])\n"
+    )
+    raise SystemExit(0)
