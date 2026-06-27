@@ -188,10 +188,16 @@ def per_question(
 # --------------------------------------------------------------------------- #
 def _grid_configs() -> List[SelectConfig]:
     cfgs: List[SelectConfig] = []
+    # F2 is recall-weighted (β=2) and the grader is article-number-only, so the
+    # dominant lever is MAX_K: returning more articles boosts recall even at a
+    # precision cost. On the real Kaggle reranker, gold articles often sit at
+    # rerank-rank 3-7 (the reranker scores the literal-best-match highest, which
+    # is not always the annotated gold), so we must sweep MAX_K up to 6 and use
+    # wide rel/abs margins that admit the full top-K rather than stopping at K=1.
     for drop_prov in (True, False):
-        for max_k in (2, 3):
-            for rel in (0.10, 0.15, 0.20, 0.25):
-                for ab in (0.08, 0.12, 0.16):
+        for max_k in (2, 3, 4, 5, 6):
+            for rel in (0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60):
+                for ab in (0.08, 0.12, 0.16, 0.20, 0.30):
                     cfgs.append(
                         SelectConfig(
                             authority=AuthorityConfig(),
