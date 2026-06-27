@@ -361,6 +361,10 @@ def build_unified_pipeline(
     gen_load_in_4bit: bool = True,
     max_sub_queries: int = 4,
     gen_context_topk: int = 6,
+    use_multi_variant: bool = False,
+    use_complexity_k: bool = False,
+    coverage_quota: bool = True,
+    max_variants: int = 5,
 ):
     """Construct the full unified pipeline from a Stage-6 bundle directory.
 
@@ -408,11 +412,17 @@ def build_unified_pipeline(
         cfg=anchor_cfg or DocAnchorConfig(),
     )
 
+    # The planner/router is needed whenever decomposition, multi-variant
+    # retrieval, or complexity-K is active (all three consume the plan). When
+    # any of these want the LLM planner, the shared Qwen is built once.
+    needs_router = use_decomposition or use_multi_variant or use_complexity_k
+    needs_llm_planner = needs_router and use_llm_decomposition
+
     # Build the (4-bit) Qwen llm_call exactly once and share it between the
-    # generator and the optional LLM-driven decomposition router. This avoids a
-    # second 7B model load when both features are enabled.
+    # generator and the optional LLM-driven planner. This avoids a second 7B
+    # model load when both features are enabled.
     llm_call = None
-    if use_generator or (use_decomposition and use_llm_decomposition):
+    if use_generator or needs_llm_planner:
         from generation.generator import build_hf_llm_call
 
         llm_call = build_hf_llm_call(
@@ -422,22 +432,23 @@ def build_unified_pipeline(
         )
 
     router = None
-    if use_decomposition:
+    if needs_router:
         from retrieval.sub_query_router import SubQueryRouter, SubQueryRouterConfig
 
         router_llm = None
-        if use_llm_decomposition and llm_call is not None:
-            # The router expects ``(prompt: str) -> str``; the generator's
-            # llm_call takes a chat ``messages`` list. Adapt by wrapping the
-            # prompt as a single user turn. On any LLM/parse failure the router
-            # falls back to its deterministic rule-based split internally.
+        if needs_llm_planner and llm_call is not None:
+            # The router/planner expects ``(prompt: str) -> str``; the
+            # generator's llm_call takes a chat ``messages`` list. Adapt by
+            # wrapping the prompt as a single user turn. On any LLM/parse
+            # failure the planner falls back to its deterministic rule-based
+            # split + rule-based complexity internally.
             def router_llm(prompt: str) -> str:
                 return llm_call([{"role": "user", "content": prompt}])
 
         router = SubQueryRouter(
             llm_call=router_llm,
             config=SubQueryRouterConfig(
-                use_llm=use_llm_decomposition and router_llm is not None,
+                use_llm=needs_llm_planner and router_llm is not None,
                 max_sub_queries=max_sub_queries,
             ),
         )
@@ -458,6 +469,10 @@ def build_unified_pipeline(
             use_decomposition=use_decomposition,
             max_sub_queries=max_sub_queries,
             gen_context_topk=gen_context_topk,
+            use_multi_variant=use_multi_variant,
+            max_variants=max_variants,
+            use_complexity_k=use_complexity_k,
+            coverage_quota=coverage_quota,
         ),
     )
     return pipe, fts

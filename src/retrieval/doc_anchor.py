@@ -353,6 +353,87 @@ class DocAnchoredRetriever:
             return [h.base_score for h in harvested]
         return [float(s) for s in scores]
 
+    # ------------------------------------------------------------------ #
+    # Multi-variant retrieval: gather-then-rerank-ONCE
+    # ------------------------------------------------------------------ #
+    def retrieve_pool_multi(
+        self,
+        variants: Sequence[str],
+        rerank_query: Optional[str] = None,
+    ) -> List[ArticleCandidate]:
+        """Retrieve across several query variants but rerank the pool **once**.
+
+        This is the latency-bounded port of the teammate's multi-variant
+        retrieval. The expensive cross-encoder is the dominant GPU cost and is
+        called *exactly once per question*, not once per variant:
+
+        1. For each variant, run the cheap dense (+ optional lexical) search and
+           anchor/harvest its chunks. Breadth of *search* is where the recall
+           gain comes from — many query angles surface different gold chunks.
+        2. Merge all harvested chunks, dedupe by ``(doc, Điều, row_idx)`` keeping
+           the best pre-rerank ``base_score``, and cap the merged pool to
+           ``cfg.rerank_pool`` (so the rerank cost is bounded regardless of how
+           many variants there are).
+        3. Rerank the merged pool ONCE against ``rerank_query`` (the original
+           question by default — the reranker should judge relevance to what the
+           user actually asked, not to a derived sub-query).
+        4. Aggregate per article, inheriting the MAX reranker score.
+
+        With a single variant this reduces to the same candidates as
+        :meth:`retrieve_pool` (one search, one rerank), so it is a strict
+        superset and safe to use unconditionally when multi-variant is enabled.
+        """
+        cfg = self.cfg
+        variants = [v for v in variants if v and v.strip()]
+        if not variants:
+            return []
+        primary = rerank_query if (rerank_query and rerank_query.strip()) else variants[0]
+
+        # ---- Step 1+2: gather harvested chunks across all variants --------
+        # Keyed by (doc_key, dieu, row_idx) so the same chunk surfaced by two
+        # variants is counted once, at its best pre-rerank score.
+        merged: Dict[Tuple[str, str, int], HarvestedChunk] = {}
+        for variant in variants:
+            lex = self.lexical_search(variant, cfg.top_bm25) or []
+            den = self.dense_search(variant, cfg.top_dense) if self.dense_search else []
+            den = den or []
+            attach_rank_scores(lex, cfg.rrf_k)
+            attach_rank_scores(den, cfg.rrf_k)
+            anchored = anchor_documents(lex, den, cfg)
+            harvested = harvest_articles(lex, den, anchored, cfg)
+            for h in harvested:
+                key = (h.law_id, h.dieu_so, h.row_idx)
+                cur = merged.get(key)
+                if cur is None or h.base_score > cur.base_score:
+                    merged[key] = h
+
+        if not merged:
+            return []
+
+        # ---- cap merged pool to rerank_pool (bounds the GPU cost) ---------
+        pool = list(merged.values())
+        pool.sort(key=lambda h: h.base_score, reverse=True)
+        pool = pool[: cfg.rerank_pool]
+
+        # ---- Step 3: rerank ONCE against the original question ------------
+        scores = self._score(primary, pool)
+
+        # ---- Step 4: aggregate per article (MAX reranker score) -----------
+        best_per_article: Dict[Tuple[str, str, str], ArticleCandidate] = {}
+        for h, s in zip(pool, scores):
+            akey = (h.law_id, h.ten_van_ban, h.dieu_so)
+            cur = best_per_article.get(akey)
+            if cur is None or s > cur.score:
+                best_per_article[akey] = ArticleCandidate(
+                    law_id=h.law_id,
+                    ten_van_ban=h.ten_van_ban,
+                    dieu_so=h.dieu_so,
+                    score=s,
+                )
+        out = list(best_per_article.values())
+        out.sort(key=lambda a: a.score, reverse=True)
+        return out
+
 
 def pool_record(
     qid: int, question: str, candidates: Sequence[ArticleCandidate]

@@ -196,6 +196,36 @@ class SelectConfig:
     agreement_cap: int = 3
 
 
+# Complexity → (min_k, max_k) bounds for the multi-variant pipeline. These are
+# pure POLICY numbers (no law/domain tables): a ``simple`` question should
+# answer with ~1 article, ``complex`` multi-facet questions may need many. The
+# numbers mirror the teammate's adaptive bounds but without any of his
+# per-document/role hardcoding — selection still admits by score margin within
+# these caps. ``medium`` is the safe default and matches the legacy max_k=3.
+COMPLEXITY_K_BOUNDS: Dict[str, Tuple[int, int]] = {
+    "simple": (1, 2),
+    "medium": (1, 4),
+    "complex": (2, 10),
+}
+
+
+def select_config_for_complexity(
+    complexity: str, base: Optional[SelectConfig] = None
+) -> SelectConfig:
+    """Return a copy of ``base`` with ``min_k``/``max_k`` set by ``complexity``.
+
+    All other knobs (authority, margins, agreement) are inherited unchanged, so
+    the scale-aware admission logic the selector relies on is preserved — only
+    the recall *envelope* widens/narrows with complexity. An unknown label
+    falls back to the ``medium`` band.
+    """
+    from dataclasses import replace
+
+    base = base or SelectConfig()
+    min_k, max_k = COMPLEXITY_K_BOUNDS.get(complexity, COMPLEXITY_K_BOUNDS["medium"])
+    return replace(base, min_k=min_k, max_k=max_k)
+
+
 def aggregate_articles(
     candidates: Sequence[ArticleCandidate], cfg: SelectConfig
 ) -> List[AggregatedArticle]:

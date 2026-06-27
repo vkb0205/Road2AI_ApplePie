@@ -30,8 +30,10 @@ from retrieval.article_select import (
     AggregatedArticle,
     ArticleCandidate,
     SelectConfig,
+    aggregate_articles,
     canonical_dieu,
     select_articles,
+    select_config_for_complexity,
 )
 from retrieval.doc_anchor import DocAnchoredRetriever
 
@@ -39,6 +41,7 @@ __all__ = [
     "UnifiedConfig",
     "UnifiedPipeline",
     "fuse_candidate_pools",
+    "build_query_variants",
     "summarize_timings",
     "build_record",
     "run_dev_set",
@@ -57,6 +60,46 @@ class UnifiedConfig:
     use_decomposition: bool = False   # rule-based SubQueryRouter pre-split
     max_sub_queries: int = 4
     gen_context_topk: int = 6         # passages handed to the generator
+    # --- multi-variant recall layer (ported from the teammate, de-hardcoded) -
+    use_multi_variant: bool = False   # gather across variants, rerank ONCE
+    max_variants: int = 5             # hard cap on dense searches per question
+    use_complexity_k: bool = False    # let plan.complexity set per-query K
+    coverage_quota: bool = True       # admit each sub-query's top article
+
+
+def build_query_variants(
+    query: str,
+    sub_queries: Optional[Sequence[str]] = None,
+    facets: Optional[Sequence[str]] = None,
+    max_variants: int = 5,
+) -> List[str]:
+    """Assemble the retrieval variants: original + atomic + facet, deduped.
+
+    The original question always comes first (highest-trust signal). Atomic
+    sub-queries and facet phrases follow, each contributing a distinct search
+    angle. Exact-duplicate strings (case/space-insensitive) are dropped, and
+    the list is hard-capped at ``max_variants`` to bound the dense-search count
+    (the only per-variant cost — the cross-encoder still runs once downstream).
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def _add(text: str) -> None:
+        t = (text or "").strip()
+        if not t:
+            return
+        key = " ".join(t.lower().split())
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(t)
+
+    _add(query)
+    for sq in sub_queries or []:
+        _add(sq)
+    for f in facets or []:
+        _add(f)
+    return out[:max_variants]
 
 
 def fuse_candidate_pools(
@@ -123,6 +166,25 @@ class UnifiedPipeline:
         self.cfg = cfg or UnifiedConfig()
 
     # ------------------------------------------------------------------ #
+    def _plan(self, query: str) -> Any:
+        """Run the planner/router once and return its decision.
+
+        Uses the richer :meth:`SubQueryRouter.plan` (decomposition + complexity
+        + facets) when the multi-variant or complexity-K layers are active, so
+        the single shared Qwen call yields every signal at once. Falls back to
+        the lighter :meth:`route` otherwise, and to ``None`` when no router is
+        wired (the caller then treats the query as a single, medium-complexity
+        variant — i.e. exactly the legacy behaviour).
+        """
+        if self.router is None:
+            return None
+        wants_plan = self.cfg.use_multi_variant or self.cfg.use_complexity_k
+        if wants_plan and hasattr(self.router, "plan"):
+            return self.router.plan(query)
+        if self.cfg.use_decomposition:
+            return self.router.route(query)
+        return None
+
     def _sub_queries(self, query: str) -> List[str]:
         """Return the sub-queries to retrieve for (>=1; the original if no split)."""
         if not (self.cfg.use_decomposition and self.router is not None):
@@ -133,18 +195,86 @@ class UnifiedPipeline:
             return subs[: self.cfg.max_sub_queries]
         return [query]
 
+    def _select_cfg_for(self, plan: Any) -> SelectConfig:
+        """Per-query SelectConfig: widen/narrow K by plan complexity if enabled."""
+        if self.cfg.use_complexity_k and plan is not None:
+            complexity = getattr(plan, "complexity", "medium")
+            return select_config_for_complexity(complexity, self.select_cfg)
+        return self.select_cfg
+
     def retrieve_candidates(self, query: str) -> List[ArticleCandidate]:
-        """Retrieve (and fuse, when decomposed) the article-candidate pool."""
+        """Retrieve the article-candidate pool (legacy single/decomp path)."""
         subs = self._sub_queries(query)
         if len(subs) == 1:
             return list(self.retriever.retrieve_pool(subs[0]))
         pools = [self.retriever.retrieve_pool(sq) for sq in subs]
         return fuse_candidate_pools(pools)
 
+    def _retrieve_candidates_planned(
+        self, query: str, plan: Any
+    ) -> Tuple[List[ArticleCandidate], int]:
+        """Retrieve candidates using the plan; return (candidates, n_sub).
+
+        When multi-variant is enabled, builds ``original + atomic + facet``
+        variants and calls the gather-then-rerank-ONCE retriever so the
+        cross-encoder runs a single time. Otherwise reuses the legacy
+        single/decomposition path. ``n_sub`` is the number of atomic
+        sub-queries (drives the coverage-quota floor).
+        """
+        if plan is not None:
+            subs = list(getattr(plan, "sub_queries", []) or [])
+            if not (getattr(plan, "should_decompose", False) and len(subs) > 1):
+                subs = [query]
+        else:
+            subs = [query]
+        n_sub = len(subs)
+
+        if self.cfg.use_multi_variant and hasattr(
+            self.retriever, "retrieve_pool_multi"
+        ):
+            facets = list(getattr(plan, "facets", []) or []) if plan else []
+            variants = build_query_variants(
+                query,
+                sub_queries=subs if n_sub > 1 else None,
+                facets=facets,
+                max_variants=self.cfg.max_variants,
+            )
+            cands = list(
+                self.retriever.retrieve_pool_multi(variants, rerank_query=query)
+            )
+            return cands, n_sub
+
+        # Legacy retrieval (single or per-sub-query fusion).
+        if n_sub == 1:
+            return list(self.retriever.retrieve_pool(subs[0])), 1
+        pools = [self.retriever.retrieve_pool(sq) for sq in subs]
+        return fuse_candidate_pools(pools), n_sub
+
+    def _select_from(
+        self, candidates: Sequence[ArticleCandidate], cfg: SelectConfig, n_sub: int
+    ) -> List[AggregatedArticle]:
+        """Margin-select with an optional coverage-quota recall floor.
+
+        The coverage quota is the budget-safe, de-hardcoded port of the
+        teammate's role/facet-completion passes: when the query decomposed into
+        ``n_sub`` distinct angles, raise the effective ``min_k`` so at least one
+        article per angle survives (bounded by ``max_k``). It reuses the scores
+        already computed by the single shared rerank — no extra rerank pass — so
+        it costs nothing on the GPU. With ``n_sub==1`` it is a no-op.
+        """
+        if self.cfg.coverage_quota and n_sub > 1:
+            from dataclasses import replace
+
+            floor = max(cfg.min_k, min(n_sub, cfg.max_k))
+            cfg = replace(cfg, min_k=floor)
+        return select_articles(candidates, cfg)
+
     def select(self, query: str) -> List[AggregatedArticle]:
-        """Retrieve + select the final articles for a query."""
-        candidates = self.retrieve_candidates(query)
-        return select_articles(candidates, self.select_cfg)
+        """Retrieve + select the final articles for a query (plan-aware)."""
+        plan = self._plan(query)
+        candidates, n_sub = self._retrieve_candidates_planned(query, plan)
+        cfg = self._select_cfg_for(plan)
+        return self._select_from(candidates, cfg, n_sub)
 
     def _gen_contexts(
         self, chosen: Sequence[AggregatedArticle]
@@ -195,35 +325,55 @@ class UnifiedPipeline:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Like :meth:`answer_record`, but also returns per-stage wall-clock.
 
-        The timing dict separates the three cost centres so the decomposition
-        overhead is measurable:
+        The timing dict separates the cost centres so the recall layers'
+        overhead is measurable and the single-rerank invariant is verifiable:
 
-        ``decompose``  seconds in the (optional) router decision.
-        ``retrieve``   seconds in retrieval+rerank across *all* sub-queries
-                       (this is the stage that scales with ``n_sub``).
+        ``decompose``  seconds in the planner/router decision (one LLM call).
+        ``retrieve``   seconds in retrieval+rerank. With multi-variant this
+                       runs N cheap dense searches but the cross-encoder ONCE.
         ``select``     seconds in F2 article selection (cheap, CPU).
-        ``generate``   seconds in the single IRAC generation pass (fixed; does
-                       not scale with ``n_sub``).
-        ``n_sub``      number of sub-queries actually retrieved for.
-        ``decomposed`` True when the router split into >1 sub-query.
+        ``generate``   seconds in the single IRAC generation pass (fixed).
+        ``n_sub``      number of atomic sub-queries from the plan.
+        ``n_variants`` number of retrieval variants actually searched.
+        ``complexity`` plan complexity label (drives K when enabled).
+        ``multi_variant`` True when the gather-then-rerank-once path ran.
+        ``decomposed`` True when the plan split into >1 sub-query.
         ``total``      sum of the above stage times.
         """
         import time
 
         t0 = time.perf_counter()
-        subs = self._sub_queries(question)
+        plan = self._plan(question)
         t_decompose = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        if len(subs) == 1:
-            candidates = list(self.retriever.retrieve_pool(subs[0]))
+        # Reconstruct the variants count for reporting (mirrors the retrieval
+        # path) without paying for retrieval twice.
+        subs = list(getattr(plan, "sub_queries", []) or []) if plan else []
+        if not (plan and getattr(plan, "should_decompose", False) and len(subs) > 1):
+            subs = [question]
+        n_sub = len(subs)
+        multi_variant = self.cfg.use_multi_variant and hasattr(
+            self.retriever, "retrieve_pool_multi"
+        )
+        if multi_variant:
+            facets = list(getattr(plan, "facets", []) or []) if plan else []
+            variants = build_query_variants(
+                question,
+                sub_queries=subs if n_sub > 1 else None,
+                facets=facets,
+                max_variants=self.cfg.max_variants,
+            )
+            n_variants = len(variants)
         else:
-            pools = [self.retriever.retrieve_pool(sq) for sq in subs]
-            candidates = fuse_candidate_pools(pools)
-        t_retrieve = time.perf_counter() - t0
+            n_variants = n_sub
 
         t0 = time.perf_counter()
-        chosen = select_articles(candidates, self.select_cfg)
+        candidates, n_sub = self._retrieve_candidates_planned(question, plan)
+        t_retrieve = time.perf_counter() - t0
+
+        cfg = self._select_cfg_for(plan)
+        t0 = time.perf_counter()
+        chosen = self._select_from(candidates, cfg, n_sub)
         t_select = time.perf_counter() - t0
 
         relevant_articles = [a.to_relevant_string() for a in chosen]
@@ -253,8 +403,11 @@ class UnifiedPipeline:
             "retrieve": t_retrieve,
             "select": t_select,
             "generate": t_generate,
-            "n_sub": len(subs),
-            "decomposed": len(subs) > 1,
+            "n_sub": n_sub,
+            "n_variants": n_variants,
+            "complexity": getattr(plan, "complexity", "medium") if plan else "medium",
+            "multi_variant": multi_variant,
+            "decomposed": n_sub > 1,
             "total": t_decompose + t_retrieve + t_select + t_generate,
         }
         return record, timing
@@ -263,8 +416,10 @@ class UnifiedPipeline:
 def summarize_timings(timings: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Aggregate a list of per-query timing dicts into a report.
 
-    Returns mean/total seconds per stage, the decomposition rate, and the mean
-    sub-query count, so the retrieval multiplier from decomposition is visible.
+    Returns mean/total seconds per stage, the decomposition rate, the mean
+    sub-query / variant counts, and the multi-variant rate — so both the
+    retrieval multiplier AND the single-rerank invariant are visible (retrieve
+    time should stay flat in N_variants because the cross-encoder runs once).
     """
     n = len(timings)
     if n == 0:
@@ -279,6 +434,11 @@ def summarize_timings(timings: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     out["decomposed_count"] = n_decomposed
     out["decomposed_rate"] = n_decomposed / n
     out["mean_n_sub"] = sum(float(t.get("n_sub", 1)) for t in timings) / n
+    out["mean_n_variants"] = sum(float(t.get("n_variants", 1)) for t in timings) / n
+    out["max_n_variants"] = max(int(t.get("n_variants", 1)) for t in timings)
+    n_mv = sum(1 for t in timings if t.get("multi_variant"))
+    out["multi_variant_count"] = n_mv
+    out["multi_variant_rate"] = n_mv / n
     return out
 
 

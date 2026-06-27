@@ -44,8 +44,14 @@ __all__ = [
     "normalize_sub_queries",
     "clean_sub_query",
     "rule_based_decompose",
+    "infer_complexity",
     "DECOMPOSITION_PROMPT",
+    "PLANNER_PROMPT",
+    "COMPLEXITY_LEVELS",
 ]
+
+# Valid complexity labels (simple → single article; complex → multi-facet).
+COMPLEXITY_LEVELS = ("simple", "medium", "complex")
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +82,38 @@ Output schema:
     "...",
     "..."
   ]
+}}
+
+Query: {query}"""
+
+# Extended planner prompt: in ONE call the LLM returns the decomposition AND a
+# complexity label AND short facet phrases, so the multi-variant pipeline pays
+# for only a single Qwen call (not one per signal). Parsing is defensive: any
+# missing/garbage field degrades gracefully to the rule-based fallback.
+PLANNER_PROMPT = """\
+Bạn là bộ lập kế hoạch truy vấn pháp lý.
+
+Nhiệm vụ: phân tích câu hỏi và trả về JSON mô tả kế hoạch truy hồi.
+
+Trả về các trường:
+1. complexity: "simple" nếu chỉ một ý/điều luật; "medium" nếu vài ý liên quan;
+   "complex" nếu nhiều yêu cầu pháp lý độc lập hoặc đa lĩnh vực.
+2. atomic_questions: các câu hỏi con độc lập (tối đa 4). Mỗi câu giữ nguyên bối
+   cảnh pháp lý và chủ thể chính, đủ rõ để truy hồi độc lập. Nếu câu hỏi chỉ một
+   ý, trả về danh sách rỗng.
+3. facets: các cụm từ pháp lý ngắn mô tả từng khía cạnh cần tìm (ví dụ "trách
+   nhiệm bồi thường thiệt hại", "căn cứ xác định mức phạt"). Tối đa 6 cụm.
+
+Quy tắc:
+- Không bịa tên luật/điều khoản cụ thể nếu câu hỏi không nêu.
+- Không tách theo từ nối bề mặt nếu làm mất nghĩa pháp lý.
+- Trả về JSON hợp lệ, không giải thích thêm.
+
+Output schema:
+{{
+  "complexity": "simple|medium|complex",
+  "atomic_questions": ["...", "..."],
+  "facets": ["...", "..."]
 }}
 
 Query: {query}"""
@@ -136,11 +174,21 @@ class RouterDecision:
     source: str = "rule_fallback"
     raw_llm_output: Optional[str] = None
     fallback_log: Optional[RouterFallbackLog] = None
+    # Planner extensions (multi-variant pipeline). ``complexity`` drives the
+    # per-query K bounds; ``facets`` are short legal phrases used to build
+    # extra retrieval variants. Both degrade gracefully: an unrecognised
+    # complexity is coerced to "medium", and facets default to empty.
+    complexity: str = "medium"
+    facets: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.sub_queries:
             self.sub_queries = []
         self.num_sub_queries = len(self.sub_queries)
+        if self.complexity not in COMPLEXITY_LEVELS:
+            self.complexity = "medium"
+        if not self.facets:
+            self.facets = []
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -148,6 +196,8 @@ class RouterDecision:
             "num_sub_queries": self.num_sub_queries,
             "sub_queries": self.sub_queries,
             "source": self.source,
+            "complexity": self.complexity,
+            "facets": self.facets,
         }
         if self.raw_llm_output is not None:
             d["raw_llm_output"] = self.raw_llm_output
@@ -367,6 +417,50 @@ def rule_based_decompose(query: str, max_parts: int = 4) -> List[str]:
     return parts[:max_parts]
 
 
+# Cross-document / multi-issue markers: their presence signals the query spans
+# more than one independent legal requirement (→ complex).
+_CROSS_DOC_MARKERS_RE = re.compile(
+    r"(đồng\s+thời|ngoài\s+ra|bên\s+cạnh\s+đó|sau\s+đó|"
+    r"đặc\s+biệt\s+nếu|cũng\s+như|kèm\s+theo)",
+    re.IGNORECASE,
+)
+
+
+def infer_complexity(query: str, sub_queries: Optional[Sequence[str]] = None) -> str:
+    """Rule-based complexity label when the LLM planner is unavailable.
+
+    Deterministic and dependency-free, mirroring the spirit of the teammate's
+    ``fallback_complexity`` but **without any domain/law tables** — it keys only
+    on surface structure (length, clause/sub-query count, cross-doc markers):
+
+    * ``complex``  — the query splits into ≥3 sub-queries, OR carries a
+      cross-document marker AND is long, OR is very long with multiple clauses.
+    * ``simple``   — short, single-clause, no split, no cross-doc marker.
+    * ``medium``   — everything in between (the safe default).
+
+    Tuned to avoid the over-eager ``medium`` bias the teammate's doc flags: a
+    short single-issue question stays ``simple`` (K≈1) rather than being padded.
+    """
+    q = (query or "").strip()
+    if not q:
+        return "medium"
+    n_sub = len(sub_queries) if sub_queries else 1
+    tokens = q.split()
+    n_tokens = len(tokens)
+    n_clauses = 1 + len(_MULTI_CLAUSE_RE.findall(q)) + len(_CONJUNCTION_RE.findall(q))
+    has_cross_doc = bool(_CROSS_DOC_MARKERS_RE.search(q))
+
+    if n_sub >= 3:
+        return "complex"
+    if has_cross_doc and n_tokens >= 20:
+        return "complex"
+    if n_tokens >= 40 and n_clauses >= 3:
+        return "complex"
+    if n_sub <= 1 and n_clauses <= 1 and n_tokens <= 18 and not has_cross_doc:
+        return "simple"
+    return "medium"
+
+
 # ---------------------------------------------------------------------------
 # Sub-query router
 # ---------------------------------------------------------------------------
@@ -517,6 +611,7 @@ class SubQueryRouter:
                 sub_queries=[query],
                 source="llm",
                 raw_llm_output=raw,
+                complexity=infer_complexity(query, [query]),
             )
 
         # If LLM said decompose but we only have 1 sub-query after cleaning,
@@ -527,6 +622,7 @@ class SubQueryRouter:
                 sub_queries=sub_queries if sub_queries else [query],
                 source="llm",
                 raw_llm_output=raw,
+                complexity=infer_complexity(query, sub_queries or [query]),
             )
 
         return RouterDecision(
@@ -534,6 +630,7 @@ class SubQueryRouter:
             sub_queries=sub_queries,
             source="llm",
             raw_llm_output=raw,
+            complexity=infer_complexity(query, sub_queries),
         )
 
     # ------------------------------------------------------------------ #
@@ -587,4 +684,127 @@ class SubQueryRouter:
             sub_queries=sub_queries if sub_queries else [query],
             source="rule_fallback",
             fallback_log=fallback_log,
+            complexity=infer_complexity(query, sub_queries or [query]),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Planner: one LLM call → decomposition + complexity + facets
+    # ------------------------------------------------------------------ #
+    def plan(self, query: str) -> RouterDecision:
+        """Return a full query plan (decomposition + complexity + facets).
+
+        Like :meth:`route`, but uses the richer :data:`PLANNER_PROMPT` so a
+        single LLM call yields the sub-queries, a complexity label, and short
+        facet phrases. When the LLM is disabled/unavailable/unparseable, it
+        degrades to the deterministic rule fallback (which still fills
+        ``complexity`` via :func:`infer_complexity` and leaves ``facets`` empty).
+
+        The single-call design is what keeps the multi-variant pipeline inside
+        the latency budget: the planner reuses the same Qwen the generator
+        already loads, and is invoked at most once per question.
+        """
+        query = clean_sub_query(query)
+        if not query:
+            return RouterDecision(
+                should_decompose=False,
+                sub_queries=[],
+                source="rule_fallback",
+                fallback_log=RouterFallbackLog(
+                    original_query="",
+                    reason="empty query after cleaning",
+                    rule_triggered="empty_input",
+                ),
+            )
+
+        cfg = self.config
+        if cfg.use_llm and self._llm_call is not None:
+            try:
+                decision = self._llm_plan(query)
+                if decision is not None:
+                    return decision
+            except Exception as exc:
+                logger.warning(
+                    "SubQueryRouter.plan: LLM call failed (%s), falling back "
+                    "to rule-based plan for query=%r",
+                    exc,
+                    query,
+                )
+
+        # Rule fallback already fills complexity; facets stay empty.
+        return self._rule_fallback(query)
+
+    def _llm_plan(self, query: str) -> Optional[RouterDecision]:
+        """Call the LLM with :data:`PLANNER_PROMPT` and parse the plan JSON.
+
+        Returns ``None`` on unparseable output so the caller falls back. Each
+        field is parsed defensively and independently — a bad ``complexity``
+        coerces to ``medium`` (via ``RouterDecision.__post_init__``), bad
+        ``facets`` drop to ``[]``, and bad ``atomic_questions`` fall through to
+        the rule-based complexity using the original query.
+        """
+        cfg = self.config
+        prompt = PLANNER_PROMPT.format(query=query)
+        raw = self._llm_call(prompt)  # type: ignore[misc]
+
+        if not raw or not raw.strip():
+            return None
+
+        raw_clean = raw.strip()
+        if raw_clean.startswith("```"):
+            raw_clean = re.sub(r"^```(?:json)?\s*", "", raw_clean)
+            raw_clean = re.sub(r"\s*```\s*$", "", raw_clean)
+
+        try:
+            parsed = json.loads(raw_clean)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw_clean, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    return None
+            else:
+                return None
+        if not isinstance(parsed, dict):
+            return None
+
+        # --- atomic_questions → sub_queries (reuse the normaliser) ---------
+        raw_atomic = parsed.get("atomic_questions", [])
+        if not isinstance(raw_atomic, list):
+            raw_atomic = []
+        sub_queries = normalize_sub_queries(
+            [str(a) for a in raw_atomic],
+            max_count=cfg.max_sub_queries,
+            min_chars=cfg.min_sub_query_chars,
+            dedup_threshold=cfg.dedup_threshold,
+        )
+
+        # --- facets: short phrases, cleaned + length-capped (no legal-term
+        # filter — facets are intentionally terse, e.g. "mức bồi thường") ----
+        raw_facets = parsed.get("facets", [])
+        if not isinstance(raw_facets, list):
+            raw_facets = []
+        facets: List[str] = []
+        for f in raw_facets:
+            fc = clean_sub_query(str(f))
+            if fc and fc not in facets:
+                facets.append(fc)
+        facets = facets[: cfg.max_sub_queries + 2]
+
+        # --- complexity: trust the LLM if valid, else infer from structure --
+        raw_complexity = str(parsed.get("complexity", "")).strip().lower()
+        complexity = (
+            raw_complexity
+            if raw_complexity in COMPLEXITY_LEVELS
+            else infer_complexity(query, sub_queries or [query])
+        )
+
+        should_decompose = len(sub_queries) > 1
+        return RouterDecision(
+            should_decompose=should_decompose,
+            sub_queries=sub_queries if sub_queries else [query],
+            source="llm",
+            raw_llm_output=raw,
+            complexity=complexity,
+            facets=facets,
         )

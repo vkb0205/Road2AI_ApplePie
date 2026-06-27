@@ -34,10 +34,16 @@ from retrieval.unified_pipeline import (  # noqa: E402
     summarize_timings,
     UnifiedConfig,
     UnifiedPipeline,
+    build_query_variants,
     build_record,
     fuse_candidate_pools,
     validate_submission,
 )
+from retrieval.article_select import (  # noqa: E402
+    COMPLEXITY_K_BOUNDS,
+    select_config_for_complexity,
+)
+from retrieval.sub_query_router import infer_complexity  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -342,3 +348,209 @@ def test_build_record_helper_shapes_output():
     assert rec["id"] == 3
     assert rec["relevant_articles"] == ["01/2021/NĐ-CP|Nghị định 01|Điều 12"]
     validate_submission([rec])
+
+
+# --------------------------------------------------------------------------- #
+# Combined recall layer: variants, complexity-K, multi-variant, coverage quota
+# --------------------------------------------------------------------------- #
+def test_build_query_variants_dedupes_and_caps():
+    v = build_query_variants(
+        "câu gốc",
+        sub_queries=["câu gốc", "Sub HAI", "sub ba"],  # 'câu gốc' dup, 'Sub HAI' case dup of none
+        facets=["facet một", "sub ba", "facet bốn"],   # 'sub ba' dup of sub-query
+        max_variants=4,
+    )
+    assert v[0] == "câu gốc"               # original always first
+    lowered = [s.lower() for s in v]
+    assert len(lowered) == len(set(lowered))  # no case-insensitive duplicates
+    assert len(v) <= 4                     # hard cap honoured
+
+
+def test_build_query_variants_handles_no_subs_or_facets():
+    assert build_query_variants("chỉ một câu") == ["chỉ một câu"]
+
+
+def test_infer_complexity_levels():
+    assert infer_complexity("Mức phạt vi phạm là bao nhiêu?") == "simple"
+    assert infer_complexity("q", ["a", "b", "c"]) == "complex"
+    long_cross = (
+        "Xác định trách nhiệm bồi thường thiệt hại đồng thời làm rõ nghĩa vụ "
+        "của các bên liên quan trong hợp đồng dân sự hiện hành"
+    )
+    assert infer_complexity(long_cross) == "complex"
+
+
+def test_select_config_for_complexity_sets_k_bounds():
+    base = SelectConfig(min_k=1, max_k=3, rel_margin=0.2)
+    simple = select_config_for_complexity("simple", base)
+    complex_ = select_config_for_complexity("complex", base)
+    assert (simple.min_k, simple.max_k) == COMPLEXITY_K_BOUNDS["simple"]
+    assert (complex_.min_k, complex_.max_k) == COMPLEXITY_K_BOUNDS["complex"]
+    # other knobs inherited unchanged
+    assert simple.rel_margin == base.rel_margin == complex_.rel_margin
+    # unknown label falls back to the medium band
+    assert (
+        select_config_for_complexity("???", base).max_k
+        == COMPLEXITY_K_BOUNDS["medium"][1]
+    )
+
+
+class _CountingRetriever:
+    """Fake retriever exposing both APIs; counts rerank passes."""
+
+    def __init__(self, multi_cands, single_cands=None):
+        self.multi_cands = multi_cands
+        self.single_cands = single_cands or multi_cands[:1]
+        self.rerank_calls = 0
+        self.last_variants = None
+
+    def retrieve_pool(self, q):
+        self.rerank_calls += 1
+        return list(self.single_cands)
+
+    def retrieve_pool_multi(self, variants, rerank_query=None):
+        self.rerank_calls += 1  # ONE rerank per question regardless of N variants
+        self.last_variants = list(variants)
+        return list(self.multi_cands)
+
+
+def _planner_router(complexity, atomics, facets):
+    import json
+
+    def fake_llm(_prompt):
+        return json.dumps(
+            {"complexity": complexity, "atomic_questions": atomics, "facets": facets},
+            ensure_ascii=False,
+        )
+
+    return SubQueryRouter(llm_call=fake_llm, config=SubQueryRouterConfig(use_llm=True))
+
+
+def test_multi_variant_reranks_once_and_widens_variants():
+    cands = [
+        ArticleCandidate("L1", "Luật A", "Điều 1", 0.95),
+        ArticleCandidate("L2", "Luật B", "Điều 5", 0.80),
+        ArticleCandidate("L3", "Luật C", "Điều 9", 0.55),
+    ]
+    ret = _CountingRetriever(cands)
+    router = _planner_router(
+        "complex",
+        ["xác định trách nhiệm bồi thường thiệt hại",
+         "xác định quyền và nghĩa vụ của các bên trong hợp đồng"],
+        ["mức bồi thường", "căn cứ xác định thiệt hại"],
+    )
+    pipe = UnifiedPipeline(
+        ret, select_cfg=SelectConfig(max_k=10), router=router,
+        cfg=UnifiedConfig(
+            use_decomposition=True, use_multi_variant=True,
+            use_complexity_k=True, coverage_quota=True, max_variants=5,
+        ),
+    )
+    chosen = pipe.select("một câu hỏi pháp lý phức tạp")
+    assert ret.rerank_calls == 1                      # the single-rerank invariant
+    assert ret.last_variants[0] == "một câu hỏi pháp lý phức tạp"  # original first, verbatim
+    assert len(ret.last_variants) > 1                 # widened by atomic + facet
+    assert len(chosen) >= 2                            # complexity band allowed >1
+
+
+def test_coverage_quota_floors_k_at_subquery_count():
+    cands = [
+        ArticleCandidate("L1", "Luật A", "Điều 1", 0.95),
+        ArticleCandidate("L2", "Luật B", "Điều 5", 0.30),  # far below top → margin would drop it
+    ]
+    ret = _CountingRetriever(cands)
+    router = _planner_router(
+        "complex",
+        ["xác định trách nhiệm bồi thường thiệt hại",
+         "xác định quyền và nghĩa vụ của các bên trong hợp đồng"],
+        [],
+    )
+    # With coverage_quota the 2 sub-queries floor min_k=2, so the low-score
+    # second article is still admitted despite the margin.
+    pipe = UnifiedPipeline(
+        ret, select_cfg=SelectConfig(max_k=10, rel_margin=0.1), router=router,
+        cfg=UnifiedConfig(
+            use_decomposition=True, use_multi_variant=True,
+            use_complexity_k=True, coverage_quota=True, max_variants=5,
+        ),
+    )
+    chosen = pipe.select("câu hỏi phức tạp")
+    assert len(chosen) >= 2
+
+    # Without the quota the margin alone would keep only the top article.
+    ret2 = _CountingRetriever(cands)
+    router2 = _planner_router(
+        "complex",
+        ["xác định trách nhiệm bồi thường thiệt hại",
+         "xác định quyền và nghĩa vụ của các bên trong hợp đồng"],
+        [],
+    )
+    pipe2 = UnifiedPipeline(
+        ret2, select_cfg=SelectConfig(max_k=10, min_k=1, rel_margin=0.1),
+        router=router2,
+        cfg=UnifiedConfig(
+            use_decomposition=True, use_multi_variant=True,
+            use_complexity_k=False, coverage_quota=False, max_variants=5,
+        ),
+    )
+    assert len(pipe2.select("câu hỏi phức tạp")) == 1
+
+
+def test_complexity_k_caps_simple_query_articles():
+    # Three strong, near-tied candidates; a simple query should still cap small.
+    cands = [
+        ArticleCandidate("L1", "Luật A", "Điều 1", 0.95),
+        ArticleCandidate("L2", "Luật B", "Điều 5", 0.93),
+        ArticleCandidate("L3", "Luật C", "Điều 9", 0.92),
+    ]
+    ret = _CountingRetriever(cands)
+    router = _planner_router("simple", [], [])  # no decomposition
+    pipe = UnifiedPipeline(
+        ret, select_cfg=SelectConfig(max_k=10, rel_margin=0.5), router=router,
+        cfg=UnifiedConfig(
+            use_decomposition=True, use_multi_variant=True,
+            use_complexity_k=True, coverage_quota=True, max_variants=5,
+        ),
+    )
+    chosen = pipe.select("Mức phạt là bao nhiêu?")
+    assert len(chosen) <= COMPLEXITY_K_BOUNDS["simple"][1]  # simple band caps K
+
+
+def test_multi_variant_disabled_preserves_single_rerank_path():
+    cands = [ArticleCandidate("L1", "Luật A", "Điều 1", 0.9)]
+    ret = _CountingRetriever(cands)
+    pipe = UnifiedPipeline(
+        ret, select_cfg=SelectConfig(max_k=3),
+        cfg=UnifiedConfig(use_multi_variant=False),  # legacy path
+    )
+    pipe.select("câu hỏi đơn")
+    assert ret.rerank_calls == 1
+    assert ret.last_variants is None  # multi path never touched
+
+
+def test_timing_reports_variants_and_multi_flag():
+    cands = [
+        ArticleCandidate("L1", "Luật A", "Điều 1", 0.95),
+        ArticleCandidate("L2", "Luật B", "Điều 5", 0.80),
+    ]
+    ret = _CountingRetriever(cands)
+    router = _planner_router(
+        "complex",
+        ["xác định trách nhiệm bồi thường thiệt hại",
+         "xác định quyền và nghĩa vụ của các bên trong hợp đồng"],
+        ["mức bồi thường"],
+    )
+    pipe = UnifiedPipeline(
+        ret, select_cfg=SelectConfig(max_k=10), router=router,
+        cfg=UnifiedConfig(
+            use_decomposition=True, use_multi_variant=True,
+            use_complexity_k=True, coverage_quota=True, max_variants=5,
+        ),
+    )
+    _rec, t = pipe.answer_record_timed(1, "câu hỏi phức tạp")
+    assert t["multi_variant"] is True
+    assert t["complexity"] == "complex"
+    assert t["n_variants"] >= t["n_sub"] >= 2
+    summ = summarize_timings([t])
+    assert summ["multi_variant_rate"] == 1.0
+    assert summ["mean_n_variants"] >= 2
