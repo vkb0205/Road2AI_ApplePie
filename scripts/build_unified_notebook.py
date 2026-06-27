@@ -53,7 +53,7 @@ md("## 1. Configuration")
 code(
     '# ===== Configuration (edit these) =====================================\n'
     'GITHUB_REPO = "https://github.com/vkb0205/Road2AI_ApplePie.git"\n'
-    'REPO_BRANCH = "new_retrieval"\n'
+    'REPO_BRANCH = "combined_recall_pipeline"\n'
     'REPO_DIR    = "/kaggle/working/Road2AI_ApplePie"\n'
     '\n'
     'KAGGLE_DATASET = "vkb0205/stage6-data"   # <-- your dataset slug\n'
