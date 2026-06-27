@@ -56,6 +56,38 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _load_flag_reranker(model_name: str, use_fp16: bool, device: Optional[str]):
+    """Construct a FlagReranker pinned to a single ``device`` (e.g. "cuda:0").
+
+    Why pin: with >1 visible GPU and no device given, FlagEmbedding spawns
+    multi-GPU worker processes on every ``compute_score`` call (re-initialising
+    CUDA per child). For the handful of (query, passage) pairs reranked per
+    sub-query, that spawn/IPC overhead dwarfs the actual compute and the GPU
+    shows ~0% util while wall-clock explodes (the 580s single-query symptom).
+    Pinning to one device keeps inference in-process.
+
+    The device kwarg name differs across versions: 1.2.x uses ``device=``
+    (single str), 1.3.x uses ``devices=``. Try the modern name, fall back to
+    the legacy one, then fall back to no-device so an unexpected signature
+    never hard-fails the load.
+    """
+    from FlagEmbedding import FlagReranker  # lazy
+
+    if device is None:
+        return FlagReranker(model_name, use_fp16=use_fp16)
+    try:
+        return FlagReranker(model_name, use_fp16=use_fp16, devices=device)
+    except TypeError:
+        pass
+    try:
+        return FlagReranker(model_name, use_fp16=use_fp16, device=device)
+    except TypeError:
+        return FlagReranker(model_name, use_fp16=use_fp16)
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -73,6 +105,10 @@ class RetrievalConfig:
     expanded_top: int = 50
     final_top_k: int = 5
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    # Pin the cross-encoder reranker to ONE device. None => let FlagEmbedding
+    # decide (its multi-GPU spawn path, slow with >1 visible GPU). Default to
+    # cuda:0 so the reranker stays on the retrieval card, in-process.
+    rerank_device: Optional[str] = "cuda:0"
     rerank_max_input_chars: int = 2000
     seed: int = 42
 
@@ -685,7 +721,8 @@ class HybridRetriever:
         # silently dropped on a transient partial-cache.
         if self._reranker is None:
             try:
-                self._reranker = FlagReranker(cfg.rerank_model, use_fp16=True)
+                self._reranker = _load_flag_reranker(
+                    cfg.rerank_model, use_fp16=True, device=cfg.rerank_device)
             except Exception as e:
                 print(f"[rerank] first load of {cfg.rerank_model} failed: {e!r}; "
                       f"attempting cache repair + retry")
@@ -711,7 +748,8 @@ class HybridRetriever:
                                         "*.model"],
                     )
                     print(f"[rerank] re-downloaded snapshot -> {_rp}")
-                    self._reranker = FlagReranker(cfg.rerank_model, use_fp16=True)
+                    self._reranker = _load_flag_reranker(
+                        cfg.rerank_model, use_fp16=True, device=cfg.rerank_device)
                     print(f"[rerank] retry load of {cfg.rerank_model} succeeded")
                 except Exception as e2:
                     print(f"[rerank] retry also failed: {e2!r}; "

@@ -303,10 +303,17 @@ class BGEQueryEncoder:
         model_name: str = "BAAI/bge-m3",
         max_length: int = 512,
         use_fp16: bool = True,
+        device: Optional[str] = "cuda:0",
     ) -> None:
         self.model_name = model_name
         self.max_length = max_length
         self.use_fp16 = use_fp16
+        # Pin to ONE device. With >1 visible GPU and no device given,
+        # FlagEmbedding spawns multi-GPU worker processes on every encode()
+        # call (re-init CUDA per child) — for batch_size=1 query encodes the
+        # spawn/IPC overhead dwarfs compute and the GPU shows ~0% util while
+        # wall-clock explodes. Pinning to a single device keeps it in-process.
+        self.device = device
         self._encoder: Any = None
 
     def _ensure_loaded(self) -> None:
@@ -314,9 +321,27 @@ class BGEQueryEncoder:
             return
         from FlagEmbedding import BGEM3FlagModel  # lazy
 
-        self._encoder = BGEM3FlagModel(
-            self.model_name, use_fp16=self.use_fp16
-        )
+        # The device kwarg name differs across FlagEmbedding versions:
+        # 1.2.x takes ``device=`` (single str), 1.3.x takes ``devices=``.
+        # Try the modern name, fall back to the legacy one, and finally fall
+        # back to no-device (original behaviour) so an unexpected signature
+        # never hard-fails the encoder.
+        if self.device is None:
+            self._encoder = BGEM3FlagModel(self.model_name, use_fp16=self.use_fp16)
+            return
+        try:
+            self._encoder = BGEM3FlagModel(
+                self.model_name, use_fp16=self.use_fp16, devices=self.device
+            )
+        except TypeError:
+            try:
+                self._encoder = BGEM3FlagModel(
+                    self.model_name, use_fp16=self.use_fp16, device=self.device
+                )
+            except TypeError:
+                self._encoder = BGEM3FlagModel(
+                    self.model_name, use_fp16=self.use_fp16
+                )
 
     def encode(self, query: str) -> Any:
         """Encode a single query → ``(1, dim)`` L2-normalised float32 array."""
