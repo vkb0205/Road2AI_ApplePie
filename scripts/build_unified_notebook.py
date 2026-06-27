@@ -35,7 +35,7 @@ md(
     "| Stage | Module | What it does |\n"
     "|---|---|---|\n"
     "| Retrieve | `retrieval.doc_anchor` | FTS + FAISS → RRF doc-anchor → harvest → cross-encoder rerank |\n"
-    "| Decompose (opt) | `retrieval.sub_query_router` | rule-based split of multi-clause questions |\n"
+    "| Decompose | `retrieval.sub_query_router` | rule-based split of multi-clause questions (multi-hop / cross-document) |\n"
     "| Select | `retrieval.article_select` | authority prior by document **type** + adaptive K |\n"
     "| Generate | `generation.generator` | grounded IRAC answer, always cites an in-list `Điều X` |\n"
     "| Submit | `retrieval.unified_pipeline` | grader record + schema validation + `submission.zip` |\n"
@@ -63,7 +63,7 @@ code(
     '# --- Pipeline switches -------------------------------------------------\n'
     'USE_DENSE         = True    # FAISS + BGE-m3 (GPU). Required for recall.\n'
     'USE_RERANK        = True    # cross-encoder BAAI/bge-reranker-v2-m3 (GPU).\n'
-    'USE_DECOMPOSITION = False   # rule-based sub-query split (no LLM router)\n'
+    'USE_DECOMPOSITION = True    # rule-based sub-query split; REQUIRED by the competition (multi-hop / cross-document)\n'
     'USE_GENERATOR     = True    # IRAC answer generation (one 4-bit Qwen)\n'
     'FTS_MODE          = "bm25_ranked"\n'
     'GPU_ID            = 0\n'
