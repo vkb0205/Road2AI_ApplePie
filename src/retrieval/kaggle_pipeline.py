@@ -122,27 +122,77 @@ def make_reranker(
     device: Optional[str] = "cuda:0",
     use_fp16: bool = True,
     max_input_chars: int = 2000,
+    max_length: int = 512,
+    batch_size: int = 32,
+    backend: str = "transformers",
 ) -> "callable":
-    """Build a RerankFn backed by ``BAAI/bge-reranker-v2-m3`` (lazy, GPU).
+    """Build a RerankFn for ``BAAI/bge-reranker-v2-m3`` (lazy, GPU).
 
-    Reuses the project's reranker loader so device pinning / fp16 behaviour
-    matches the rest of the pipeline.
+    ``backend``:
+      - ``"transformers"`` (default): score the cross-encoder directly with
+        ``AutoModelForSequenceClassification`` + a **fast** tokenizer. This is
+        version-robust and avoids FlagEmbedding's ``compute_score`` path, which
+        breaks on recent ``transformers`` (slow ``XLMRobertaTokenizer`` lacks
+        ``prepare_for_model`` → ``AttributeError``).
+      - ``"flag"``: the legacy FlagEmbedding ``FlagReranker.compute_score``
+        path (kept for parity where the version combo is known-good).
+
+    Both return scores normalised to ``[0, 1]`` (sigmoid for the transformers
+    backend, ``normalize=True`` for the flag backend).
     """
-    from retrieval.retriever import _load_flag_reranker  # lazy: pulls torch
+    if backend == "flag":
+        from retrieval.retriever import _load_flag_reranker  # lazy: pulls torch
 
-    reranker = _load_flag_reranker(model_name, use_fp16=use_fp16, device=device)
+        reranker = _load_flag_reranker(model_name, use_fp16=use_fp16, device=device)
 
-    def _rerank(query: str, passages: Sequence[str]) -> List[float]:
-        pairs = [[query, (p or "")[:max_input_chars]] for p in passages]
-        if not pairs:
+        def _rerank_flag(query: str, passages: Sequence[str]) -> List[float]:
+            pairs = [[query, (p or "")[:max_input_chars]] for p in passages]
+            if not pairs:
+                return []
+            scores = reranker.compute_score(pairs, normalize=True)
+            if isinstance(scores, (int, float)):
+                return [float(scores)]
+            return [float(s) for s in scores]
+
+        return _rerank_flag
+
+    # --- transformers-native backend (default, version-robust) -------------
+    import torch  # lazy
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    dev = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    # Force the fast (Rust) tokenizer; the slow XLMRoberta tokenizer is what
+    # triggers the prepare_for_model AttributeError under newer transformers.
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    model = model.to(dev)
+    if use_fp16 and str(dev).startswith("cuda"):
+        model = model.half()
+    model.eval()
+
+    def _rerank_hf(query: str, passages: Sequence[str]) -> List[float]:
+        if not passages:
             return []
-        scores = reranker.compute_score(pairs, normalize=True)
-        # compute_score returns a float for a single pair, else a list.
-        if isinstance(scores, (int, float)):
-            return [float(scores)]
-        return [float(s) for s in scores]
+        scores: List[float] = []
+        for start in range(0, len(passages), batch_size):
+            batch = passages[start : start + batch_size]
+            queries = [query] * len(batch)
+            texts = [(p or "")[:max_input_chars] for p in batch]
+            inputs = tokenizer(
+                queries,
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            ).to(dev)
+            with torch.no_grad():
+                logits = model(**inputs, return_dict=True).logits.view(-1).float()
+                probs = torch.sigmoid(logits)  # normalise to [0, 1]
+            scores.extend(probs.detach().cpu().tolist())
+        return scores
 
-    return _rerank
+    return _rerank_hf
 
 
 # --------------------------------------------------------------------------- #
