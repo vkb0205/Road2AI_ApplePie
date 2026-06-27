@@ -169,14 +169,43 @@ class HarvestedChunk:
 
 
 def _hit_score(hit: Dict[str, Any]) -> float:
-    """Best available pre-rerank score from a hit dict."""
-    for key in ("dense_score", "bm25_score", "rrf_score", "score"):
+    """Best available pre-rerank score from a hit dict.
+
+    ``norm_rank_score`` (a leg-normalised reciprocal rank attached by
+    :meth:`DocAnchoredRetriever.retrieve_pool`) is preferred when present so
+    the dense and lexical legs are ordered on a *comparable* scale at every
+    ``base_score``-sorted survival gate (per-(doc,Điều) chunk cap, per-doc
+    article cap, ``rerank_pool`` truncation). Without it the legs are sorted on
+    incomparable raw scales — dense cosine ∈ [0,1] vs negated-BM25 magnitude
+    ~5-15 — so lexical hits sort strictly above dense and the dense-found gold
+    passage is truncated out *before* it reaches the cross-encoder, even though
+    the dense leg is what recovers the gold article BM25 missed. The other keys
+    remain as fallbacks so the pure harvest unit tests (which inject a single
+    raw score) are unaffected.
+    """
+    for key in ("norm_rank_score", "dense_score", "bm25_score", "rrf_score", "score"):
         if key in hit and hit[key] is not None:
             try:
                 return float(hit[key])
             except (TypeError, ValueError):
                 continue
     return 0.0
+
+
+def attach_rank_scores(hits: Sequence[Dict[str, Any]], rrf_k: int) -> None:
+    """Attach a leg-normalised reciprocal-rank score to each hit in place.
+
+    Each leg arrives already ranked (best first). We write
+    ``norm_rank_score = 1 / (rrf_k + rank)`` — the same 1/(k+rank) form RRF
+    uses at the document-anchoring stage — so the dense and lexical legs become
+    directly comparable at the ``base_score``-ordered harvest/truncation gates.
+    This is what stops the lexical leg (large-magnitude BM25) from starving the
+    dense leg (cosine ≤ 1) out of the rerank pool. The reranker remains the true
+    scorer; ``norm_rank_score`` only governs which chunks *survive* to be
+    reranked, where recall-first rank fusion is exactly what we want.
+    """
+    for rank, h in enumerate(hits, start=1):
+        h["norm_rank_score"] = 1.0 / (rrf_k + rank)
 
 
 def harvest_articles(
@@ -272,6 +301,14 @@ class DocAnchoredRetriever:
         lex = self.lexical_search(query, cfg.top_bm25) or []
         den = self.dense_search(query, cfg.top_dense) if self.dense_search else []
         den = den or []
+
+        # Normalise each leg to a comparable reciprocal-rank score BEFORE the
+        # base_score-ordered harvest/truncation gates, so the dense leg (cosine
+        # ≤ 1) is not starved out of the rerank pool by the large-magnitude
+        # lexical leg. Without this the gold passage the dense leg recovers is
+        # truncated before the cross-encoder ever scores it.
+        attach_rank_scores(lex, cfg.rrf_k)
+        attach_rank_scores(den, cfg.rrf_k)
 
         anchored = anchor_documents(lex, den, cfg)
         harvested = harvest_articles(lex, den, anchored, cfg)

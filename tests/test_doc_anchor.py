@@ -198,12 +198,56 @@ def test_retriever_rerank_shape_mismatch_falls_back():
     def bad_rerank(query, passages):
         return [0.5, 0.6]  # wrong length
 
+    cfg = DocAnchorConfig()
     r = DocAnchoredRetriever(
         lexical_search=_lex_fn(lex), dense_search=None,
-        fetch_text=fetch_text, rerank=bad_rerank, cfg=DocAnchorConfig(),
+        fetch_text=fetch_text, rerank=bad_rerank, cfg=cfg,
     )
     pool = r.retrieve_pool("q")
-    assert pool[0].score == 3.0  # fell back to base score
+    # On a rerank shape-mismatch we fall back to the harvested base_score, which
+    # is now the leg-normalised reciprocal rank 1/(rrf_k + rank) (rank 1) rather
+    # than the raw BM25 magnitude — the legs are normalised before harvesting so
+    # the dense leg is not starved out of the rerank pool.
+    assert pool[0].score == pytest.approx(1.0 / (cfg.rrf_k + 1))
+
+
+def test_dense_gold_survives_lexical_starvation():
+    """Regression: the dense leg must not be starved out of the rerank pool.
+
+    The lexical leg returns many high-magnitude BM25 hits from wrong documents;
+    the dense leg returns the single gold passage with a small cosine score.
+    Before leg normalisation the rerank_pool truncation sorted on the raw
+    base_score, so every lexical hit (magnitude ~10) sorted above the gold dense
+    hit (cosine ~0.6) and the gold was discarded before reranking — gold in the
+    pool, never in the reranked top-K, F2≈0. With normalisation both legs are on
+    a comparable reciprocal-rank scale, so the gold dense hit (dense rank 1)
+    survives the truncation and reaches the reranker.
+    """
+    # 6 wrong-doc lexical hits with large BM25 scores; gold is NOT among them.
+    lex = [
+        _hit(100 + i, f"{i}/2010/QĐ-UBND", f"Điều {i}", bm25_score=float(20 - i))
+        for i in range(1, 7)
+    ]
+    # Dense leg surfaces the gold article (small cosine, but rank 1).
+    den = [_hit(1, "01/2021/NĐ-CP", "Điều 12", dense_score=0.62)]
+
+    def fetch_text(row_idxs):
+        return {i: f"text-{i}" for i in row_idxs}
+
+    # Reranker rewards the gold passage; everything else scores low.
+    def rerank(query, passages):
+        return [0.95 if p == "text-1" else 0.10 for p in passages]
+
+    cfg = DocAnchorConfig(rerank_pool=4)  # tight cap: pre-fix this evicts gold
+    r = DocAnchoredRetriever(
+        lexical_search=_lex_fn(lex), dense_search=_lex_fn(den),
+        fetch_text=fetch_text, rerank=rerank, cfg=cfg,
+    )
+    pool = r.retrieve_pool("đăng ký doanh nghiệp")
+    dieus = {c.dieu_so for c in pool}
+    assert "Điều 12" in dieus, "dense-found gold was starved out before rerank"
+    # And after reranking the gold passage is the top candidate.
+    assert pool[0].dieu_so == "Điều 12"
 
 
 def test_retriever_empty_pool_on_no_hits():
