@@ -172,11 +172,11 @@ class AggregatedArticle:
 
 @dataclass
 class SelectConfig:
-    """Tunable selection policy (tuned on the dev set)."""
+    """Tunable selection policy for macro-F2 (recall-weighted) scoring."""
 
     authority: AuthorityConfig = field(default_factory=AuthorityConfig)
     drop_provincial: bool = True          # hard-drop provincial issuers
-    max_k: int = 3                        # never return more than this
+    max_k: int = 6                        # recall-oriented cap for F2 scoring
     min_k: int = 1                        # always return at least this
     # Add the n-th candidate (n>=2) only if its score is within `rel_margin`
     # (fraction of the top score) AND, when scores are on a normalized [0,1]
@@ -184,8 +184,8 @@ class SelectConfig:
     # scale-invariant and is what actually governs admission for raw BM25
     # scores (which live on a ~100 scale, where an absolute gap of 0.12 would
     # otherwise veto every 2nd article and force K=1 — collapsing recall).
-    rel_margin: float = 0.18
-    abs_margin: float = 0.12
+    rel_margin: float = 0.32
+    abs_margin: float = 0.22
     # Scores whose top value exceeds this are treated as "unnormalised" (raw
     # BM25 / large-magnitude) and the absolute-margin gate is skipped, leaving
     # admission to the scale-invariant relative margin alone.
@@ -197,15 +197,15 @@ class SelectConfig:
 
 
 # Complexity → (min_k, max_k) bounds for the multi-variant pipeline. These are
-# pure POLICY numbers (no law/domain tables): a ``simple`` question should
-# answer with ~1 article, ``complex`` multi-facet questions may need many. The
-# numbers mirror the teammate's adaptive bounds but without any of his
-# per-document/role hardcoding — selection still admits by score margin within
-# these caps. ``medium`` is the safe default and matches the legacy max_k=3.
+# pure POLICY numbers (no law/domain tables): a ``simple`` question should stay
+# fairly tight, while complex multi-facet questions need a much wider recall
+# envelope. The official F2 score weights recall 4× precision, so the defaults
+# intentionally prefer admitting plausible extra article numbers over missing a
+# gold article entirely.
 COMPLEXITY_K_BOUNDS: Dict[str, Tuple[int, int]] = {
-    "simple": (1, 2),
-    "medium": (1, 4),
-    "complex": (2, 10),
+    "simple": (1, 3),
+    "medium": (2, 6),
+    "complex": (4, 12),
 }
 
 
@@ -277,13 +277,13 @@ def aggregate_articles(
 def select_articles(
     candidates: Sequence[ArticleCandidate], cfg: Optional[SelectConfig] = None
 ) -> List[AggregatedArticle]:
-    """Full pipeline: suppress → aggregate → F2-optimal K selection.
+    """Full pipeline: suppress → aggregate → F2-oriented K selection.
 
     Returns the chosen articles in rank order. The K policy always keeps the
-    top article (recall floor), then admits further articles only when their
-    score is close to the top (a confident second/third article), capped at
-    ``max_k``. This matches the dev-set gold cardinality (16×1, 4×2) while
-    protecting recall.
+    top article (recall floor), then admits further articles when their score is
+    plausibly close to the top, capped at ``max_k``. Because the official F2
+    scorer weights recall 4× precision, this selector deliberately uses a wider
+    margin than a precision-first selector.
 
     Admission criterion (scale-agnostic): a candidate is admitted iff its
     ``final_score`` is within ``rel_margin`` (a *fraction* of the top score) of
